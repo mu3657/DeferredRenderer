@@ -9,17 +9,25 @@ assets::MaterialInfo assets::read_material_info(AssetFile* file)
 	nlohmann::json material_metadata = nlohmann::json::parse(file->json);
 	info.baseEffect = material_metadata["baseEffect"];
 
-
-	for (auto& [key, value] : material_metadata["textures"].items())
+	if (material_metadata.contains("textures") && material_metadata["textures"].is_object())
 	{
-
-		info.textures[key] = value;
+		for (auto& [key, value] : material_metadata["textures"].items())
+		{
+			info.textures[key] = value.get<std::string>();
+		}
 	}
 
-	for (auto& [key, value] : material_metadata["customProperties"].items())
+	if (material_metadata.contains("customProperties") && material_metadata["customProperties"].is_object())
 	{
-
-		info.customProperties[key] = value;
+		for (auto& [key, value] : material_metadata["customProperties"].items())
+		{
+			// customProperties values may be stored as strings or other JSON types;
+			// convert to string representation in either case.
+			if (value.is_string())
+				info.customProperties[key] = value.get<std::string>();
+			else
+				info.customProperties[key] = value.dump();
+		}
 	}
 
 	info.transparency = TransparencyMode::Opaque;
@@ -47,12 +55,15 @@ assets::AssetFile assets::pack_material(MaterialInfo* info)
 	material_metadata["customProperties"] = info->customProperties;
 
 	switch (info->transparency)
-	{	
+	{
 	case TransparencyMode::Transparent:
 		material_metadata["transparency"] = "transparent";
 		break;
 	case TransparencyMode::Masked:
 		material_metadata["transparency"] = "masked";
+		break;
+	default:
+		material_metadata["transparency"] = "opaque";
 		break;
 	}
 

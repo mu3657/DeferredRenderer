@@ -65,6 +65,7 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
+/assets/
 /assets/brickadia
 *.rdc
 *.resolved

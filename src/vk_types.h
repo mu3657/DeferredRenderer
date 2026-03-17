@@ -1,4 +1,4 @@
-﻿// vulkan_guide.h : Include file for standard system include files,
+// vulkan_guide.h : Include file for standard system include files,
 // or project specific include files.
 #pragma once
 
@@ -131,6 +131,34 @@ struct MeshNode : public Node {
     std::shared_ptr<MeshAsset> mesh;
 
     virtual void Draw(const glm::mat4& topMatrix, DrawContext& ctx) override;
+};
+
+// Light types matching NodeLight::type from the asset pipeline
+enum class LightType : int {
+    Point       = 0,
+    Directional = 1,
+    Spot        = 2,
+};
+
+struct GpuLight {
+    glm::vec3  color;
+    float      intensity;
+    LightType  type;
+    float      range;          // 0 = infinite (directional)
+    glm::vec3  worldPosition;  // filled in during Draw() traversal
+    float      _pad{};
+};
+
+struct LightNode : public Node {
+    GpuLight light;
+
+    virtual void Draw(const glm::mat4& topMatrix, DrawContext& ctx) override
+    {
+        // Store world-space position derived from the accumulated transform.
+        // The light list is read directly from LoadedScene; DrawContext is not involved.
+        light.worldPosition = glm::vec3(topMatrix * localTransform * glm::vec4(0.f, 0.f, 0.f, 1.f));
+        Node::Draw(topMatrix, ctx); // recurse children
+    }
 };
 
 struct RenderObject {

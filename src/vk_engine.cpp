@@ -1,4 +1,4 @@
-﻿//> includes
+//> includes
 #define VMA_IMPLEMENTATION
 #include "vk_engine.h"
 
@@ -63,14 +63,15 @@ void VulkanEngine::init()
     init_imgui();
 
 	init_camera();
+	assetManager.init(this);
+	//std::string structurePath = { "../assets/BistroInterior_out/BistroInterior.gltf" };
+	 std::string structurePath = { "../assets/BistroInterior_out/assets_export/BistroInterior.pfb" };
+	//std::string structurePath = { "../assets/structure/assets_export/structure.pfb" };
+	auto structureFile = loadScene(this,structurePath);
 
-	std::string structurePath = { "../assets/BistroInterior_out/BistroInterior.gltf" };
-	 //std::string structurePath = { "../assets/structure.glb" };
-	auto structureFile = loadGltf(this,structurePath);
-
-	assert(structureFile.has_value());
-
-	loadedScenes["structure"] = *structureFile;
+	if (structureFile.has_value()) {
+	    loadedScenes["structure"] = *structureFile;
+	}
 
     //everything went fine
     _isInitialized = true;
@@ -207,7 +208,7 @@ void VulkanEngine::cleanup()
             destroy_buffer(mesh->meshBuffers.indexBuffer);
             destroy_buffer(mesh->meshBuffers.vertexBuffer);
         }
-
+    	assetManager.cleanup();
         _mainDeletionQueue.flush();
         destroy_swapchain();
 
@@ -539,6 +540,15 @@ void VulkanEngine::init_vulkan()
     vmaCreateAllocator(&allocatorInfo, &_allocator);
 
     _mainDeletionQueue.push_function([&]() {
+ //    		char* statsString;
+	// vmaBuildStatsString(_allocator, &statsString, VK_TRUE);
+	//
+	// // 把这个字符串打印到控制台，或者保存成 JSON 文件
+ //    	fmt::print("VMA Unfreed Resources:\n{}\n", statsString);
+	//
+	// // 记得释放字符串内存
+	// vmaFreeStatsString(_allocator, statsString);
+
         vmaDestroyAllocator(_allocator);
     });
 
@@ -768,6 +778,37 @@ void VulkanEngine::init_pipelines()
     // GRAPHICS PIPELINES
     metalRoughMaterial.build_pipelines(this);
     init_Deferredlighting_pipeline();
+
+    // Build the default (fallback) material now that materialLayout is ready.
+    // This MUST happen after build_pipelines() which creates materialLayout.
+    GLTFMetallic_Roughness::MaterialResources materialResources;
+    materialResources.colorImage        = _whiteImage;
+    materialResources.colorSampler      = _defaultSamplerLinear;
+    materialResources.metalRoughImage   = _greyImage;
+    materialResources.metalRoughSampler = _defaultSamplerLinear;
+    materialResources.normalImage       = _defaultNormalImage;
+    materialResources.normalSampler     = _defaultSamplerLinear;
+    materialResources.occlusionImage    = _whiteImage;
+    materialResources.occlusionSampler  = _defaultSamplerLinear;
+    materialResources.emissiveImage     = _blackImage;
+    materialResources.emissiveSampler   = _defaultSamplerLinear;
+
+    AllocatedBuffer materialConstants = create_buffer(sizeof(GLTFMetallic_Roughness::MaterialConstants),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+    auto* matData = (GLTFMetallic_Roughness::MaterialConstants*)materialConstants.allocation->GetMappedData();
+    matData->colorFactors        = glm::vec4{1, 1, 1, 1};
+    matData->metal_rough_factors = glm::vec4{0, 0.5f, 0, 0};
+    matData->emissive_factors    = glm::vec4{0, 0, 0, 0};
+
+    _mainDeletionQueue.push_function([=, this]() {
+        destroy_buffer(materialConstants);
+    });
+
+    materialResources.dataBuffer       = materialConstants.buffer;
+    materialResources.dataBufferOffset = 0;
+
+    defaultData = metalRoughMaterial.write_material(_device, MaterialPass::MainColor,
+        materialResources, globalDescriptorAllocator);
 }
 
 // 将网格的顶点数据和索引数据上传到 GPU
@@ -980,6 +1021,7 @@ void VulkanEngine::geometry_pass(VkCommandBuffer cmd)
 		if (is_visible(mainDrawContext.OpaqueSurfaces[i], sceneData.viewproj)) {
 			opaque_draws.push_back(i);
 		}
+		// opaque_draws.push_back(i);
 	}
 
 	// sort the opaque surfaces by material and mesh
@@ -1368,6 +1410,12 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 	});
 
 }
+
+void GLTFMetallic_Roughness::clear_resources(VkDevice device)
+{
+
+}
+
 MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, MaterialPass pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator)
 {
     MaterialInstance matData;
@@ -1384,9 +1432,11 @@ MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, Materia
 
     writer.clear();
     writer.write_buffer(0, resources.dataBuffer, sizeof(MaterialConstants), resources.dataBufferOffset, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-    writer.write_image(1, resources.colorImage.imageView, resources.colorSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    writer.write_image(1, resources.colorImage.imageView,      resources.colorSampler,      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     writer.write_image(2, resources.metalRoughImage.imageView, resources.metalRoughSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-	writer.write_image(3, resources.normalImage.imageView, resources.normalSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+	writer.write_image(3, resources.normalImage.imageView,     resources.normalSampler,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    writer.write_image(4, resources.occlusionImage.imageView,  resources.occlusionSampler,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    writer.write_image(5, resources.emissiveImage.imageView,   resources.emissiveSampler,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     writer.update_set(device, matData.materialSet);
 
     return matData;
@@ -1394,16 +1444,15 @@ MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, Materia
 void VulkanEngine::init_default_data() {
 
 
-    // testMeshes = loadGltfMeshes(this,"../assets/basicmesh.glb").value();
-    auto result = loadGltfMeshes(this, "../assets/basicmesh.glb");
+    // auto result = loadScene(this, "../assets_export/basicmesh.pfb");
 
-    if (result.has_value()) {
-        testMeshes = result.value(); // 或者 std::move(result.value())
-    } else {
-        // 报错并处理，比如跳过这个模型的加载，而不是让整个引擎崩溃
-        fmt::print("Critical Error: Could not load basicmesh.glb\n");
-        // return; 或采取其他补救措施
-    }
+    // if (result.has_value()) {
+    //     for (auto& [k, v] : result.value()->meshes) {
+    //         testMeshes.push_back(v);
+    //     }
+    // } else {
+    //     fmt::print("Warning: Could not load basicmesh.pfb\n");
+    // }
 
     //3 default textures, white, grey, black. 1 pixel each
     uint32_t white = glm::packUnorm4x8(glm::vec4(1, 1, 1, 1));
@@ -1456,37 +1505,6 @@ void VulkanEngine::init_default_data() {
         destroy_image(_defaultNormalImage);
     });
 
-    //
-    // GLTFMetallic_Roughness::MaterialResources materialResources;
-    // //default the material textures
-    // materialResources.colorImage = _whiteImage;
-    // materialResources.colorSampler = _defaultSamplerLinear;
-    // materialResources.metalRoughImage = _whiteImage;
-    // materialResources.metalRoughSampler = _defaultSamplerLinear;
-    // materialResources.normalImage = _greyImage;
-    // materialResources.normalSampler = _defaultSamplerLinear;
-    // materialResources.occlusionImage = _whiteImage;
-    // materialResources.occlusionSampler = _defaultSamplerLinear;
-    // materialResources.emissiveImage = _blackImage;
-    // materialResources.emissiveSampler = _defaultSamplerLinear;
-    //
-    // //set the uniform buffer for the material data
-    // AllocatedBuffer materialConstants = create_buffer(sizeof(GLTFMetallic_Roughness::MaterialConstants), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-    //
-    // //write the buffer
-    // GLTFMetallic_Roughness::MaterialConstants* sceneUniformData = (GLTFMetallic_Roughness::MaterialConstants*)materialConstants.allocation->GetMappedData();
-    // sceneUniformData->colorFactors = glm::vec4{1,1,1,1};
-    // sceneUniformData->metal_rough_factors = glm::vec4{1,0.5,0,0};
-    //
-    // _mainDeletionQueue.push_function([=, this]() {
-    //     destroy_buffer(materialConstants);
-    // });
-    //
-    // materialResources.dataBuffer = materialConstants.buffer;
-    // materialResources.dataBufferOffset = 0;
-    //
-    // defaultData = metalRoughMaterial.write_material(_device,MaterialPass::MainColor,materialResources, globalDescriptorAllocator);
-
 	// for (auto& m : testMeshes) {
 	// 	std::shared_ptr<MeshNode> newNode = std::make_shared<MeshNode>();
 	// 	newNode->mesh = m;
@@ -1512,7 +1530,8 @@ void VulkanEngine::create_swapchain(uint32_t width, uint32_t height)
         //.use_default_format_selection()
         .set_desired_format(VkSurfaceFormatKHR{ .format = _swapchainImageFormat, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR })
         //use vsync present mode
-        .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+        // .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+		.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
         .set_desired_extent(width, height)
         .add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT)
         .build()
@@ -1718,7 +1737,9 @@ void VulkanEngine::update_scene()
 	//
 	// 	loadedNodes["Cube"]->Draw(translation * scale, mainDrawContext);
 	// }
-	loadedScenes["structure"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
+	 if (loadedScenes.find("structure") != loadedScenes.end()) {
+	     loadedScenes["structure"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
+	 }
 
 
 	//some default lighting parameters

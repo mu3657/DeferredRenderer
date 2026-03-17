@@ -16,7 +16,15 @@ namespace assets {
 			std::string mesh_path;
 		};
 
+		struct NodeLight {
+			float color[3];
+			float intensity;
+			int type; // 0 = point, 1 = directional, 2 = spot
+			float range;
+		};
+
 		std::unordered_map<uint64_t, NodeMesh> node_meshes;
+		std::unordered_map<uint64_t, NodeLight> node_lights;
 
 		std::vector<std::array<float,16>> matrices;
 	};

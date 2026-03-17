@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <unordered_map>
 #include <filesystem>
@@ -21,14 +21,16 @@ struct MeshAsset {
 
     std::vector<GeoSurface> surfaces;
     GPUMeshBuffers meshBuffers;
+
+
 };
 
 //forward declaration
 class VulkanEngine;
 
-struct LoadedGLTF : public IRenderable {
+struct LoadedScene : public IRenderable {
 
-    // storage for all the data on a given glTF file
+    // storage for all the data on a given scene file
     std::unordered_map<std::string, std::shared_ptr<MeshAsset>> meshes;
     std::unordered_map<std::string, std::shared_ptr<Node>> nodes;
     std::unordered_map<std::string, AllocatedImage> images;
@@ -36,6 +38,10 @@ struct LoadedGLTF : public IRenderable {
 
     // nodes that dont have a parent, for iterating through the file in tree order
     std::vector<std::shared_ptr<Node>> topNodes;
+
+    // all lights in the scene, populated by load_prefab; consumed by the lighting pass.
+    // Weak references into the node graph — the nodes map owns the actual lifetime.
+    std::vector<std::weak_ptr<LightNode>> lightNodes;
 
     std::vector<VkSampler> samplers;
 
@@ -45,7 +51,7 @@ struct LoadedGLTF : public IRenderable {
 
     VulkanEngine* creator;
 
-    ~LoadedGLTF() { clearAll(); };
+    ~LoadedScene() { clearAll(); };
 
     virtual void Draw(const glm::mat4& topMatrix, DrawContext& ctx);
 
@@ -53,5 +59,6 @@ private:
 
     void clearAll();
 };
-std::optional<std::vector<std::shared_ptr<MeshAsset>>> loadGltfMeshes(VulkanEngine* engine, std::filesystem::path filePath);
-std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine,std::string_view filePath);
+
+
+std::optional<std::shared_ptr<LoadedScene>> loadScene(VulkanEngine* engine, std::string_view filePath);

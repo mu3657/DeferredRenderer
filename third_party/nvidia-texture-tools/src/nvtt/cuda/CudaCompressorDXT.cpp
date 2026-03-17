@@ -40,6 +40,8 @@
 #include <stdio.h>
 
 #if defined HAVE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
 #define MAX_BLOCKS 8192U // 32768, 65535 // @@ Limit number of blocks on slow devices to prevent hitting the watchdog timer.

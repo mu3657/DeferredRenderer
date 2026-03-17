@@ -1,4 +1,4 @@
-﻿// vulkan_guide.h : Include file for standard system include files,
+// vulkan_guide.h : Include file for standard system include files,
 // or project specific include files.
 
 #pragma once
@@ -212,7 +212,7 @@ public:
 	AssetManager assetManager;
 	RenderScene renderScene;
 
-	std::unordered_map<std::string, std::shared_ptr<LoadedGLTF>> loadedScenes;
+	std::unordered_map<std::string, std::shared_ptr<LoadedScene>> loadedScenes;
 
 #pragma region DebugVariables
 	EngineStats stats;

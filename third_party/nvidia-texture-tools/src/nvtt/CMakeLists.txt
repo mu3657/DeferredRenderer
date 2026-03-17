@@ -34,10 +34,12 @@ SET(NVTT_SRCS
 
 IF (CUDA_FOUND)
     ADD_DEFINITIONS(-DHAVE_CUDA)
-    CUDA_COMPILE(CUDA_SRCS cuda/CompressKernel.cu)
+    # CUDA_COMPILE is deprecated. CMake handles .cu if CUDA language is enabled.
+    SET(CUDA_SRCS cuda/CompressKernel.cu)
+    set_source_files_properties(${CUDA_SRCS} PROPERTIES LANGUAGE CUDA)
     SET(NVTT_SRCS ${NVTT_SRCS} ${CUDA_SRCS})
-    SET(LIBS ${LIBS} ${CUDA_LIBRARIES})
-    INCLUDE_DIRECTORIES(${CUDA_INCLUDE_DIRS})
+    # Since CUDA is enabled globally, we don't strictly need CUDA_LIBRARIES but we keep the logical flow
+    # Include dirs are also automatically handled by modern CMake.
 ENDIF (CUDA_FOUND)
 
 INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR})

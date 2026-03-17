@@ -43,6 +43,22 @@ assets::PrefabInfo assets::read_prefab_info(AssetFile* file)
 		info.node_meshes[pair.first] = node;
 	}
 
+	if (prefab_metadata.contains("node_lights")) {
+		std::unordered_map<uint64_t, nlohmann::json> lightnodes = prefab_metadata["node_lights"];
+		for (auto pair : lightnodes) {
+			assets::PrefabInfo::NodeLight node;
+
+			node.color[0] = pair.second["color"][0];
+			node.color[1] = pair.second["color"][1];
+			node.color[2] = pair.second["color"][2];
+			node.intensity = pair.second["intensity"];
+			node.type = pair.second["type"];
+			node.range = pair.second["range"];
+
+			info.node_lights[pair.first] = node;
+		}
+	}
+
 
 	size_t nmatrices = file->binaryBlob.size() / (sizeof(float) * 16);
 	info.matrices.resize(nmatrices);
@@ -69,6 +85,19 @@ assets::AssetFile assets::pack_prefab(const PrefabInfo& info)
 	}
 
 	prefab_metadata["node_meshes"] = meshindex;
+
+	std::unordered_map<uint64_t, nlohmann::json> lightindex;
+	for (auto pair : info.node_lights)
+	{
+		nlohmann::json lightnode;
+		lightnode["color"] = { pair.second.color[0], pair.second.color[1], pair.second.color[2] };
+		lightnode["intensity"] = pair.second.intensity;
+		lightnode["type"] = pair.second.type;
+		lightnode["range"] = pair.second.range;
+		lightindex[pair.first] = lightnode;
+	}
+
+	prefab_metadata["node_lights"] = lightindex;
 
 	//core file header
 	AssetFile file;
