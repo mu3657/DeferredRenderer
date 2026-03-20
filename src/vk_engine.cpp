@@ -1,6 +1,8 @@
 //> includes
 #define VMA_IMPLEMENTATION
 #include "vk_engine.h"
+#include <Tracy/Tracy.hpp>
+
 
 #include <glm/gtx/transform.hpp>
 #include <SDL.h>
@@ -47,7 +49,7 @@ void VulkanEngine::init()
         _windowExtent.height,
         window_flags
     );
-	init_renderdoc();
+	//init_renderdoc();
     init_vulkan();
 
     init_swapchain();
@@ -246,9 +248,11 @@ void VulkanEngine::draw_background(VkCommandBuffer cmd)
 
 void VulkanEngine::draw()
 {
+	ZoneScoped;
 	if (capture_next_frame && rdoc_api) {
 		rdoc_api->StartFrameCapture(NULL, NULL);
 	}
+
 
 	update_scene();
 
@@ -316,7 +320,7 @@ void VulkanEngine::draw()
 	vkutil::transition_image(cmd, _gAlbedo.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 
 
 	lighting_pass(cmd,_drawImage.imageView);
@@ -380,18 +384,27 @@ void VulkanEngine::draw()
     //increase the number of frames drawn
     _frameNumber++;
 
-
+	FrameMark;
 }
+
 
 void VulkanEngine::run()
 {
     SDL_Event e;
     bool bQuit = false;
-
+	uint64_t lastTime = SDL_GetPerformanceCounter();
+	uint64_t frequency = SDL_GetPerformanceFrequency();
     // main loop
     while (!bQuit) {
+		ZoneScopedN("Main Loop");
         //Handle events on queue
-        while (SDL_PollEvent(&e) != 0) {
+    	uint64_t currentTime = SDL_GetPerformanceCounter();
+    	// 得到的 deltaTime 单位是秒 (e.g., 0.0166s 对于 60fps)
+    	float deltaTime = (float)(currentTime - lastTime) / (float)frequency;
+    	// fmt::print("deltaTime: {}\n", deltaTime);
+    	lastTime = currentTime;
+
+        while (SDL_PollEvent(&e) ) {
         	auto start = std::chrono::system_clock::now();
             //close the window when user alt-f4s or clicks the X button
             if (e.type == SDL_QUIT) bQuit = true;
@@ -400,6 +413,7 @@ void VulkanEngine::run()
             }
 
         	mainCamera.processSDLEvent(e);
+        	mainCamera.update(deltaTime);
         	ImGui_ImplSDL2_ProcessEvent(&e);
 
             if (e.type == SDL_WINDOWEVENT) {
@@ -502,7 +516,15 @@ void VulkanEngine::init_vulkan()
     //vulkan 1.2 features
     VkPhysicalDeviceVulkan12Features features12{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
     features12.bufferDeviceAddress = true;
+
     features12.descriptorIndexing = true;
+	features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+	features12.descriptorBindingPartiallyBound           = VK_TRUE;
+	features12.descriptorBindingVariableDescriptorCount  = VK_TRUE;
+	features12.runtimeDescriptorArray                   = VK_TRUE;
+
+	features12.descriptorIndexing = VK_TRUE;
+
 
 
     //use vkbootstrap to select a gpu.
@@ -1014,6 +1036,8 @@ bool is_visible(const RenderObject& obj, const glm::mat4& viewproj) {
 
 void VulkanEngine::geometry_pass(VkCommandBuffer cmd)
 {
+	ZoneScoped;
+
 	std::vector<uint32_t> opaque_draws;
 	opaque_draws.reserve(mainDrawContext.OpaqueSurfaces.size());
 
@@ -1147,6 +1171,8 @@ void VulkanEngine::geometry_pass(VkCommandBuffer cmd)
 }
 void VulkanEngine::lighting_pass(VkCommandBuffer cmd, VkImageView targetImageView)
 {
+	ZoneScoped;
+
 	VkRenderingAttachmentInfo swapchainAttachment = vkinit::attachment_info(targetImageView, nullptr, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	VkRenderingInfo renderInfo = {};
 	renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -1304,7 +1330,7 @@ void VulkanEngine::init_Deferredlighting_pipeline()
 	pipelineBuilder.disable_blending();
 	pipelineBuilder.enable_depthtest(false, VK_COMPARE_OP_ALWAYS);
 
-	pipelineBuilder.set_color_attachment_formats({ VK_FORMAT_R8G8B8A8_UNORM });
+	pipelineBuilder.set_color_attachment_formats({ VK_FORMAT_R16G16B16A16_SFLOAT });
 	pipelineBuilder.set_depth_format(_depthImage.imageFormat);
 	pipelineBuilder._pipelineLayout = pipelineLayout;
 
@@ -1715,7 +1741,7 @@ void VulkanEngine::resize_swapchain()
 
 void VulkanEngine::update_scene()
 {
-	mainCamera.update();
+
 
 	glm::mat4 view = mainCamera.getViewMatrix();
 

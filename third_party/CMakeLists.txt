@@ -1,4 +1,5 @@
 find_package(Vulkan REQUIRED)
+find_package(Threads REQUIRED)
 include(ExternalProject)
 
 add_library(vkbootstrap STATIC)
@@ -117,3 +118,10 @@ target_include_directories(assimp INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/assimp/
 
 add_library(tinyGLTF INTERFACE)
 target_include_directories(tinyGLTF INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/tinygltf")
+ 
+ add_library(tracy STATIC tracy/public/TracyClient.cpp)
+ target_include_directories(tracy PUBLIC tracy/public)
+ target_compile_definitions(tracy PUBLIC TRACY_ENABLE)
+ if(WIN32)
+     target_link_libraries(tracy PUBLIC ws2_32 dbghelp secur32)
+ endif()

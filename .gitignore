@@ -67,5 +67,6 @@ Thumbs.db
 # Project specific
 /assets/
 /assets/brickadia
+third_party/
 *.rdc
 *.resolved
