@@ -346,28 +346,14 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
 
     constants.emissive_factors = glm::vec4(parse_vec3(matInfo.customProperties["emissiveFactor"], glm::vec3(0.0f)), 1.0f);
 
-    // Create GPU Data Buffer
-    AllocatedBuffer dataBuffer = _engine->create_buffer(sizeof(GLTFMetallic_Roughness::MaterialConstants), 
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-    
-    void* data = dataBuffer.info.pMappedData;
-    memcpy(data, &constants, sizeof(constants));
-
-    resources.dataBuffer = dataBuffer.buffer;
-    resources.dataBufferOffset = 0;
+    // Pass constants struct directly to write_material for SSBO inclusion
+    resources.data = constants;
 
     // Build Material Instance
     MaterialInstance matInstance = _engine->metalRoughMaterial.write_material(_engine->_device, pass, resources, _engine->globalDescriptorAllocator);
 
     auto newMat = std::make_shared<Material>();
     newMat->data = matInstance;
-
-    // Register cleanup for the constant buffer
-    _engine->_mainDeletionQueue.push_function([=, engine = _engine]() {
-        engine->destroy_buffer(dataBuffer);
-
-    });
-
 
     _materials[path] = newMat;
     return newMat;

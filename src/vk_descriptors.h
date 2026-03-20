@@ -1,11 +1,12 @@
-﻿#pragma once
+#pragma once
 
 #include <vk_types.h>
 struct DescriptorLayoutBuilder {
 
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    std::vector<VkDescriptorBindingFlags> bindingFlags;
 
-    void add_binding(uint32_t binding, VkDescriptorType type);
+    void add_binding(uint32_t binding, VkDescriptorType type, VkDescriptorBindingFlags flags = 0, uint32_t descriptorCount = 1);
     void clear();
     VkDescriptorSetLayout build(VkDevice device, VkShaderStageFlags shaderStages, void* pNext = nullptr, VkDescriptorSetLayoutCreateFlags flags = 0);
 };
@@ -55,6 +56,7 @@ struct DescriptorWriter {
     std::vector<VkWriteDescriptorSet> writes;
 
     void write_image(int binding,VkImageView image,VkSampler sampler , VkImageLayout layout, VkDescriptorType type);
+    void write_image_to_array(int binding, uint32_t arrayElement, VkImageView image, VkSampler sampler, VkImageLayout layout, VkDescriptorType type);
     void write_buffer(int binding,VkBuffer buffer,size_t size, size_t offset,VkDescriptorType type);
 
     void clear();

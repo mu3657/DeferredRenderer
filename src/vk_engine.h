@@ -91,16 +91,24 @@ struct GLTFMetallic_Roughness {
 	MaterialPipeline opaquePipeline;
 	MaterialPipeline transparentPipeline;
 
-	VkDescriptorSetLayout materialLayout;
-
 	struct MaterialConstants {
 		glm::vec4 colorFactors;
 		glm::vec4 metal_rough_factors;
 		//padding, we need it anyway for uniform buffers
 		glm::vec4 emissive_factors; // 发光因子 (rgb), w可存 emissive strength 或 alpha cutoff
 
+		uint32_t colorTexID;
+		uint32_t metalRoughTexID;
+		uint32_t normalTexID;
+		uint32_t occlusionTexID;
+
+		uint32_t emissiveTexID;
+		uint32_t pad0;
+		uint32_t pad1;
+		uint32_t pad2;
+
 		// 调整 padding 以保证正确的字节对齐 (比如满足 256 字节)
-		glm::vec4 extra[13];
+		glm::vec4 extra[12];
 	};
 
 	struct MaterialResources {
@@ -116,9 +124,7 @@ struct GLTFMetallic_Roughness {
 		AllocatedImage emissiveImage;       // 发光贴图
 		VkSampler emissiveSampler;
 
-
-		VkBuffer dataBuffer;
-		uint32_t dataBufferOffset;
+		MaterialConstants data;
 	};
 
 	DescriptorWriter writer;
@@ -183,6 +189,17 @@ public:
 	// --------------------------
 
 	DescriptorAllocatorGrowable globalDescriptorAllocator;
+
+	// --- Bindless Setup ---
+	VkDescriptorSetLayout _bindlessDescriptorLayout;
+	VkDescriptorSet _bindlessDescriptorSet;
+	AllocatedBuffer _materialBuffer;
+
+	uint32_t bindlessTextureCount{0};
+	uint32_t bindlessMaterialCount{0};
+
+	uint32_t upload_bindless_texture(VkImageView view, VkSampler sampler);
+	uint32_t upload_bindless_material(const GLTFMetallic_Roughness::MaterialConstants& materialData);
 
 	VkDescriptorSet _drawImageDescriptors;
 	VkDescriptorSetLayout _drawImageDescriptorLayout;

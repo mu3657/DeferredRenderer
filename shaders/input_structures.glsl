@@ -22,15 +22,26 @@ layout(set = 0, binding = 1) uniform  ObjectBuffer{
     uint padding2;
 } ObjectData;
 
-layout(set = 1, binding = 0) uniform GLTFMaterialData{
-
+struct MaterialData {
     vec4 colorFactors;
     vec4 metal_rough_factors;
+    vec4 emissive_factors;
 
-} materialData;
+    uint colorTexID;
+    uint metalRoughTexID;
+    uint normalTexID;
+    uint occlusionTexID;
 
-layout(set = 1, binding = 1) uniform sampler2D colorTex;
-layout(set = 1, binding = 2) uniform sampler2D metalRoughTex;
-layout(set = 1, binding = 3) uniform sampler2D normalTex;
-layout(set = 1, binding = 4) uniform sampler2D occlusionTex;
-layout(set = 1, binding = 5) uniform sampler2D emissiveTex;
+    uint emissiveTexID;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+
+    vec4 extra[12];
+};
+
+layout(set = 1, binding = 0) readonly buffer MaterialStorage {
+    MaterialData materials[];
+};
+
+layout(set = 1, binding = 1) uniform sampler2D globalTextures[];

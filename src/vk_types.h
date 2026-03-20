@@ -71,6 +71,7 @@ struct GPUMeshBuffers {
 struct GPUDrawPushConstants {
     glm::mat4 worldMatrix;
     VkDeviceAddress vertexBuffer;
+    uint32_t materialID;
 };
 
 enum class MaterialPass :uint8_t {
@@ -85,7 +86,7 @@ struct MaterialPipeline {
 
 struct MaterialInstance {
     MaterialPipeline* pipeline;
-    VkDescriptorSet materialSet;
+    uint32_t materialID;
     MaterialPass passType;
 };
 

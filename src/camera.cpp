@@ -5,41 +5,36 @@
 
 void Camera::update(float deltaTime)
 {
-    // 1. 获取当前键盘全局状态，解决多键按下冲突
     const Uint8* state = SDL_GetKeyboardState(NULL);
-    fmt::print("W:{} A:{} S:{} D:{}\n", state[SDL_SCANCODE_W], state[SDL_SCANCODE_A], state[SDL_SCANCODE_S], state[SDL_SCANCODE_D]);
-    printf("Move speed: %f, Pos: %f %f %f\n", moveSpeed, position.x, position.y, position.z);
     glm::vec3 inputVelocity(0.f);
     if (state[SDL_SCANCODE_W]) inputVelocity.z -= 10.f;
     if (state[SDL_SCANCODE_S]) inputVelocity.z += 10.f;
     if (state[SDL_SCANCODE_A]) inputVelocity.x -= 10.f;
     if (state[SDL_SCANCODE_D]) inputVelocity.x += 10.f;
 
-    // 防止斜向移动速度过快
+
     // if (glm::length(inputVelocity) > 0.1f) {
     //     inputVelocity = glm::normalize(inputVelocity);
     // }
 
-    // 2. 根据旋转矩阵计算移动方向
     glm::mat4 cameraRotation = getRotationMatrix();
     position += glm::vec3(cameraRotation * glm::vec4(inputVelocity, 0.f)) * moveSpeed * deltaTime;
 }
 
 void Camera::processSDLEvent(SDL_Event& e)
 {
-    // 修复 Alt 逻辑：只有按/放 Alt 键时才修改状态
+
     if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
         if (e.key.keysym.sym == SDLK_LALT || e.key.keysym.sym == SDLK_RALT) {
             isAltPressed = (e.type == SDL_KEYDOWN);
         }
     }
 
-    // 鼠标移动处理
     if (e.type == SDL_MOUSEMOTION && !isAltPressed) {
         yaw += (float)e.motion.xrel * sensitivity;
         pitch -= (float)e.motion.yrel * sensitivity;
 
-        // 限制俯仰角，防止视角反转 (约 89 度)
+        // 限制俯仰角
         pitch = std::clamp(pitch, -1.55f, 1.55f);
     }
 

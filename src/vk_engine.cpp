@@ -37,6 +37,8 @@ VulkanEngine& VulkanEngine::Get() { return *loadedEngine; }
 
 void VulkanEngine::init()
 {
+
+	loadedEngine = this;
     // We initialize SDL and create a window with it.
     SDL_Init(SDL_INIT_VIDEO);
 
@@ -77,6 +79,8 @@ void VulkanEngine::init()
 
     //everything went fine
     _isInitialized = true;
+
+
 }
 void VulkanEngine::init_renderdoc() {
 	// 1. 动态加载 RenderDoc 动态链接库
@@ -266,9 +270,6 @@ void VulkanEngine::draw()
     _drawExtent.width= std::min(_swapchainExtent.width, _drawImage.imageExtent.width) * renderScale;
 
 
-    VK_CHECK(vkResetFences(_device, 1, &get_current_frame()._renderFence));
-
-
     //request image from the swapchain
     uint32_t swapchainImageIndex;
 
@@ -277,6 +278,8 @@ void VulkanEngine::draw()
         resize_requested = true;
         return ;
     }
+
+    VK_CHECK(vkResetFences(_device, 1, &get_current_frame()._renderFence));
 
     VkCommandBuffer cmd = get_current_frame()._mainCommandBuffer;
 
@@ -413,7 +416,6 @@ void VulkanEngine::run()
             }
 
         	mainCamera.processSDLEvent(e);
-        	mainCamera.update(deltaTime);
         	ImGui_ImplSDL2_ProcessEvent(&e);
 
             if (e.type == SDL_WINDOWEVENT) {
@@ -436,6 +438,9 @@ void VulkanEngine::run()
         	auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
         	stats.frametime = elapsed.count() / 1000.f;
         }
+
+        // 每帧只更新一次相机（放在事件循环之外）
+        mainCamera.update(deltaTime);
 
         //do not draw if we are minimized
         if (stop_rendering) {
@@ -734,6 +739,68 @@ void VulkanEngine::init_descriptors() {
 
 
 
+    {
+        DescriptorLayoutBuilder builder;
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0); // Material Buffer
+        builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
+            2000); // 可变贴图数组，必须与 variableCount 和 pool 大小一致
+        _bindlessDescriptorLayout = builder.build(
+            _device,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            nullptr,
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT); // pool 有这个 flag，layout 必须匹配
+    }
+    
+    uint32_t variableCount = 2000;
+    VkDescriptorSetVariableDescriptorCountAllocateInfo variableAllocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
+        .descriptorSetCount = 1,
+        .pDescriptorCounts = &variableCount
+    };
+    
+    // Create a dedicated descriptor pool for bindless
+    VkDescriptorPoolSize bindless_pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4000 }
+    };
+    VkDescriptorPoolCreateInfo bindless_pool_info = {};
+    bindless_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    bindless_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    bindless_pool_info.maxSets = 1;
+    bindless_pool_info.poolSizeCount = 2;
+    bindless_pool_info.pPoolSizes = bindless_pool_sizes;
+
+    VkDescriptorPool bindlessPool;
+    VK_CHECK(vkCreateDescriptorPool(_device, &bindless_pool_info, nullptr, &bindlessPool));
+
+    VkDescriptorSetAllocateInfo bindlessAllocInfo = {};
+    bindlessAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    bindlessAllocInfo.pNext = &variableAllocInfo;
+    bindlessAllocInfo.descriptorPool = bindlessPool;
+    bindlessAllocInfo.descriptorSetCount = 1;
+    bindlessAllocInfo.pSetLayouts = &_bindlessDescriptorLayout;
+
+    VK_CHECK(vkAllocateDescriptorSets(_device, &bindlessAllocInfo, &_bindlessDescriptorSet));
+
+    _mainDeletionQueue.push_function([this, bindlessPool]() {
+        vkDestroyDescriptorPool(_device, bindlessPool, nullptr);
+    });
+
+    // Initial Material Buffer sizing for 2000 materials
+    _materialBuffer = create_buffer(sizeof(GLTFMetallic_Roughness::MaterialConstants) * 4000,
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 
+                                    VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+    DescriptorWriter bindlessWriter;
+    bindlessWriter.write_buffer(0, _materialBuffer.buffer, sizeof(GLTFMetallic_Roughness::MaterialConstants) * 4000, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    bindlessWriter.update_set(_device, _bindlessDescriptorSet);
+
+    _mainDeletionQueue.push_function([this]() {
+        vkDestroyDescriptorSetLayout(_device, _bindlessDescriptorLayout, nullptr);
+        destroy_buffer(_materialBuffer);
+    });
+
     for (int i = 0; i < FRAME_OVERLAP; i++) {
         // create a descriptor pool
         std::vector<DescriptorAllocatorGrowable::PoolSizeRatio> frame_sizes = {
@@ -815,19 +882,12 @@ void VulkanEngine::init_pipelines()
     materialResources.emissiveImage     = _blackImage;
     materialResources.emissiveSampler   = _defaultSamplerLinear;
 
-    AllocatedBuffer materialConstants = create_buffer(sizeof(GLTFMetallic_Roughness::MaterialConstants),
-        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
-    auto* matData = (GLTFMetallic_Roughness::MaterialConstants*)materialConstants.allocation->GetMappedData();
-    matData->colorFactors        = glm::vec4{1, 1, 1, 1};
-    matData->metal_rough_factors = glm::vec4{0, 0.5f, 0, 0};
-    matData->emissive_factors    = glm::vec4{0, 0, 0, 0};
+    GLTFMetallic_Roughness::MaterialConstants constants{};
+    constants.colorFactors        = glm::vec4{1, 1, 1, 1};
+    constants.metal_rough_factors = glm::vec4{0, 0.5f, 0, 0};
+    constants.emissive_factors    = glm::vec4{0, 0, 0, 0};
 
-    _mainDeletionQueue.push_function([=, this]() {
-        destroy_buffer(materialConstants);
-    });
-
-    materialResources.dataBuffer       = materialConstants.buffer;
-    materialResources.dataBufferOffset = 0;
+    materialResources.data = constants;
 
     defaultData = metalRoughMaterial.write_material(_device, MaterialPass::MainColor,
         materialResources, globalDescriptorAllocator);
@@ -1124,28 +1184,25 @@ void VulkanEngine::geometry_pass(VkCommandBuffer cmd)
     VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
 
     auto draw = [&](const RenderObject& r) {
-        if (r.material != lastMaterial) {
-            lastMaterial = r.material;
-            if (r.material->pipeline != lastPipeline) {
-
-                lastPipeline = r.material->pipeline;
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.material->pipeline->pipeline);
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,r.material->pipeline->layout, 0, 1,
-                    &globalDescriptor, 0, nullptr);
-
-            }
-
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.material->pipeline->layout, 1, 1,
-                &r.material->materialSet, 0, nullptr);
+        if (r.material->pipeline != lastPipeline) {
+            lastPipeline = r.material->pipeline;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.material->pipeline->pipeline);
+            
+            // Bind both Set 0 (Per frame Camera/Object Data) and Set 1 (Bindless Asset Data)
+            VkDescriptorSet descriptorSets[] = { globalDescriptor, _bindlessDescriptorSet };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.material->pipeline->layout, 0, 2, descriptorSets, 0, nullptr);
         }
+        
         if (r.indexBuffer != lastIndexBuffer) {
             lastIndexBuffer = r.indexBuffer;
             vkCmdBindIndexBuffer(cmd, r.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
         }
+        
         // calculate final mesh matrix
         GPUDrawPushConstants push_constants;
         push_constants.worldMatrix = r.transform;
         push_constants.vertexBuffer = r.vertexBufferAddress;
+        push_constants.materialID = r.material->materialID;
 
         vkCmdPushConstants(cmd, r.material->pipeline->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GPUDrawPushConstants), &push_constants);
 
@@ -1361,19 +1418,8 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 	matrixRange.size = sizeof(GPUDrawPushConstants);
 	matrixRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
-    DescriptorLayoutBuilder layoutBuilder;
-    layoutBuilder.add_binding(0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-    layoutBuilder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-	layoutBuilder.add_binding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-	// ====== 新增 ======
-	layoutBuilder.add_binding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // Normal
-	layoutBuilder.add_binding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // Occlusion
-	layoutBuilder.add_binding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // Emissive
-
-    materialLayout = layoutBuilder.build(engine->_device, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
-
 	VkDescriptorSetLayout layouts[] = { engine->_gpuSceneDataDescriptorLayout,
-        materialLayout };
+        engine->_bindlessDescriptorLayout };
 
 	VkPipelineLayoutCreateInfo mesh_layout_info = vkinit::pipeline_layout_create_info();
 	mesh_layout_info.setLayoutCount = 2;
@@ -1430,16 +1476,31 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 		// 2. 销毁管线的总布线图 (Pipeline Layout)
 		// newLayout 在上面被 [=] 按值捕获了，所以在这里绝对安全
 		vkDestroyPipelineLayout(engine->_device, newLayout, nullptr);
-
-		// 3. 销毁你自己用 Builder 捏出来的材质插线板图纸
-		vkDestroyDescriptorSetLayout(engine->_device, materialLayout, nullptr);
 	});
 
 }
 
+uint32_t VulkanEngine::upload_bindless_texture(VkImageView view, VkSampler sampler)
+{
+    uint32_t id = bindlessTextureCount++;
+    DescriptorWriter writer;
+    writer.write_image_to_array(1, id, view, sampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    writer.update_set(_device, _bindlessDescriptorSet);
+    return id;
+}
+
+uint32_t VulkanEngine::upload_bindless_material(const GLTFMetallic_Roughness::MaterialConstants& materialData)
+{
+    uint32_t id = bindlessMaterialCount++;
+    // Buffer 创建时已设置 VMA_ALLOCATION_CREATE_MAPPED_BIT，直接使用持久映射指针
+    GLTFMetallic_Roughness::MaterialConstants* matArray =
+        (GLTFMetallic_Roughness::MaterialConstants*)_materialBuffer.allocation->GetMappedData();
+    matArray[id] = materialData;
+    return id;
+}
+
 void GLTFMetallic_Roughness::clear_resources(VkDevice device)
 {
-
 }
 
 MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, MaterialPass pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator)
@@ -1453,17 +1514,27 @@ MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, Materia
         matData.pipeline = &opaquePipeline;
     }
 
-    matData.materialSet = descriptorAllocator.allocate(device, materialLayout);
+    VulkanEngine& engine = VulkanEngine::Get();
 
+    // 1. Upload textures to bindless array and get IDs
+    uint32_t colorID = engine.upload_bindless_texture(resources.colorImage.imageView, resources.colorSampler);
+    uint32_t metalRoughID = engine.upload_bindless_texture(resources.metalRoughImage.imageView, resources.metalRoughSampler);
+    uint32_t normalID = engine.upload_bindless_texture(resources.normalImage.imageView, resources.normalSampler);
+    uint32_t occlusionID = engine.upload_bindless_texture(resources.occlusionImage.imageView, resources.occlusionSampler);
+    uint32_t emissiveID = engine.upload_bindless_texture(resources.emissiveImage.imageView, resources.emissiveSampler);
 
-    writer.clear();
-    writer.write_buffer(0, resources.dataBuffer, sizeof(MaterialConstants), resources.dataBufferOffset, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-    writer.write_image(1, resources.colorImage.imageView,      resources.colorSampler,      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    writer.write_image(2, resources.metalRoughImage.imageView, resources.metalRoughSampler, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-	writer.write_image(3, resources.normalImage.imageView,     resources.normalSampler,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    writer.write_image(4, resources.occlusionImage.imageView,  resources.occlusionSampler,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    writer.write_image(5, resources.emissiveImage.imageView,   resources.emissiveSampler,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    writer.update_set(device, matData.materialSet);
+    // Read the material data that was populated by the asset pipeline
+    MaterialConstants localMat = resources.data;
+
+    // Update the struct with global texture IDs
+    localMat.colorTexID = colorID;
+    localMat.metalRoughTexID = metalRoughID;
+    localMat.normalTexID = normalID;
+    localMat.occlusionTexID = occlusionID;
+    localMat.emissiveTexID = emissiveID;
+
+    // 2. Upload material to global SSBO and get materialID
+    matData.materialID = engine.upload_bindless_material(localMat);
 
     return matData;
 }
@@ -1611,6 +1682,7 @@ void VulkanEngine::init_swapchain()
     _depthImage.imageExtent = drawImageExtent;
     VkImageUsageFlags depthImageUsages{};
     depthImageUsages |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthImageUsages |= VK_IMAGE_USAGE_SAMPLED_BIT;
 
     VkImageCreateInfo dimg_info = vkinit::image_create_info(_depthImage.imageFormat, depthImageUsages, drawImageExtent);
 

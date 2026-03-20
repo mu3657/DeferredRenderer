@@ -1,18 +1,20 @@
-﻿#include <vk_descriptors.h>
+#include <vk_descriptors.h>
 
-void DescriptorLayoutBuilder::add_binding(uint32_t binding, VkDescriptorType type)
+void DescriptorLayoutBuilder::add_binding(uint32_t binding, VkDescriptorType type, VkDescriptorBindingFlags flags, uint32_t descriptorCount)
 {
     VkDescriptorSetLayoutBinding newbind {};
     newbind.binding = binding;
-    newbind.descriptorCount = 1;
+    newbind.descriptorCount = descriptorCount;
     newbind.descriptorType = type;
 
     bindings.push_back(newbind);
+    bindingFlags.push_back(flags);
 }
 
 void DescriptorLayoutBuilder::clear()
 {
     bindings.clear();
+    bindingFlags.clear();
 }
 
 VkDescriptorSetLayout DescriptorLayoutBuilder::build(VkDevice device, VkShaderStageFlags shaderStages, void* pNext, VkDescriptorSetLayoutCreateFlags flags)
@@ -22,7 +24,23 @@ VkDescriptorSetLayout DescriptorLayoutBuilder::build(VkDevice device, VkShaderSt
     }
 
     VkDescriptorSetLayoutCreateInfo info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    info.pNext = pNext;
+    
+    // Check if we need binding flags
+    bool hasFlags = false;
+    for (auto f : bindingFlags) {
+        if (f != 0) hasFlags = true;
+    }
+
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {};
+    if (hasFlags) {
+        flagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        flagsInfo.bindingCount = (uint32_t)bindingFlags.size();
+        flagsInfo.pBindingFlags = bindingFlags.data();
+        flagsInfo.pNext = pNext;
+        info.pNext = &flagsInfo;
+    } else {
+        info.pNext = pNext;
+    }
 
     info.pBindings = bindings.data();
     info.bindingCount = (uint32_t)bindings.size();
@@ -217,6 +235,25 @@ void DescriptorWriter::write_image(int binding,VkImageView image, VkSampler samp
     VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
 
     write.dstBinding = binding;
+    write.dstSet = VK_NULL_HANDLE; //left empty for now until we need to write it
+    write.descriptorCount = 1;
+    write.descriptorType = type;
+    write.pImageInfo = &info;
+
+    writes.push_back(write);
+}
+
+void DescriptorWriter::write_image_to_array(int binding, uint32_t arrayElement, VkImageView image, VkSampler sampler, VkImageLayout layout, VkDescriptorType type)
+{
+    VkDescriptorImageInfo& info = imageInfos.emplace_back(VkDescriptorImageInfo{
+        .sampler = sampler,
+        .imageView = image,
+        .imageLayout = layout
+    });
+
+    VkWriteDescriptorSet write = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    write.dstBinding = binding;
+    write.dstArrayElement = arrayElement;
     write.dstSet = VK_NULL_HANDLE; //left empty for now until we need to write it
     write.descriptorCount = 1;
     write.descriptorType = type;
