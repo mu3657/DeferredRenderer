@@ -3,7 +3,7 @@
 #include "vk_engine.h"
 #include <Tracy/Tracy.hpp>
 
-
+#include <algorithm>
 #include <glm/gtx/transform.hpp>
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -51,7 +51,7 @@ void VulkanEngine::init()
         _windowExtent.height,
         window_flags
     );
-	//init_renderdoc();
+	init_renderdoc();
     init_vulkan();
 
     init_swapchain();
@@ -75,6 +75,7 @@ void VulkanEngine::init()
 
 	if (structureFile.has_value()) {
 	    loadedScenes["structure"] = *structureFile;
+	    sceneOutliner.rebuild(*(*structureFile));
 	}
 
     //everything went fine
@@ -181,11 +182,11 @@ void VulkanEngine::init_imgui()
 	});
 }
 void VulkanEngine::init_camera() {
-	mainCamera.velocity = glm::vec3(0.f);
 	mainCamera.position = glm::vec3(30.f, -00.f, -085.f);
-
 	mainCamera.pitch = 0;
 	mainCamera.yaw = 0;
+	// Set orbit pivot in front of starting position
+	mainCamera.pivot   = mainCamera.position + glm::vec3(0.f, 0.f, 10.f);
 }
 
 void VulkanEngine::cleanup()
@@ -415,7 +416,12 @@ void VulkanEngine::run()
                 capture_next_frame = true;
             }
 
-        	mainCamera.processSDLEvent(e);
+        	// Only forward mouse-button-down to the camera when ImGui is NOT consuming the mouse
+            // (i.e. the user is clicking in the 3D viewport, not on a panel)
+            bool imguiWantsMouse = ImGui::GetIO().WantCaptureMouse;
+            if (!imguiWantsMouse || e.type != SDL_MOUSEBUTTONDOWN) {
+                mainCamera.processSDLEvent(e);
+            }
         	ImGui_ImplSDL2_ProcessEvent(&e);
 
             if (e.type == SDL_WINDOWEVENT) {
@@ -428,9 +434,6 @@ void VulkanEngine::run()
                 }
             }
 
-            //send SDL event to imgui for handling
-            ImGui_ImplSDL2_ProcessEvent(&e);
-
         	//get clock again, compare with start clock
         	auto end = std::chrono::system_clock::now();
 
@@ -440,7 +443,7 @@ void VulkanEngine::run()
         }
 
         // 每帧只更新一次相机（放在事件循环之外）
-        mainCamera.update(deltaTime);
+        mainCamera.update(deltaTime, _window);
 
         //do not draw if we are minimized
         if (stop_rendering) {
@@ -484,6 +487,9 @@ void VulkanEngine::run()
             ImGui::InputFloat4("data4",(float*)& selected.data.data4);
         }
         ImGui::End();
+
+        // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
+        sceneOutliner.draw(*this);
 
         ImGui::Render();
 
@@ -1662,7 +1668,6 @@ void VulkanEngine::init_swapchain()
     drawImageUsages |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
     VkImageCreateInfo rimg_info = vkinit::image_create_info(_drawImage.imageFormat, drawImageUsages, drawImageExtent);
-
     //for the draw image, we want to allocate it from gpu local memory
     VmaAllocationCreateInfo rimg_allocinfo = {};
     rimg_allocinfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;

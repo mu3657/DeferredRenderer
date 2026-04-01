@@ -49,6 +49,8 @@ target_sources(imgui PRIVATE
   imgui/imgui_tables.cpp
   imgui/imgui_impl_vulkan.cpp
   imgui/imgui_impl_sdl2.cpp
+  imgui/ImGuizmo.h
+  imgui/ImGuizmo.cpp
   )
 
 target_link_libraries(imgui PUBLIC Vulkan::Vulkan SDL2::SDL2)
@@ -125,3 +127,6 @@ target_include_directories(tinyGLTF INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/tinyg
  if(WIN32)
      target_link_libraries(tracy PUBLIC ws2_32 dbghelp secur32)
  endif()
+
+add_library(entt INTERFACE)
+target_include_directories(entt INTERFACE entt)

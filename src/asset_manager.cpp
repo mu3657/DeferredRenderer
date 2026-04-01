@@ -92,9 +92,9 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
             engineVertices[i].uv_y = src[i].uv[1];
         }
     } else {
-        // Dynamic 或未知格式：直接 memcpy（假设布局已匹配）
+        //未知格式：直接 memcpy
 
-        size_t copySize = min(vertexCount * sizeof(Vertex), vertexBuffer.size());
+        size_t copySize = std::min(vertexCount * sizeof(Vertex), vertexBuffer.size());
         memcpy(engineVertices.data(), vertexBuffer.data(), copySize);
     }
 
@@ -221,6 +221,7 @@ std::shared_ptr<LoadedScene> AssetManager::load_prefab(const std::string& path) 
             newNode = std::make_shared<Node>();
         }
 
+        newNode->name = name;
         scene->nodes[name] = newNode;
         nodeMap[nodeID] = newNode;
     }
@@ -380,7 +381,7 @@ AllocatedImage AssetManager::load_texture(const std::string& path) {
 
     if (txInfo.pages.empty()) {
         fmt::print("Warning: Texture {} has 0 pages! Returning fallback image.\n", path);
-        // 返回你引擎里默认的紫黑棋盘格，或者白底的 AllocatedImage fallback
+        // 返回引擎里默认的紫黑棋盘格
         return _engine->_errorCheckerboardImage;
     }
 

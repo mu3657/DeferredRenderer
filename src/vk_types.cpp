@@ -2,7 +2,7 @@
 #include "vk_loader.h"
 
 void MeshNode::Draw(const glm::mat4& topMatrix, DrawContext& ctx) {
-    glm::mat4 nodeMatrix = topMatrix * worldTransform;
+    glm::mat4 nodeMatrix = topMatrix * localTransform;
 
     for (auto& s : mesh->surfaces) {
         RenderObject def;
@@ -21,6 +21,6 @@ void MeshNode::Draw(const glm::mat4& topMatrix, DrawContext& ctx) {
         }
     }
 
-    // recurse down
-    Node::Draw(topMatrix, ctx);
+    // recurse down — pass accumulated nodeMatrix so children inherit this node's transform
+    Node::Draw(nodeMatrix, ctx);
 }

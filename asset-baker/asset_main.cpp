@@ -1475,8 +1475,8 @@ int main(int argc, char* argv[])
 		    		std::cerr << "Failed to convert image: " << p.path() << std::endl;
 		    	}
 		    }
-		    // 🚀 节点 2：处理 FBX (注意这里变成了 else if)
-		    else if (false) // 等你以后开启 fbx 支持时，改成 ext == ".fbx"
+		    // 处理 FBX
+		    else if (false)
 		    {
 		       const aiScene* scene;
 		       {

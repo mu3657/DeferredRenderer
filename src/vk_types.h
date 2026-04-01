@@ -107,6 +107,9 @@ struct Node : public IRenderable {
     std::weak_ptr<Node> parent;
     std::vector<std::shared_ptr<Node>> children;
 
+    std::string  name;           // display name (from GLTF node name)
+    bool         visible { true };  // controlled by SceneOutliner
+
     glm::mat4 localTransform;
     glm::mat4 worldTransform;
 
@@ -120,9 +123,11 @@ struct Node : public IRenderable {
 
     virtual void Draw(const glm::mat4& topMatrix, DrawContext& ctx)
     {
-        // draw children
+        if (!visible) return;   // outliner visibility gate
+        // Accumulate this node's local transform for children
+        glm::mat4 nodeMatrix = topMatrix * localTransform;
         for (auto& c : children) {
-            c->Draw(topMatrix, ctx);
+            c->Draw(nodeMatrix, ctx);
         }
     }
 };

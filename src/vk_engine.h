@@ -14,9 +14,11 @@
 #include "camera.h"
 #include "VkBootstrap.h"
 #include "vk_scene.h"
+#include "vk_outliner.h"
 
 #if defined(_WIN32)
 	#define WIN32_LEAN_AND_MEAN
+	#define NOMINMAX
 	#include <windows.h>
 #elif defined(__linux__)
 	#include <dlfcn.h>
@@ -228,6 +230,7 @@ public:
 
 	AssetManager assetManager;
 	RenderScene renderScene;
+	SceneOutliner sceneOutliner;
 
 	std::unordered_map<std::string, std::shared_ptr<LoadedScene>> loadedScenes;
 
