@@ -9,6 +9,8 @@ add_executable (engine
   vk_images.cpp 
   vk_descriptors.h
   vk_descriptors.cpp
+  vk_descriptor_system.h
+  vk_descriptor_system.cpp
   vk_pipelines.h
   vk_pipelines.cpp
   vk_engine.h

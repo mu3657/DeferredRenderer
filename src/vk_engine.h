@@ -7,6 +7,7 @@
 #include <vk_types.h>
 #include <vk_initializers.h>
 #include <vk_descriptors.h>
+#include <vk_descriptor_system.h>
 
 #include "vk_mem_alloc.h"
 #include <GpuData.h>
@@ -191,6 +192,7 @@ public:
 	// --------------------------
 
 	DescriptorAllocatorGrowable globalDescriptorAllocator;
+	DescriptorSystem _descriptorSystem;
 
 	// --- Bindless Setup ---
 	VkDescriptorSetLayout _bindlessDescriptorLayout;

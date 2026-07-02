@@ -70,3 +70,4 @@ Thumbs.db
 third_party/
 *.rdc
 *.resolved
+DESCRIPTOR_SYSTEM.md

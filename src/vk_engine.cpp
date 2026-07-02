@@ -699,51 +699,35 @@ void VulkanEngine::immediate_submit(std::function<void(VkCommandBuffer cmd)>&& f
 }
 
 void VulkanEngine::init_descriptors() {
-    //create a descriptor pool that will hold 10 sets with 1 image each
-    std::vector<DescriptorAllocatorGrowable::PoolSizeRatio> sizes =
-    {
-    	{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-	    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},        // 对应 binding 0 (材质参数)
-	    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5} // 对应 binding 1-4 (4张贴图)
-    };
-
-    globalDescriptorAllocator.init(_device, 10, sizes);
-
-    //make the descriptor set layout for our compute draw
-    {
-        DescriptorLayoutBuilder builder;
-        builder.add_binding(0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        _drawImageDescriptorLayout = builder.build(_device, VK_SHADER_STAGE_COMPUTE_BIT);
-    }
-
-    _drawImageDescriptors = globalDescriptorAllocator.allocate(_device,_drawImageDescriptorLayout);
-
-
-    {
-        DescriptorLayoutBuilder builder;
-        builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);   // Camera/Scene UBO
-        builder.add_binding(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);   // Object SSBO
-        _gpuSceneDataDescriptorLayout = builder.build(_device, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
-    }
-
-
-	_mainDeletionQueue.push_function([=, this]() {
-	vkDestroyDescriptorSetLayout(_device, _gpuSceneDataDescriptorLayout, nullptr);
-});
-
-    DescriptorWriter writer;
-    writer.write_image(0, _drawImage.imageView, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-
-    writer.update_set(_device,_drawImageDescriptors);
-
-    //make sure both the descriptor allocator and the new layout get cleaned up properly
-    _mainDeletionQueue.push_function([&]() {
-        globalDescriptorAllocator.destroy_pools(_device);
-
-        vkDestroyDescriptorSetLayout(_device, _drawImageDescriptorLayout, nullptr);
+    _descriptorSystem.init(_device, FRAME_OVERLAP);
+    _mainDeletionQueue.push_function([this]() {
+        _descriptorSystem.cleanup();
     });
 
+    _drawImageDescriptorLayout = _descriptorSystem.layout(DescriptorLayoutID::DrawImage);
+    _gpuSceneDataDescriptorLayout = _descriptorSystem.layout(DescriptorLayoutID::FrameScene);
 
+    _drawImageDescriptors = _descriptorSystem.allocate_persistent(DescriptorLayoutID::DrawImage);
+    _descriptorSystem.write_image(
+        _drawImageDescriptors,
+        0,
+        _drawImage.imageView,
+        VK_NULL_HANDLE,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+
+    // Keep the legacy persistent allocator alive while material/bindless code still
+    // accepts it in public signatures. Fixed engine sets now come from DescriptorSystem.
+    std::vector<DescriptorAllocatorGrowable::PoolSizeRatio> legacyPersistentSizes = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5},
+    };
+    globalDescriptorAllocator.init(_device, 10, legacyPersistentSizes);
+    _mainDeletionQueue.push_function([this]() {
+        globalDescriptorAllocator.destroy_pools(_device);
+    });
 
     {
         DescriptorLayoutBuilder builder;
@@ -751,6 +735,7 @@ void VulkanEngine::init_descriptors() {
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
             2000); // 可变贴图数组，必须与 variableCount 和 pool 大小一致
+
         _bindlessDescriptorLayout = builder.build(
             _device,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -808,55 +793,44 @@ void VulkanEngine::init_descriptors() {
     });
 
     for (int i = 0; i < FRAME_OVERLAP; i++) {
-        // create a descriptor pool
-        std::vector<DescriptorAllocatorGrowable::PoolSizeRatio> frame_sizes = {
-            { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3 },
-            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 },
-            { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 },
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 },
-        };
+        _frames[i].objectStorageBuffer = create_buffer(
+            sizeof(GPUObjectData) * MAX_OBJECTS,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU
+        );
 
-        _frames[i]._frameDescriptorsAllocator = DescriptorAllocatorGrowable{};
-        _frames[i]._frameDescriptorsAllocator.init(_device, 1000, frame_sizes);
+        // 2. 创建这一帧的摄像机 UBO
+        _frames[i].cameraBuffer = create_buffer(
+            sizeof(GPUSceneData),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU
+        );
 
-        _mainDeletionQueue.push_function([&, i]() {
-            _frames[i]._frameDescriptorsAllocator.destroy_pools(_device);
+        // 3. 从这一帧的池子里分配 Set 0
+        _frames[i].globalDescriptor = _descriptorSystem.allocate_frame(DescriptorLayoutID::FrameScene, i);
+
+        // Binding 0: Camera UBO
+        _descriptorSystem.write_buffer(
+            _frames[i].globalDescriptor,
+            0,
+            _frames[i].cameraBuffer.buffer,
+            sizeof(GPUSceneData),
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+        // Binding 1: Object SSBO
+        _descriptorSystem.write_buffer(
+            _frames[i].globalDescriptor,
+            1,
+            _frames[i].objectStorageBuffer.buffer,
+            sizeof(GPUObjectData) * MAX_OBJECTS,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+
+        // 5. 注册销毁 (注意用 [=, this])
+        _mainDeletionQueue.push_function([=, this]() {
+            destroy_buffer(_frames[i].objectStorageBuffer);
+            destroy_buffer(_frames[i].cameraBuffer);
+            // descriptor set 会随着 pool 自动销毁，不用管
         });
-
-    	_frames[i].objectStorageBuffer = create_buffer(
-		sizeof(GPUObjectData) * MAX_OBJECTS,
-		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-		VMA_MEMORY_USAGE_CPU_TO_GPU
-	);
-
-    	// 2. 创建这一帧的摄像机 UBO
-    	_frames[i].cameraBuffer = create_buffer(
-			sizeof(GPUSceneData),
-			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-			VMA_MEMORY_USAGE_CPU_TO_GPU
-		);
-
-    	// 3. 从这一帧的池子里分配 Set 0
-    	_frames[i].globalDescriptor = _frames[i]._frameDescriptorsAllocator.allocate(_device, _gpuSceneDataDescriptorLayout);
-
-    	// 4. 更新 Descriptor Set (把 Buffer 指针填进去)
-    	DescriptorWriter writer;
-
-    	// Binding 0: Camera UBO
-    	writer.write_buffer(0, _frames[i].cameraBuffer.buffer, sizeof(GPUSceneData), 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-
-    	// Binding 1: Object SSBO
-    	writer.write_buffer(1, _frames[i].objectStorageBuffer.buffer, sizeof(GPUObjectData) * MAX_OBJECTS, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-
-    	// 提交更新
-    	writer.update_set(_device, _frames[i].globalDescriptor);
-
-    	// 5. 注册销毁 (注意用 [=, this])
-    	_mainDeletionQueue.push_function([=, this]() {
-			destroy_buffer(_frames[i].objectStorageBuffer);
-			destroy_buffer(_frames[i].cameraBuffer);
-			// descriptor set 会随着 pool 自动销毁，不用管
-		});
 
 
     }
@@ -1764,30 +1738,16 @@ void VulkanEngine::init_gbuffer() {
         vmaDestroyImage(_allocator, _gORM.image, _gORM.allocation);
     });
 
-    // --- Create G-Buffer Descriptor Layout (For deferred lighting pass) ---
-    DescriptorLayoutBuilder builder;
-    builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // gAlbedo
-    builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // gNormal
-    builder.add_binding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // gMaterial
-    builder.add_binding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // gDepth
-
-    _gBufferDescriptorLayout = builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT);
-    
-    _mainDeletionQueue.push_function([=, this]() {
-        vkDestroyDescriptorSetLayout(_device, _gBufferDescriptorLayout, nullptr);
-    });
+    _gBufferDescriptorLayout = _descriptorSystem.layout(DescriptorLayoutID::GBufferInput);
 
     // --- Allocate & Write G-Buffer Descriptor Set ---
-    _gBufferDescriptorSet = globalDescriptorAllocator.allocate(_device, _gBufferDescriptorLayout);
-    
-    DescriptorWriter gBufferWriter;
+    _gBufferDescriptorSet = _descriptorSystem.allocate_persistent(DescriptorLayoutID::GBufferInput);
+
     // Note: uses _defaultSamplerNearest which is now correctly initialized because init_gbuffer() is called after init_default_data()
-    gBufferWriter.write_image(0, _gAlbedo.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    gBufferWriter.write_image(1, _gNormal.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    gBufferWriter.write_image(2, _gORM.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    gBufferWriter.write_image(3, _depthImage.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    
-    gBufferWriter.update_set(_device, _gBufferDescriptorSet);
+    _descriptorSystem.write_image(_gBufferDescriptorSet, 0, _gAlbedo.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    _descriptorSystem.write_image(_gBufferDescriptorSet, 1, _gNormal.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    _descriptorSystem.write_image(_gBufferDescriptorSet, 2, _gORM.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    _descriptorSystem.write_image(_gBufferDescriptorSet, 3, _depthImage.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 }
 void VulkanEngine::destroy_swapchain()
 {
