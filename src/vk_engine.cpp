@@ -12,6 +12,7 @@
 #include <vk_types.h>
 
 #include <chrono>
+#include <filesystem>
 #include <thread>
 
 #include "fmt/color.h"
@@ -31,6 +32,21 @@ const bool bUseValidationLayers = true;
 
 const size_t MAX_OBJECTS = 10000;
 VulkanEngine& VulkanEngine::Get() { return *loadedEngine; }
+
+namespace {
+std::string scene_display_name(const std::string& path)
+{
+    std::filesystem::path fsPath(path);
+    std::filesystem::path parent = fsPath.parent_path().parent_path().filename();
+    std::string stem = fsPath.stem().string();
+
+    if (!parent.empty()) {
+        return parent.string() + " / " + stem;
+    }
+
+    return stem.empty() ? path : stem;
+}
+}
 
 
 
@@ -68,14 +84,14 @@ void VulkanEngine::init()
 
 	init_camera();
 	assetManager.init(this);
-	//std::string structurePath = { "../assets/BistroInterior_out/BistroInterior.gltf" };
-	 std::string structurePath = { "../assets/BistroInterior_out/assets_export/BistroInterior.pfb" };
-	//std::string structurePath = { "../assets/structure/assets_export/structure.pfb" };
-	auto structureFile = loadScene(this,structurePath);
-
-	if (structureFile.has_value()) {
-	    loadedScenes["structure"] = *structureFile;
-	    sceneOutliner.rebuild(*(*structureFile));
+	scan_scene_library();
+	const std::string defaultScene = "../assets/BistroInterior_out/assets_export/BistroInterior.pfb";
+	if (std::find(sceneLibrary.begin(), sceneLibrary.end(), defaultScene) != sceneLibrary.end()) {
+	    load_scene_from_path(defaultScene);
+	} else if (!sceneLibrary.empty()) {
+	    load_scene_from_path(sceneLibrary.front());
+	} else {
+	    fmt::println("Warning: no .pfb scenes found under assets or ../assets.");
 	}
 
     //everything went fine
@@ -488,6 +504,8 @@ void VulkanEngine::run()
         }
         ImGui::End();
 
+        draw_scene_browser();
+
         // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
         sceneOutliner.draw(*this);
 
@@ -500,6 +518,119 @@ void VulkanEngine::run()
 
     }
 }
+
+void VulkanEngine::scan_scene_library()
+{
+    sceneLibrary.clear();
+
+    const std::filesystem::path roots[] = {
+        std::filesystem::path("../assets"),
+        std::filesystem::path("assets"),
+    };
+
+    for (const auto& root : roots) {
+        std::error_code ec;
+        if (!std::filesystem::exists(root, ec)) {
+            continue;
+        }
+
+        std::filesystem::recursive_directory_iterator it(root, ec);
+        std::filesystem::recursive_directory_iterator end;
+        while (!ec && it != end) {
+            if (it->is_regular_file(ec) && it->path().extension() == ".pfb") {
+                std::string scenePath = it->path().lexically_normal().generic_string();
+                if (std::find(sceneLibrary.begin(), sceneLibrary.end(), scenePath) == sceneLibrary.end()) {
+                    sceneLibrary.push_back(scenePath);
+                }
+            }
+
+            it.increment(ec);
+        }
+    }
+
+    std::sort(sceneLibrary.begin(), sceneLibrary.end());
+}
+
+bool VulkanEngine::load_scene_from_path(const std::string& path)
+{
+    if (loadedScenes.find(path) != loadedScenes.end()) {
+        set_active_scene(path);
+        return true;
+    }
+
+    auto sceneFile = loadScene(this, path);
+    if (!sceneFile.has_value()) {
+        fmt::println("Failed to load scene {}", path);
+        return false;
+    }
+
+    loadedScenes[path] = *sceneFile;
+    set_active_scene(path);
+    return true;
+}
+
+void VulkanEngine::set_active_scene(const std::string& sceneName)
+{
+    auto it = loadedScenes.find(sceneName);
+    if (it == loadedScenes.end()) {
+        return;
+    }
+
+    activeSceneName = sceneName;
+    sceneOutliner.rebuild(*it->second);
+}
+
+void VulkanEngine::draw_scene_browser()
+{
+    ImGui::SetNextWindowPos(ImVec2(290, 0), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(360, 180), ImGuiCond_Once);
+
+    if (!ImGui::Begin("Scene Browser", nullptr, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::Button("Refresh")) {
+        scan_scene_library();
+    }
+
+    ImGui::SameLine();
+    ImGui::Text("Available: %d", static_cast<int>(sceneLibrary.size()));
+
+    const std::string activeLabel = activeSceneName.empty()
+        ? std::string("(none)")
+        : scene_display_name(activeSceneName);
+
+    if (ImGui::BeginCombo("Active Scene", activeLabel.c_str())) {
+        for (const std::string& path : sceneLibrary) {
+            const bool active = (path == activeSceneName);
+            const bool loaded = (loadedScenes.find(path) != loadedScenes.end());
+            std::string label = scene_display_name(path);
+            if (loaded) {
+                label += " [loaded]";
+            }
+
+            if (ImGui::Selectable(label.c_str(), active)) {
+                load_scene_from_path(path);
+            }
+
+            if (active) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    if (!activeSceneName.empty()) {
+        ImGui::TextWrapped("%s", activeSceneName.c_str());
+    } else {
+        ImGui::TextDisabled("No active scene");
+    }
+
+    ImGui::Text("Loaded cache: %d", static_cast<int>(loadedScenes.size()));
+    ImGui::End();
+}
+
 void VulkanEngine::init_vulkan()
 {
     vkb::InstanceBuilder builder;
@@ -1800,9 +1931,12 @@ void VulkanEngine::update_scene()
 	//
 	// 	loadedNodes["Cube"]->Draw(translation * scale, mainDrawContext);
 	// }
-	 if (loadedScenes.find("structure") != loadedScenes.end()) {
-	     loadedScenes["structure"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
-	 }
+    if (!activeSceneName.empty()) {
+        auto activeScene = loadedScenes.find(activeSceneName);
+        if (activeScene != loadedScenes.end()) {
+            activeScene->second->Draw(glm::mat4{ 1.f }, mainDrawContext);
+        }
+    }
 
 
 	//some default lighting parameters

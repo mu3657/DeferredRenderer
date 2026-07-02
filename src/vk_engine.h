@@ -235,6 +235,8 @@ public:
 	SceneOutliner sceneOutliner;
 
 	std::unordered_map<std::string, std::shared_ptr<LoadedScene>> loadedScenes;
+	std::vector<std::string> sceneLibrary;
+	std::string activeSceneName;
 
 #pragma region DebugVariables
 	EngineStats stats;
@@ -300,9 +302,13 @@ public:
 
 	void update_scene();
 	void init_camera();
+	bool load_scene_from_path(const std::string& path);
+	void set_active_scene(const std::string& sceneName);
 private:
 	void init_vulkan();
 	void draw_imgui(VkCommandBuffer cmd, VkImageView targetImageView);
+	void draw_scene_browser();
+	void scan_scene_library();
 	void init_swapchain();
 	void init_gbuffer();
 	void init_commands();
