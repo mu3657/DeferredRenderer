@@ -11,6 +11,7 @@ enum class DescriptorLayoutID : uint8_t {
     DrawImage,
     FrameScene,
     GBufferInput,
+    LightData,
     ShadowInput,
     GIInput,
     Count

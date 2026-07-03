@@ -1,5 +1,12 @@
 
+#pragma once
+
+#include <cstdint>
+
 #include <vk_types.h>
+
+constexpr uint32_t MAX_GPU_LIGHTS = 256;
+
 struct GPUSceneData {
     glm::mat4 view;
     glm::mat4 proj;
@@ -22,3 +29,21 @@ struct GPUObjectData {
     uint32_t padding1;          // 填充，保证 128 字节对齐
     uint32_t padding2;
 };
+
+struct GPULight {
+    glm::vec4 positionRange;    // xyz = world position, w = range
+    glm::vec4 directionType;    // xyz = light emission direction, w = LightType
+    glm::vec4 colorIntensity;   // rgb = linear color, w = intensity
+    glm::vec4 params;           // x/y = spot cone cosines, z = shadow index, w = flags
+};
+
+struct GPULightData {
+    uint32_t lightCount{0};
+    uint32_t directionalLightCount{0};
+    uint32_t pointLightCount{0};
+    uint32_t spotLightCount{0};
+    glm::vec4 ambientColor{0.1f};
+};
+
+static_assert(sizeof(GPULight) == 64);
+static_assert(sizeof(GPULightData) == 32);

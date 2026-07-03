@@ -164,6 +164,48 @@ void VulkanEngine::init_imgui()
 
 	// this initializes the core structures of imgui
 	ImGui::CreateContext();
+	ImGuiIO& io = ImGui::GetIO();
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+	ImGui::StyleColorsDark();
+	ImGuiStyle& style = ImGui::GetStyle();
+	style.WindowRounding = 6.f;
+	style.ChildRounding = 4.f;
+	style.FrameRounding = 4.f;
+	style.PopupRounding = 6.f;
+	style.ScrollbarRounding = 4.f;
+	style.GrabRounding = 4.f;
+	style.TabRounding = 4.f;
+	style.WindowPadding = ImVec2(12.f, 10.f);
+	style.FramePadding = ImVec2(8.f, 5.f);
+	style.ItemSpacing = ImVec2(8.f, 6.f);
+	style.ItemInnerSpacing = ImVec2(6.f, 4.f);
+	style.IndentSpacing = 16.f;
+	style.ScrollbarSize = 13.f;
+
+	ImVec4* colors = style.Colors;
+	colors[ImGuiCol_WindowBg] = ImVec4(0.065f, 0.070f, 0.078f, 0.96f);
+	colors[ImGuiCol_ChildBg] = ImVec4(0.045f, 0.050f, 0.058f, 0.96f);
+	colors[ImGuiCol_PopupBg] = ImVec4(0.075f, 0.080f, 0.090f, 0.98f);
+	colors[ImGuiCol_Border] = ImVec4(0.220f, 0.235f, 0.255f, 0.75f);
+	colors[ImGuiCol_FrameBg] = ImVec4(0.120f, 0.130f, 0.145f, 1.00f);
+	colors[ImGuiCol_FrameBgHovered] = ImVec4(0.180f, 0.205f, 0.205f, 1.00f);
+	colors[ImGuiCol_FrameBgActive] = ImVec4(0.160f, 0.255f, 0.230f, 1.00f);
+	colors[ImGuiCol_TitleBg] = ImVec4(0.050f, 0.055f, 0.062f, 1.00f);
+	colors[ImGuiCol_TitleBgActive] = ImVec4(0.080f, 0.110f, 0.115f, 1.00f);
+	colors[ImGuiCol_Button] = ImVec4(0.135f, 0.160f, 0.165f, 1.00f);
+	colors[ImGuiCol_ButtonHovered] = ImVec4(0.200f, 0.285f, 0.265f, 1.00f);
+	colors[ImGuiCol_ButtonActive] = ImVec4(0.135f, 0.365f, 0.315f, 1.00f);
+	colors[ImGuiCol_Header] = ImVec4(0.130f, 0.185f, 0.185f, 0.82f);
+	colors[ImGuiCol_HeaderHovered] = ImVec4(0.170f, 0.260f, 0.240f, 0.95f);
+	colors[ImGuiCol_HeaderActive] = ImVec4(0.120f, 0.335f, 0.290f, 1.00f);
+	colors[ImGuiCol_CheckMark] = ImVec4(0.230f, 0.760f, 0.650f, 1.00f);
+	colors[ImGuiCol_SliderGrab] = ImVec4(0.250f, 0.660f, 0.580f, 1.00f);
+	colors[ImGuiCol_SliderGrabActive] = ImVec4(0.300f, 0.850f, 0.700f, 1.00f);
+	colors[ImGuiCol_Separator] = ImVec4(0.240f, 0.255f, 0.275f, 0.70f);
+	colors[ImGuiCol_SeparatorHovered] = ImVec4(0.240f, 0.580f, 0.520f, 0.90f);
+	colors[ImGuiCol_ResizeGrip] = ImVec4(0.160f, 0.350f, 0.315f, 0.35f);
+	colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.240f, 0.620f, 0.540f, 0.70f);
 
 	// this initializes imgui for SDL
 	ImGui_ImplSDL2_InitForVulkan(_window);
@@ -505,6 +547,7 @@ void VulkanEngine::run()
         ImGui::End();
 
         draw_scene_browser();
+        lightSystem.draw_debug_ui();
 
         // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
         sceneOutliner.draw(*this);
@@ -582,7 +625,7 @@ void VulkanEngine::set_active_scene(const std::string& sceneName)
 
 void VulkanEngine::draw_scene_browser()
 {
-    ImGui::SetNextWindowPos(ImVec2(290, 0), ImGuiCond_Once);
+    ImGui::SetNextWindowPos(ImVec2(340, 0), ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(360, 180), ImGuiCond_Once);
 
     if (!ImGui::Begin("Scene Browser", nullptr, ImGuiWindowFlags_NoCollapse)) {
@@ -965,6 +1008,11 @@ void VulkanEngine::init_descriptors() {
 
 
     }
+
+    lightSystem.init(this, FRAME_OVERLAP);
+    _mainDeletionQueue.push_function([this]() {
+        lightSystem.cleanup();
+    });
 
 
 
@@ -1377,10 +1425,16 @@ void VulkanEngine::lighting_pass(VkCommandBuffer cmd, VkImageView targetImageVie
 	vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,_deferredLightingPipeline);
 	//vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout, 0, 1, &_gBufferDescriptorSet, 0, nullptr);
 	FrameData& currentFrame = get_current_frame();
+    const uint32_t frameIndex = _frameNumber % FRAME_OVERLAP;
+    lightSystem.upload_frame(frameIndex);
+    VkDescriptorSet lightDescriptor = lightSystem.descriptor_set(frameIndex);
+
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							0, 1, &currentFrame.globalDescriptor, 0, nullptr); // 绑定 Set 0 (SceneData)
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							1, 1, &_gBufferDescriptorSet, 0, nullptr);         // 绑定 Set 1 (G-Buffer)
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
+                            2, 1, &lightDescriptor, 0, nullptr);               // Set 2 (LightData)
 	// 绘制 3 个没有 Vertex Buffer 指派的顶点
 	vkCmdDraw(cmd, 3, 1, 0, 0);
 	//
@@ -1479,8 +1533,12 @@ void VulkanEngine::init_Deferredlighting_pipeline()
 		fmt::print("Error when building the deferred lighting shader module \n");
 	}
 	VkPipelineLayoutCreateInfo layoutCreateInfo = vkinit::pipeline_layout_create_info();
-	layoutCreateInfo.setLayoutCount = 2;
-	VkDescriptorSetLayout lightingLayouts[] = { _gpuSceneDataDescriptorLayout, _gBufferDescriptorLayout};
+	layoutCreateInfo.setLayoutCount = 3;
+	VkDescriptorSetLayout lightingLayouts[] = {
+        _gpuSceneDataDescriptorLayout,
+        _gBufferDescriptorLayout,
+        _descriptorSystem.layout(DescriptorLayoutID::LightData)
+    };
 	layoutCreateInfo.pSetLayouts = lightingLayouts;
 	layoutCreateInfo.pPushConstantRanges = nullptr;
 	layoutCreateInfo.pushConstantRangeCount = 0;
@@ -1922,6 +1980,9 @@ void VulkanEngine::update_scene()
 	sceneData.view = view;
 	sceneData.proj = projection;
 	sceneData.viewproj = projection * view;
+    sceneData.ambientColor = glm::vec4(.1f);
+    sceneData.sunlightColor = glm::vec4(1.f);
+    sceneData.sunlightDirection = glm::vec4(0,1,0.5,1.f);
 
 	// loadedNodes["Suzanne"]->Draw(glm::mat4{1.f}, mainDrawContext);
 	// for (int x = -3; x < 3; x++) {
@@ -1931,16 +1992,14 @@ void VulkanEngine::update_scene()
 	//
 	// 	loadedNodes["Cube"]->Draw(translation * scale, mainDrawContext);
 	// }
+    LoadedScene* activeSceneForLighting = nullptr;
     if (!activeSceneName.empty()) {
         auto activeScene = loadedScenes.find(activeSceneName);
         if (activeScene != loadedScenes.end()) {
             activeScene->second->Draw(glm::mat4{ 1.f }, mainDrawContext);
+            activeSceneForLighting = activeScene->second.get();
         }
     }
 
-
-	//some default lighting parameters
-	sceneData.ambientColor = glm::vec4(.1f);
-	sceneData.sunlightColor = glm::vec4(1.f);
-	sceneData.sunlightDirection = glm::vec4(0,1,0.5,1.f);
+    lightSystem.collect(activeSceneForLighting, sceneData);
 }

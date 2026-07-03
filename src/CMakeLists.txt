@@ -2,6 +2,8 @@
 # Add source to this project's executable.
 add_executable (engine 
   main.cpp
+  light_system.h
+  light_system.cpp
   vk_types.h
   vk_initializers.cpp
   vk_initializers.h

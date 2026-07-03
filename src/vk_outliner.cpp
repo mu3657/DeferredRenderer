@@ -8,6 +8,11 @@
 #include "imgui.h"
 #include "ImGuizmo.h"
 
+#include <algorithm>
+#include <cctype>
+#include <unordered_map>
+
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/euler_angles.hpp>
@@ -17,9 +22,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
 static const char* node_icon(SceneNodeType t) {
     switch (t) {
-        case SceneNodeType::Mesh:  return " [M]";
-        case SceneNodeType::Light: return " [L]";
-        default:                   return " [G]";
+        case SceneNodeType::Mesh:  return "[M]";
+        case SceneNodeType::Light: return "[L]";
+        default:                   return "[G]";
+    }
+}
+
+static const char* light_type_name(LightType type) {
+    switch (type) {
+        case LightType::Directional: return "Directional";
+        case LightType::Spot:        return "Spot";
+        default:                     return "Point";
     }
 }
 
@@ -27,6 +40,173 @@ static SceneNodeType classify(const std::shared_ptr<Node>& n) {
     if (dynamic_cast<MeshNode*>(n.get()))  return SceneNodeType::Mesh;
     if (dynamic_cast<LightNode*>(n.get())) return SceneNodeType::Light;
     return SceneNodeType::Group;
+}
+
+static LoadedScene* active_scene(VulkanEngine& engine) {
+    if (engine.activeSceneName.empty()) {
+        return nullptr;
+    }
+
+    auto it = engine.loadedScenes.find(engine.activeSceneName);
+    if (it == engine.loadedScenes.end()) {
+        return nullptr;
+    }
+
+    return it->second.get();
+}
+
+static char lower_ascii(char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
+
+static bool name_matches_filter(const std::string& name, const char* filter) {
+    if (!filter || filter[0] == '\0') {
+        return true;
+    }
+
+    const std::string needle(filter);
+    auto it = std::search(
+        name.begin(), name.end(),
+        needle.begin(), needle.end(),
+        [](char a, char b) { return lower_ascii(a) == lower_ascii(b); });
+    return it != name.end();
+}
+
+static bool has_children(const std::vector<SceneNodeEntry>& entries, int index) {
+    return index + 1 < static_cast<int>(entries.size()) &&
+           entries[index + 1].depth > entries[index].depth;
+}
+
+static bool has_collapsed_ancestor(const std::vector<SceneNodeEntry>& entries, int index) {
+    int depth = entries[index].depth;
+    for (int i = index - 1; i >= 0 && depth > 0; --i) {
+        if (entries[i].depth < depth) {
+            if (!entries[i].open) {
+                return true;
+            }
+            depth = entries[i].depth;
+        }
+    }
+
+    return false;
+}
+
+static bool subtree_matches_filter(const std::vector<SceneNodeEntry>& entries, int index, const char* filter) {
+    if (!filter || filter[0] == '\0') {
+        return true;
+    }
+
+    const int rootDepth = entries[index].depth;
+    for (int i = index; i < static_cast<int>(entries.size()); ++i) {
+        if (i != index && entries[i].depth <= rootDepth) {
+            break;
+        }
+        if (name_matches_filter(entries[i].name, filter)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static std::string unique_node_name(const LoadedScene& scene, const std::string& base) {
+    if (scene.nodes.find(base) == scene.nodes.end()) {
+        return base;
+    }
+
+    for (int i = 1; i < 10000; ++i) {
+        std::string candidate = base + " " + std::to_string(i);
+        if (scene.nodes.find(candidate) == scene.nodes.end()) {
+            return candidate;
+        }
+    }
+
+    return base + " " + std::to_string(static_cast<int>(scene.nodes.size()));
+}
+
+static glm::mat4 spawn_transform(VulkanEngine& engine, const std::shared_ptr<Node>& parent) {
+    if (parent) {
+        return glm::mat4(1.f);
+    }
+
+    return glm::translate(glm::mat4(1.f), engine.mainCamera.pivot);
+}
+
+static void attach_node(LoadedScene& scene, const std::shared_ptr<Node>& node, const std::shared_ptr<Node>& parent) {
+    if (parent) {
+        parent->children.push_back(node);
+        node->parent = parent;
+        node->refreshTransform(parent->worldTransform);
+    } else {
+        scene.topNodes.push_back(node);
+        node->refreshTransform(glm::mat4(1.f));
+    }
+
+    scene.nodes[node->name] = node;
+}
+
+static std::shared_ptr<Node> create_empty_node(VulkanEngine& engine, LoadedScene& scene, const std::shared_ptr<Node>& parent) {
+    auto node = std::make_shared<Node>();
+    node->name = unique_node_name(scene, "Empty Node");
+    node->visible = true;
+    node->localTransform = spawn_transform(engine, parent);
+    node->worldTransform = glm::mat4(1.f);
+
+    attach_node(scene, node, parent);
+    return node;
+}
+
+static std::shared_ptr<Node> create_light_node(
+    VulkanEngine& engine,
+    LoadedScene& scene,
+    const std::shared_ptr<Node>& parent,
+    LightType type)
+{
+    auto node = std::make_shared<LightNode>();
+    node->name = unique_node_name(scene, std::string(light_type_name(type)) + " Light");
+    node->visible = true;
+    node->localTransform = spawn_transform(engine, parent);
+    node->worldTransform = glm::mat4(1.f);
+    node->light.type = type;
+    node->light.color = glm::vec3(1.f, 0.96f, 0.86f);
+    node->light.intensity = (type == LightType::Directional) ? 2.5f : 80.f;
+    node->light.range = (type == LightType::Directional) ? 0.f : 12.f;
+    node->light.worldPosition = glm::vec3(0.f);
+
+    attach_node(scene, node, parent);
+    scene.lightNodes.push_back(node);
+    return node;
+}
+
+static void draw_create_menu_items(
+    VulkanEngine& engine,
+    LoadedScene& scene,
+    const std::shared_ptr<Node>& parent,
+    std::shared_ptr<Node>& createdNode)
+{
+    if (parent) {
+        ImGui::TextDisabled("Parent: %s", parent->name.empty() ? "(unnamed)" : parent->name.c_str());
+    } else {
+        ImGui::TextDisabled("Parent: Scene Root");
+    }
+    ImGui::Separator();
+
+    if (ImGui::MenuItem("Empty Node")) {
+        createdNode = create_empty_node(engine, scene, parent);
+    }
+
+    if (ImGui::BeginMenu("Light")) {
+        if (ImGui::MenuItem("Point Light")) {
+            createdNode = create_light_node(engine, scene, parent, LightType::Point);
+        }
+        if (ImGui::MenuItem("Directional Light")) {
+            createdNode = create_light_node(engine, scene, parent, LightType::Directional);
+        }
+        if (ImGui::MenuItem("Spot Light")) {
+            createdNode = create_light_node(engine, scene, parent, LightType::Spot);
+        }
+        ImGui::EndMenu();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -49,11 +229,32 @@ void SceneOutliner::push_node(const std::shared_ptr<Node>& node, int depth) {
 }
 
 void SceneOutliner::rebuild(const LoadedScene& scene) {
+    std::unordered_map<Node*, bool> previousOpenState;
+    previousOpenState.reserve(entries.size());
+    std::shared_ptr<Node> selectedNode = get_selected_node();
+
+    for (const SceneNodeEntry& entry : entries) {
+        if (auto node = entry.node.lock()) {
+            previousOpenState[node.get()] = entry.open;
+        }
+    }
+
     entries.clear();
     selected_index = -1;
     for (const auto& top : scene.topNodes) {
         push_node(top, 0);
     }
+
+    for (SceneNodeEntry& entry : entries) {
+        if (auto node = entry.node.lock()) {
+            auto it = previousOpenState.find(node.get());
+            if (it != previousOpenState.end()) {
+                entry.open = it->second;
+            }
+        }
+    }
+
+    reveal_node(selectedNode);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +263,30 @@ void SceneOutliner::rebuild(const LoadedScene& scene) {
 std::shared_ptr<Node> SceneOutliner::get_selected_node() const {
     if (selected_index < 0 || selected_index >= (int)entries.size()) return nullptr;
     return entries[selected_index].node.lock();
+}
+
+void SceneOutliner::reveal_node(const std::shared_ptr<Node>& node) {
+    selected_index = -1;
+    if (!node) {
+        return;
+    }
+
+    for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
+        if (entries[i].node.lock() != node) {
+            continue;
+        }
+
+        selected_index = i;
+
+        int depth = entries[i].depth;
+        for (int j = i - 1; j >= 0 && depth > 0; --j) {
+            if (entries[j].depth < depth) {
+                entries[j].open = true;
+                depth = entries[j].depth;
+            }
+        }
+        return;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,9 +310,9 @@ void SceneOutliner::draw(VulkanEngine& engine) {
 // ─────────────────────────────────────────────────────────────────────────────
 // draw_outliner()
 // ─────────────────────────────────────────────────────────────────────────────
-void SceneOutliner::draw_outliner(VulkanEngine& /*engine*/) {
+void SceneOutliner::draw_outliner(VulkanEngine& engine) {
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(280, 600), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(330, 600), ImGuiCond_Once);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
     if (!ImGui::Begin("Outliner", nullptr, flags)) {
@@ -95,14 +320,29 @@ void SceneOutliner::draw_outliner(VulkanEngine& /*engine*/) {
         return;
     }
 
-    // Toolbar: gizmo operation selector
-    ImGui::TextDisabled("Mode:");
+    LoadedScene* scene = active_scene(engine);
+    std::shared_ptr<Node> createdNode;
+    std::shared_ptr<Node> selectedNode = get_selected_node();
+
+    ImGui::BeginDisabled(scene == nullptr);
+    if (ImGui::Button("+ Add")) {
+        ImGui::OpenPopup("##add_node_popup");
+    }
+    if (scene && ImGui::BeginPopup("##add_node_popup")) {
+        draw_create_menu_items(engine, *scene, selectedNode, createdNode);
+        ImGui::EndPopup();
+    }
+    ImGui::EndDisabled();
+    if (scene == nullptr && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+        ImGui::SetTooltip("Load a scene before adding nodes.");
+    }
+
     ImGui::SameLine();
-    if (ImGui::RadioButton("Translate (W)", gizmo_operation == 0)) gizmo_operation = 0;
+    if (ImGui::RadioButton("Move", gizmo_operation == 0)) gizmo_operation = 0;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Rotate (E)", gizmo_operation == 1))    gizmo_operation = 1;
+    if (ImGui::RadioButton("Rotate", gizmo_operation == 1)) gizmo_operation = 1;
     ImGui::SameLine();
-    if (ImGui::RadioButton("Scale (R)", gizmo_operation == 2))     gizmo_operation = 2;
+    if (ImGui::RadioButton("Scale", gizmo_operation == 2)) gizmo_operation = 2;
 
     ImGui::Separator();
 
@@ -112,65 +352,64 @@ void SceneOutliner::draw_outliner(VulkanEngine& /*engine*/) {
     ImGui::InputTextWithHint("##search", "Search...", search_buf, sizeof(search_buf));
     ImGui::Separator();
 
-    // Node list
-    ImGui::BeginChild("##node_list", ImVec2(0, -1), false);
+    const bool searching = (search_buf[0] != '\0');
+
+    ImGui::BeginChild("##node_list", ImVec2(0, -1), true);
 
     for (int i = 0; i < (int)entries.size(); ++i) {
         auto& e = entries[i];
 
-        // Filter
-        if (search_buf[0] != '\0' &&
-            e.name.find(search_buf) == std::string::npos) continue;
+        if (searching) {
+            if (!subtree_matches_filter(entries, i, search_buf)) {
+                continue;
+            }
+        } else if (has_collapsed_ancestor(entries, i)) {
+            continue;
+        }
 
-        // Indentation
-        float indent = e.depth * 14.f;
+        const bool entryHasChildren = has_children(entries, i);
+        const bool is_selected = (selected_index == i);
+        const float indent = e.depth * 18.f;
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
 
-        // Visibility toggle (eye icon)
         bool vis = e.visible;
-        ImGui::PushID(i * 3);
+        ImGui::PushID(i * 4);
         if (ImGui::Checkbox("##vis", &vis)) {
             e.visible = vis;
             if (auto n = e.node.lock()) n->visible = vis;
         }
+        ImGui::SetItemTooltip("Visible");
         ImGui::PopID();
         ImGui::SameLine();
 
-        // Selectable row  (icon + name)
         std::string label = std::string(node_icon(e.type)) + " " + e.name;
-        bool is_selected = (selected_index == i);
+        ImGuiTreeNodeFlags treeFlags =
+            ImGuiTreeNodeFlags_OpenOnArrow |
+            ImGuiTreeNodeFlags_SpanFullWidth |
+            ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        if (is_selected) {
+            treeFlags |= ImGuiTreeNodeFlags_Selected;
+        }
+        if (!entryHasChildren) {
+            treeFlags |= ImGuiTreeNodeFlags_Leaf;
+        }
 
-        ImGui::PushID(i * 3 + 1);
-        if (ImGui::Selectable(label.c_str(), is_selected,
-                              ImGuiSelectableFlags_SpanAllColumns)) {
+        if (searching && entryHasChildren) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        } else if (entryHasChildren) {
+            ImGui::SetNextItemOpen(e.open, ImGuiCond_Always);
+        }
+
+        ImGui::PushID(i * 4 + 1);
+        const bool open = ImGui::TreeNodeEx("##node", treeFlags, "%s", label.c_str());
+        if (!searching && entryHasChildren) {
+            e.open = open;
+        }
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
             selected_index = i;
         }
         ImGui::PopID();
 
-        // ── Drag-and-Drop (reorder flat list) ──
-        ImGui::PushID(i * 3 + 2);
-        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-            ImGui::SetDragDropPayload("OUTLINER_ENTRY", &i, sizeof(int));
-            ImGui::Text("Move: %s", e.name.c_str());
-            ImGui::EndDragDropSource();
-        }
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload =
-                    ImGui::AcceptDragDropPayload("OUTLINER_ENTRY")) {
-                int src = *(const int*)payload->Data;
-                if (src != i && src >= 0 && src < (int)entries.size()) {
-                    SceneNodeEntry moved = entries[src];
-                    entries.erase(entries.begin() + src);
-                    int dst = (src < i) ? i - 1 : i;
-                    entries.insert(entries.begin() + dst, moved);
-                    selected_index = dst;
-                }
-            }
-            ImGui::EndDragDropTarget();
-        }
-        ImGui::PopID();
-
-        // ── Right-click context menu ──
         if (ImGui::BeginPopupContextItem(("##ctx" + std::to_string(i)).c_str())) {
             selected_index = i;
             if (ImGui::MenuItem("Focus Camera")) {
@@ -178,6 +417,12 @@ void SceneOutliner::draw_outliner(VulkanEngine& /*engine*/) {
                     glm::vec3 pos = glm::vec3(n->worldTransform[3]);
                     VulkanEngine::Get().mainCamera.focusOn(pos, 5.f);
                 }
+            }
+            ImGui::Separator();
+            if (scene) {
+                std::shared_ptr<Node> parent = e.node.lock();
+                draw_create_menu_items(engine, *scene, parent, createdNode);
+                ImGui::Separator();
             }
             if (ImGui::MenuItem(e.visible ? "Hide" : "Show")) {
                 e.visible = !e.visible;
@@ -193,7 +438,20 @@ void SceneOutliner::draw_outliner(VulkanEngine& /*engine*/) {
         }
     }
 
+    if (scene && ImGui::BeginPopupContextWindow(
+                     "##outliner_background_context",
+                     ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
+        draw_create_menu_items(engine, *scene, nullptr, createdNode);
+        ImGui::EndPopup();
+    }
+
     ImGui::EndChild();
+
+    if (scene && createdNode) {
+        rebuild(*scene);
+        reveal_node(createdNode);
+    }
+
     ImGui::End();
 }
 
@@ -202,7 +460,7 @@ void SceneOutliner::draw_outliner(VulkanEngine& /*engine*/) {
 // ─────────────────────────────────────────────────────────────────────────────
 void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
     ImGui::SetNextWindowPos(ImVec2(0, 610), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(280, 300), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(330, 300), ImGuiCond_Once);
 
     if (!ImGui::Begin("Properties", nullptr, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -217,9 +475,9 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
     }
 
 
-
-    ImGui::Text("Name: %s", node->name.empty() ? "(unnamed)" : node->name.c_str());
-    ImGui::Separator();
+    ImGui::TextUnformatted(node->name.empty() ? "(unnamed)" : node->name.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", node_icon(classify(node)));
 
     // Decompose worldTransform for display using ImGuizmo
     float matrixTranslation[3], matrixRotation[3], matrixScale[3];
@@ -227,10 +485,11 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
 
     bool changed = false;
 
-    ImGui::TextUnformatted("World Transform");
-    changed |= ImGui::DragFloat3("Position", matrixTranslation, 0.05f);
-    changed |= ImGui::DragFloat3("Rotation", matrixRotation, 0.5f);
-    changed |= ImGui::DragFloat3("Scale",    matrixScale,       0.01f, 0.001f, 100.f);
+    if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+        changed |= ImGui::DragFloat3("Position", matrixTranslation, 0.05f);
+        changed |= ImGui::DragFloat3("Rotation", matrixRotation, 0.5f);
+        changed |= ImGui::DragFloat3("Scale",    matrixScale,       0.01f, 0.001f, 100.f);
+    }
 
     if (changed) {
         // Recompose desired world matrix from edited TRS
@@ -248,11 +507,33 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
 
     // If it's a light, show light-specific properties
     if (auto* ln = dynamic_cast<LightNode*>(node.get())) {
-        ImGui::Separator();
-        ImGui::TextUnformatted("Light");
-        ImGui::ColorEdit3("Color",     glm::value_ptr(ln->light.color));
-        ImGui::DragFloat("Intensity", &ln->light.intensity, 0.1f, 0.f, 1000.f);
-        ImGui::DragFloat("Range",     &ln->light.range,     0.5f, 0.f, 10000.f);
+        if (ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::BeginCombo("Type", light_type_name(ln->light.type))) {
+                const LightType types[] = { LightType::Point, LightType::Directional, LightType::Spot };
+                for (LightType type : types) {
+                    const bool selected = (ln->light.type == type);
+                    if (ImGui::Selectable(light_type_name(type), selected)) {
+                        ln->light.type = type;
+                        if (type == LightType::Directional) {
+                            ln->light.range = 0.f;
+                        } else if (ln->light.range <= 0.f) {
+                            ln->light.range = 12.f;
+                        }
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::ColorEdit3("Color", glm::value_ptr(ln->light.color));
+            ImGui::DragFloat("Intensity", &ln->light.intensity, 0.1f, 0.f, 1000.f);
+
+            ImGui::BeginDisabled(ln->light.type == LightType::Directional);
+            ImGui::DragFloat("Range", &ln->light.range, 0.5f, 0.f, 10000.f);
+            ImGui::EndDisabled();
+        }
     }
 
     ImGui::End();

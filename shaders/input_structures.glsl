@@ -40,8 +40,35 @@ struct MaterialData {
     vec4 extra[12];
 };
 
+#ifndef LIGHTING_PASS
 layout(set = 1, binding = 0) readonly buffer MaterialStorage {
     MaterialData materials[];
 };
 
 layout(set = 1, binding = 1) uniform sampler2D globalTextures[];
+#endif
+
+#ifdef USE_LIGHT_DATA
+const uint LIGHT_TYPE_POINT = 0;
+const uint LIGHT_TYPE_DIRECTIONAL = 1;
+const uint LIGHT_TYPE_SPOT = 2;
+
+struct GPULight {
+    vec4 positionRange;
+    vec4 directionType;
+    vec4 colorIntensity;
+    vec4 params;
+};
+
+layout(set = 2, binding = 0) uniform LightData {
+    uint lightCount;
+    uint directionalLightCount;
+    uint pointLightCount;
+    uint spotLightCount;
+    vec4 ambientColor;
+} lightData;
+
+layout(set = 2, binding = 1) readonly buffer LightStorage {
+    GPULight lights[];
+};
+#endif

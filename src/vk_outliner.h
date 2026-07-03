@@ -63,4 +63,5 @@ private:
 
     // Recursive builder helper
     void push_node(const std::shared_ptr<Node>& node, int depth);
+    void reveal_node(const std::shared_ptr<Node>& node);
 };

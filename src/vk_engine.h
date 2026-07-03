@@ -13,6 +13,7 @@
 #include <GpuData.h>
 //bootstrap library
 #include "camera.h"
+#include "light_system.h"
 #include "VkBootstrap.h"
 #include "vk_scene.h"
 #include "vk_outliner.h"
@@ -193,6 +194,7 @@ public:
 
 	DescriptorAllocatorGrowable globalDescriptorAllocator;
 	DescriptorSystem _descriptorSystem;
+	LightSystem lightSystem;
 
 	// --- Bindless Setup ---
 	VkDescriptorSetLayout _bindlessDescriptorLayout;

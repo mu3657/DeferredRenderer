@@ -1,6 +1,8 @@
 #version 450
 
 #extension GL_GOOGLE_include_directive : require
+#define LIGHTING_PASS 1
+#define USE_LIGHT_DATA 1
 #include "input_structures.glsl"
 
 layout (location = 0) in vec2 inUV;
@@ -51,6 +53,32 @@ float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
     return ggx1 * ggx2;
 }
 
+vec3 evaluatePBRDirect(vec3 albedo, float metallic, float roughness, vec3 N, vec3 V, vec3 L, vec3 radiance) {
+    vec3 H = normalize(V + L);
+    float NdotL = max(dot(N, L), 0.0);
+
+    if (NdotL <= 0.0) {
+        return vec3(0.0);
+    }
+
+    vec3 F0 = vec3(0.04);
+    F0 = mix(F0, albedo, metallic);
+
+    float NDF = DistributionGGX(N, H, roughness);
+    float G = GeometrySmith(N, V, L, roughness);
+    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+    vec3 numerator = NDF * G * F;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001;
+    vec3 specular = numerator / denominator;
+
+    vec3 kS = F;
+    vec3 kD = vec3(1.0) - kS;
+    kD *= 1.0 - metallic;
+
+    return (kD * albedo / PI + specular) * radiance * NdotL;
+}
+
 // Reconstruct world position from depth
 vec3 reconstructPosition(vec2 uv, float depth, mat4 invViewProj) {
     vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1.0);
@@ -87,38 +115,48 @@ void main()
     vec3 camPos = inverse(sceneData.view)[3].xyz;
     vec3 V = normalize(camPos - worldPos);
 
-    // 3. PBR calculation setup
-    vec3 F0 = vec3(0.04); 
-    F0 = mix(F0, albedo, metallic);
-
     vec3 Lo = vec3(0.0);
 
-    // --- Direct Lighting (Sun) ---
-    vec3 L = normalize(sceneData.sunlightDirection.xyz);
-    vec3 H = normalize(V + L);
-    float NdotL = max(dot(N, L), 0.0);
+    // --- Direct Lighting ---
+    for (uint i = 0; i < lightData.lightCount; i++) {
+        GPULight light = lights[i];
+        uint type = uint(light.directionType.w + 0.5);
 
-    // Radiance (simplistic directional light)
-    vec3 radiance = sceneData.sunlightColor.rgb * sceneData.sunlightColor.w;
+        vec3 L = vec3(0.0);
+        vec3 radiance = light.colorIntensity.rgb * light.colorIntensity.w;
 
-    // Cook-Torrance BRDF
-    float NDF = DistributionGGX(N, H, roughness);   
-    float G   = GeometrySmith(N, V, L, roughness);      
-    vec3 F    = fresnelSchlick(max(dot(H, V), 0.0), F0);
-        
-    vec3 numerator    = NDF * G * F; 
-    float denominator = 4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001; // + 0.0001 to prevent divide by zero
-    vec3 specular = numerator / denominator;
-    
-    vec3 kS = F;
-    vec3 kD = vec3(1.0) - kS;
-    kD *= 1.0 - metallic;	
+        if (type == LIGHT_TYPE_DIRECTIONAL) {
+            // directionType.xyz is the light emission direction. Shading uses the surface-to-light vector.
+            L = normalize(-light.directionType.xyz);
+        } else {
+            vec3 toLight = light.positionRange.xyz - worldPos;
+            float distanceToLight = length(toLight);
+            L = toLight / max(distanceToLight, 0.0001);
 
-    Lo += (kD * albedo / PI + specular) * radiance * NdotL;
+            float attenuation = 1.0 / max(distanceToLight * distanceToLight, 1.0);
+            float range = light.positionRange.w;
+            if (range > 0.0) {
+                float rangeFade = clamp(1.0 - distanceToLight / range, 0.0, 1.0);
+                attenuation *= rangeFade * rangeFade;
+            }
+
+            if (type == LIGHT_TYPE_SPOT) {
+                vec3 lightToSurface = normalize(worldPos - light.positionRange.xyz);
+                float spotCos = dot(lightToSurface, normalize(light.directionType.xyz));
+                float innerCos = light.params.x;
+                float outerCos = light.params.y;
+                float spotAttenuation = clamp((spotCos - outerCos) / max(innerCos - outerCos, 0.0001), 0.0, 1.0);
+                attenuation *= spotAttenuation * spotAttenuation;
+            }
+
+            radiance *= attenuation;
+        }
+
+        Lo += evaluatePBRDirect(albedo, metallic, roughness, N, V, L, radiance);
+    }
 
     // --- Ambient Lighting ---
-    // simplistic ambient term based on the scene data
-    vec3 ambient = sceneData.ambientColor.rgb * albedo * ao;
+    vec3 ambient = lightData.ambientColor.rgb * albedo * ao;
 
     vec3 color = ambient + Lo;
 

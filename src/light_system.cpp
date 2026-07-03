@@ -1,0 +1,240 @@
+#include "light_system.h"
+
+#include "imgui.h"
+#include "vk_engine.h"
+#include "vk_loader.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <glm/glm.hpp>
+#include <glm/gtx/norm.hpp>
+
+namespace {
+glm::vec3 safe_normalize(glm::vec3 v, glm::vec3 fallback)
+{
+    if (glm::length2(v) < 0.000001f) {
+        return fallback;
+    }
+
+    return glm::normalize(v);
+}
+
+glm::vec3 light_forward_from_world(const glm::mat4& worldTransform)
+{
+    return safe_normalize(glm::mat3(worldTransform) * glm::vec3(0.f, 0.f, -1.f), glm::vec3(0.f, -1.f, 0.f));
+}
+
+glm::mat4 compute_world_transform(const Node& node)
+{
+    if (std::shared_ptr<Node> parent = node.parent.lock()) {
+        return compute_world_transform(*parent) * node.localTransform;
+    }
+
+    return node.localTransform;
+}
+
+bool is_visible_in_hierarchy(const Node& node)
+{
+    if (!node.visible) {
+        return false;
+    }
+
+    if (std::shared_ptr<Node> parent = node.parent.lock()) {
+        return is_visible_in_hierarchy(*parent);
+    }
+
+    return true;
+}
+
+uint32_t light_type_to_uint(LightType type)
+{
+    return static_cast<uint32_t>(type);
+}
+}
+
+void LightSystem::init(VulkanEngine* engine, uint32_t frameOverlap)
+{
+    _engine = engine;
+    _frames.resize(frameOverlap);
+    _cpuLights.reserve(MAX_GPU_LIGHTS);
+
+    for (uint32_t i = 0; i < frameOverlap; i++) {
+        FrameResources& frame = _frames[i];
+
+        frame.lightDataBuffer = _engine->create_buffer(
+            sizeof(GPULightData),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        frame.lightBuffer = _engine->create_buffer(
+            sizeof(GPULight) * MAX_GPU_LIGHTS,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        frame.descriptorSet = _engine->_descriptorSystem.allocate_frame(DescriptorLayoutID::LightData, i);
+
+        _engine->_descriptorSystem.write_buffer(
+            frame.descriptorSet,
+            0,
+            frame.lightDataBuffer.buffer,
+            sizeof(GPULightData),
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+        _engine->_descriptorSystem.write_buffer(
+            frame.descriptorSet,
+            1,
+            frame.lightBuffer.buffer,
+            sizeof(GPULight) * MAX_GPU_LIGHTS,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    }
+
+    _initialized = true;
+}
+
+void LightSystem::cleanup()
+{
+    if (!_initialized || !_engine) {
+        return;
+    }
+
+    for (FrameResources& frame : _frames) {
+        if (frame.lightDataBuffer.buffer != VK_NULL_HANDLE) {
+            _engine->destroy_buffer(frame.lightDataBuffer);
+        }
+        if (frame.lightBuffer.buffer != VK_NULL_HANDLE) {
+            _engine->destroy_buffer(frame.lightBuffer);
+        }
+    }
+
+    _frames.clear();
+    _cpuLights.clear();
+    _engine = nullptr;
+    _initialized = false;
+}
+
+void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneData)
+{
+    _cpuLights.clear();
+    _lightData = {};
+    _lightData.ambientColor = sceneData.ambientColor;
+
+    if (scene) {
+        for (const std::weak_ptr<LightNode>& weakLight : scene->lightNodes) {
+            if (_cpuLights.size() >= MAX_GPU_LIGHTS) {
+                break;
+            }
+
+            std::shared_ptr<LightNode> lightNode = weakLight.lock();
+            if (!lightNode || !is_visible_in_hierarchy(*lightNode)) {
+                continue;
+            }
+
+            GPULight gpuLight{};
+            const GpuLight& src = lightNode->light;
+            const glm::mat4 worldTransform = compute_world_transform(*lightNode);
+            const glm::vec3 worldPosition = glm::vec3(worldTransform[3]);
+            const glm::vec3 forward = light_forward_from_world(worldTransform);
+            const float range = (src.type == LightType::Directional) ? 0.f : std::max(src.range, 0.001f);
+
+            gpuLight.positionRange = glm::vec4(worldPosition, range);
+            gpuLight.directionType = glm::vec4(forward, static_cast<float>(light_type_to_uint(src.type)));
+            gpuLight.colorIntensity = glm::vec4(src.color, src.intensity);
+            gpuLight.params = glm::vec4(
+                std::cos(glm::radians(15.f)),
+                std::cos(glm::radians(30.f)),
+                -1.f,
+                1.f);
+
+            switch (src.type) {
+                case LightType::Directional:
+                    _lightData.directionalLightCount++;
+                    break;
+                case LightType::Point:
+                    _lightData.pointLightCount++;
+                    break;
+                case LightType::Spot:
+                    _lightData.spotLightCount++;
+                    break;
+            }
+
+            _cpuLights.push_back(gpuLight);
+        }
+    }
+
+    if (_cpuLights.empty() && _enableFallbackDirectional) {
+        append_fallback_directional(sceneData);
+    }
+
+    _lightData.lightCount = static_cast<uint32_t>(_cpuLights.size());
+}
+
+void LightSystem::upload_frame(uint32_t frameIndex)
+{
+    if (!_initialized || frameIndex >= _frames.size()) {
+        return;
+    }
+
+    FrameResources& frame = _frames[frameIndex];
+    memcpy(frame.lightDataBuffer.info.pMappedData, &_lightData, sizeof(GPULightData));
+
+    if (!_cpuLights.empty()) {
+        const size_t copySize = std::min(_cpuLights.size(), static_cast<size_t>(MAX_GPU_LIGHTS)) * sizeof(GPULight);
+        memcpy(frame.lightBuffer.info.pMappedData, _cpuLights.data(), copySize);
+    }
+}
+
+void LightSystem::draw_debug_ui()
+{
+    if (!ImGui::Begin("Light System", nullptr, ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::Checkbox("Fallback directional", &_enableFallbackDirectional);
+    ImGui::Text("Lights: %u / %u", _lightData.lightCount, MAX_GPU_LIGHTS);
+    ImGui::Text("Directional: %u", _lightData.directionalLightCount);
+    ImGui::Text("Point: %u", _lightData.pointLightCount);
+    ImGui::Text("Spot: %u", _lightData.spotLightCount);
+
+    ImGui::Separator();
+    for (uint32_t i = 0; i < _lightData.lightCount && i < static_cast<uint32_t>(_cpuLights.size()); i++) {
+        const GPULight& light = _cpuLights[i];
+        const int type = static_cast<int>(light.directionType.w);
+        const char* typeName = "Unknown";
+        if (type == static_cast<int>(LightType::Directional)) {
+            typeName = "Directional";
+        } else if (type == static_cast<int>(LightType::Point)) {
+            typeName = "Point";
+        } else if (type == static_cast<int>(LightType::Spot)) {
+            typeName = "Spot";
+        }
+
+        ImGui::Text("#%u %s intensity %.2f range %.2f", i, typeName, light.colorIntensity.w, light.positionRange.w);
+    }
+
+    ImGui::End();
+}
+
+VkDescriptorSet LightSystem::descriptor_set(uint32_t frameIndex) const
+{
+    if (frameIndex >= _frames.size()) {
+        return VK_NULL_HANDLE;
+    }
+
+    return _frames[frameIndex].descriptorSet;
+}
+
+void LightSystem::append_fallback_directional(const GPUSceneData& sceneData)
+{
+    const glm::vec3 lightToSurface = safe_normalize(-glm::vec3(sceneData.sunlightDirection), glm::vec3(0.f, -1.f, -0.5f));
+
+    GPULight fallback{};
+    fallback.positionRange = glm::vec4(0.f, 0.f, 0.f, 0.f);
+    fallback.directionType = glm::vec4(lightToSurface, static_cast<float>(light_type_to_uint(LightType::Directional)));
+    fallback.colorIntensity = sceneData.sunlightColor;
+    fallback.params = glm::vec4(1.f, 1.f, -1.f, 1.f);
+
+    _cpuLights.push_back(fallback);
+    _lightData.directionalLightCount = 1;
+}
