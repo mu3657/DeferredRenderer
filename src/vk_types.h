@@ -74,20 +74,31 @@ struct GPUDrawPushConstants {
     uint32_t materialID;
 };
 
-enum class MaterialPass :uint8_t {
+enum class MaterialSurface :uint8_t {
     MainColor,
     Transparent,
     Other
 };
+
+enum class PipelineVariant : uint8_t {
+    GBuffer_MetallicRoughness,
+    GBuffer_Unlit,
+    ShadowDepth_Opaque,
+    ShadowDepth_AlphaCutout,
+    Lighting_Fullscreen,
+};
+
 struct MaterialPipeline {
 	VkPipeline pipeline;
 	VkPipelineLayout layout;
 };
 
 struct MaterialInstance {
+    // Legacy fallback while pass-owned pipeline lookup is being introduced.
     MaterialPipeline* pipeline;
     uint32_t materialID;
-    MaterialPass passType;
+    MaterialSurface passType;
+    PipelineVariant gbufferVariant{PipelineVariant::GBuffer_MetallicRoughness};
 };
 
 struct DrawContext;
@@ -182,4 +193,3 @@ struct DrawContext {
     std::vector<RenderObject> OpaqueSurfaces;
     std::vector<RenderObject> TransparentSurfaces;
 };
-

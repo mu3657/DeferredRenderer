@@ -46,7 +46,7 @@ void RenderScene::update_draw_context(DrawContext& ctx) {
     // For now we just push everything to the opaque surfaces or based on the passType.
     
     for (const auto& obj : _objects) {
-        if (obj.material && obj.material->passType == MaterialPass::Transparent) {
+        if (obj.material && obj.material->passType == MaterialSurface::Transparent) {
             ctx.TransparentSurfaces.push_back(obj);
         } else {
             ctx.OpaqueSurfaces.push_back(obj);

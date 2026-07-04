@@ -79,6 +79,10 @@ void VulkanEngine::init()
     init_descriptors();
     init_default_data();
     init_gbuffer(); 
+    pipelineRegistry.init(this);
+    _mainDeletionQueue.push_function([this]() {
+        pipelineRegistry.cleanup();
+    });
     init_pipelines();
     init_imgui();
 
@@ -309,6 +313,17 @@ void VulkanEngine::draw_background(VkCommandBuffer cmd)
 	vkCmdDispatch(cmd, std::ceil(_drawExtent.width / 16.0), std::ceil(_drawExtent.height / 16.0), 1);
 }
 
+RenderPassFrameContext VulkanEngine::make_pass_frame_context(VkCommandBuffer cmd)
+{
+    return RenderPassFrameContext{
+        *this,
+        get_current_frame(),
+        cmd,
+        static_cast<uint32_t>(_frameNumber % FRAME_OVERLAP),
+        _drawExtent
+    };
+}
+
 void VulkanEngine::draw()
 {
 	ZoneScoped;
@@ -354,6 +369,7 @@ void VulkanEngine::draw()
     // _drawExtent.height = _drawImage.imageExtent.height;
 	auto start = std::chrono::system_clock::now();
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));
+    RenderPassFrameContext passContext = make_pass_frame_context(cmd);
 
 	// transition our main draw image into general layout so we can write into it
 	// we will overwrite it all so we dont care about what was the older layout
@@ -370,9 +386,8 @@ void VulkanEngine::draw()
     vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-
-
-	geometry_pass(cmd);
+    GeometryPassContext geometryContext{ passContext, sceneData, mainDrawContext };
+	geometryPass.execute(geometryContext);
 	auto end = std::chrono::system_clock::now();
 	auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
@@ -384,8 +399,8 @@ void VulkanEngine::draw()
 	vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 
-
-	lighting_pass(cmd,_drawImage.imageView);
+    LightingPassContext lightingContext{ passContext, _drawImage.imageView, lightSystem };
+	lighting_pass(lightingContext);
 
 	//transtion the draw image and the swapchain image into their correct transfer layouts
 	vkutil::transition_image(cmd, _drawImage.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -999,17 +1014,45 @@ void VulkanEngine::init_descriptors() {
             sizeof(GPUObjectData) * MAX_OBJECTS,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
 
+        _frames[i].lightDataBuffer = create_buffer(
+            sizeof(GPULightData),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        _frames[i].lightBuffer = create_buffer(
+            sizeof(GPULight) * MAX_GPU_LIGHTS,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        _frames[i].lightDescriptor = _descriptorSystem.allocate_frame(DescriptorLayoutID::LightData, i);
+
+        _descriptorSystem.write_buffer(
+            _frames[i].lightDescriptor,
+            0,
+            _frames[i].lightDataBuffer.buffer,
+            sizeof(GPULightData),
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+        _descriptorSystem.write_buffer(
+            _frames[i].lightDescriptor,
+            1,
+            _frames[i].lightBuffer.buffer,
+            sizeof(GPULight) * MAX_GPU_LIGHTS,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+
         // 5. 注册销毁 (注意用 [=, this])
         _mainDeletionQueue.push_function([=, this]() {
             destroy_buffer(_frames[i].objectStorageBuffer);
             destroy_buffer(_frames[i].cameraBuffer);
+            destroy_buffer(_frames[i].lightDataBuffer);
+            destroy_buffer(_frames[i].lightBuffer);
             // descriptor set 会随着 pool 自动销毁，不用管
         });
 
 
     }
 
-    lightSystem.init(this, FRAME_OVERLAP);
+    lightSystem.init(this);
     _mainDeletionQueue.push_function([this]() {
         lightSystem.cleanup();
     });
@@ -1048,7 +1091,7 @@ void VulkanEngine::init_pipelines()
 
     materialResources.data = constants;
 
-    defaultData = metalRoughMaterial.write_material(_device, MaterialPass::MainColor,
+    defaultData = metalRoughMaterial.write_material(_device, MaterialSurface::MainColor,
         materialResources, globalDescriptorAllocator);
 }
 
@@ -1215,179 +1258,11 @@ void VulkanEngine::destroy_image(const AllocatedImage& img)
     vmaDestroyImage(_allocator, img.image, img.allocation);
 }
 
-bool is_visible(const RenderObject& obj, const glm::mat4& viewproj) {
-	std::array<glm::vec3, 8> corners {
-		glm::vec3 { 1, 1, 1 },
-		glm::vec3 { 1, 1, -1 },
-		glm::vec3 { 1, -1, 1 },
-		glm::vec3 { 1, -1, -1 },
-		glm::vec3 { -1, 1, 1 },
-		glm::vec3 { -1, 1, -1 },
-		glm::vec3 { -1, -1, 1 },
-		glm::vec3 { -1, -1, -1 },
-	};
-
-	glm::mat4 matrix = viewproj * obj.transform;
-
-	glm::vec3 min = { 1.5, 1.5, 1.5 };
-	glm::vec3 max = { -1.5, -1.5, -1.5 };
-
-	for (int c = 0; c < 8; c++) {
-		// project each corner into clip space
-		glm::vec4 v = matrix * glm::vec4(obj.bounds.origin + (corners[c] * obj.bounds.extents), 1.f);
-
-		// perspective correction
-		v.x = v.x / v.w;
-		v.y = v.y / v.w;
-		v.z = v.z / v.w;
-
-		min = glm::min(glm::vec3 { v.x, v.y, v.z }, min);
-		max = glm::max(glm::vec3 { v.x, v.y, v.z }, max);
-	}
-
-	// check the clip space box is within the view
-	if (min.z > 1.f || max.z < 0.f || min.x > 1.f || max.x < -1.f || min.y > 1.f || max.y < -1.f) {
-		return false;
-	} else {
-		return true;
-	}
-}
-
-void VulkanEngine::geometry_pass(VkCommandBuffer cmd)
+void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 {
 	ZoneScoped;
-
-	std::vector<uint32_t> opaque_draws;
-	opaque_draws.reserve(mainDrawContext.OpaqueSurfaces.size());
-
-	for (uint32_t i = 0; i < mainDrawContext.OpaqueSurfaces.size(); i++) {
-		if (is_visible(mainDrawContext.OpaqueSurfaces[i], sceneData.viewproj)) {
-			opaque_draws.push_back(i);
-		}
-		// opaque_draws.push_back(i);
-	}
-
-	// sort the opaque surfaces by material and mesh
-	std::sort(opaque_draws.begin(), opaque_draws.end(), [&](const auto& iA, const auto& iB) {
-		const RenderObject& A = mainDrawContext.OpaqueSurfaces[iA];
-		const RenderObject& B = mainDrawContext.OpaqueSurfaces[iB];
-		if (A.material == B.material) {
-			return A.indexBuffer < B.indexBuffer;
-		}
-		else {
-			return A.material < B.material;
-		}
-	});
-	//reset counters
-	stats.drawcall_count = 0;
-	stats.triangle_count = 0;
-
-	VkClearValue clearColor;
-	clearColor.color = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-
-	//begin a render pass  connected to our draw image
-	VkRenderingAttachmentInfo albedoAttachment = vkinit::attachment_info(
-			_gAlbedo.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	VkRenderingAttachmentInfo normalAttachment = vkinit::attachment_info(
-		_gNormal.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	VkRenderingAttachmentInfo ormAttachment = vkinit::attachment_info(
-		_gORM.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-	VkRenderingAttachmentInfo depthAttachment = vkinit::depth_attachment_info(
-			_depthImage.imageView, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
-	VkRenderingAttachmentInfo colorAttachments[] = { albedoAttachment, normalAttachment, ormAttachment };
-	// VkRenderingInfo renderInfo = vkinit::rendering_info(_drawExtent,colorAttachments, depthAttachment);
-	// VkRenderingInfo renderInfo = vkinit::rendering_info(_drawExtent, colorAttachments, depthAttachment);
-	// renderInfo.colorAttachmentCount = 3;
-	VkRenderingInfo renderInfo = {};
-	renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-	renderInfo.renderArea = VkRect2D{ {0, 0}, _drawExtent };
-	renderInfo.layerCount = 1;
-	renderInfo.colorAttachmentCount = 3;
-	renderInfo.pColorAttachments = colorAttachments;
-	renderInfo.pDepthAttachment = &depthAttachment;
-
-	vkCmdBeginRendering(cmd, &renderInfo);
-
-
-
-	//set dynamic viewport and scissor
-	VkViewport viewport = {};
-	viewport.x = 0;
-	viewport.y = 0;
-	viewport.width = _drawExtent.width;
-	viewport.height = _drawExtent.height;
-	viewport.minDepth = 0.f;
-	viewport.maxDepth = 1.f;
-
-	vkCmdSetViewport(cmd, 0, 1, &viewport);
-
-	VkRect2D scissor = {};
-	scissor.offset.x = 0;
-	scissor.offset.y = 0;
-	scissor.extent.width = viewport.width;
-	scissor.extent.height = viewport.height;
-
-	vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-
-	// 使用持久化的 FrameData buffer，直接写入新数据（buffer 和 descriptor 在 init_descriptors 已绑定好）
-	FrameData& currentFrame = get_current_frame();
-	GPUSceneData* sceneUniformData = (GPUSceneData*)currentFrame.cameraBuffer.allocation->GetMappedData();
-	*sceneUniformData = sceneData;
-
-	// 直接取现成的 globalDescriptor，无需重新 allocate 或 update_set
-	VkDescriptorSet globalDescriptor = currentFrame.globalDescriptor;
-
-    MaterialPipeline* lastPipeline = nullptr;
-    MaterialInstance* lastMaterial = nullptr;
-    VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
-
-    auto draw = [&](const RenderObject& r) {
-        if (r.material->pipeline != lastPipeline) {
-            lastPipeline = r.material->pipeline;
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.material->pipeline->pipeline);
-            
-            // Bind both Set 0 (Per frame Camera/Object Data) and Set 1 (Bindless Asset Data)
-            VkDescriptorSet descriptorSets[] = { globalDescriptor, _bindlessDescriptorSet };
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r.material->pipeline->layout, 0, 2, descriptorSets, 0, nullptr);
-        }
-        
-        if (r.indexBuffer != lastIndexBuffer) {
-            lastIndexBuffer = r.indexBuffer;
-            vkCmdBindIndexBuffer(cmd, r.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-        }
-        
-        // calculate final mesh matrix
-        GPUDrawPushConstants push_constants;
-        push_constants.worldMatrix = r.transform;
-        push_constants.vertexBuffer = r.vertexBufferAddress;
-        push_constants.materialID = r.material->materialID;
-
-        vkCmdPushConstants(cmd, r.material->pipeline->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GPUDrawPushConstants), &push_constants);
-
-        stats.drawcall_count++;
-        stats.triangle_count += r.indexCount / 3;
-        vkCmdDrawIndexed(cmd, r.indexCount, 1, r.firstIndex, 0, 0);
-    };
-
-
-	for (auto& r : opaque_draws) {
-		draw(mainDrawContext.OpaqueSurfaces[r]);
-	}
-	for (auto& r : mainDrawContext.TransparentSurfaces) {
-		draw(r);
-	}
-	mainDrawContext.OpaqueSurfaces.clear();
-	mainDrawContext.TransparentSurfaces.clear();
-
-	vkCmdEndRendering(cmd);
-
-
-
-}
-void VulkanEngine::lighting_pass(VkCommandBuffer cmd, VkImageView targetImageView)
-{
-	ZoneScoped;
+    VkCommandBuffer cmd = ctx.cmd;
+    VkImageView targetImageView = ctx.targetImageView;
 
 	VkRenderingAttachmentInfo swapchainAttachment = vkinit::attachment_info(targetImageView, nullptr, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	VkRenderingInfo renderInfo = {};
@@ -1424,17 +1299,15 @@ void VulkanEngine::lighting_pass(VkCommandBuffer cmd, VkImageView targetImageVie
 
 	vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,_deferredLightingPipeline);
 	//vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout, 0, 1, &_gBufferDescriptorSet, 0, nullptr);
-	FrameData& currentFrame = get_current_frame();
-    const uint32_t frameIndex = _frameNumber % FRAME_OVERLAP;
-    lightSystem.upload_frame(frameIndex);
-    VkDescriptorSet lightDescriptor = lightSystem.descriptor_set(frameIndex);
+	FrameData& currentFrame = ctx.frame;
+    ctx.lightSystem.upload_frame(currentFrame);
 
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							0, 1, &currentFrame.globalDescriptor, 0, nullptr); // 绑定 Set 0 (SceneData)
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							1, 1, &_gBufferDescriptorSet, 0, nullptr);         // 绑定 Set 1 (G-Buffer)
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
-                            2, 1, &lightDescriptor, 0, nullptr);               // Set 2 (LightData)
+                            2, 1, &currentFrame.lightDescriptor, 0, nullptr);  // Set 2 (LightData)
 	// 绘制 3 个没有 Vertex Buffer 指派的顶点
 	vkCmdDraw(cmd, 3, 1, 0, 0);
 	//
@@ -1635,6 +1508,22 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 
 	transparentPipeline.pipeline = pipelineBuilder.build_pipeline(engine->_device);
 
+    engine->pipelineRegistry.register_material_pipeline(
+        PipelineKey{
+            RenderPassType::GBuffer,
+            PipelineVariant::GBuffer_MetallicRoughness,
+            MaterialSurface::MainColor,
+        },
+        &opaquePipeline);
+
+    engine->pipelineRegistry.register_material_pipeline(
+        PipelineKey{
+            RenderPassType::GBuffer,
+            PipelineVariant::GBuffer_MetallicRoughness,
+            MaterialSurface::Transparent,
+        },
+        &transparentPipeline);
+
 	vkDestroyShaderModule(engine->_device, meshFragShader, nullptr);
 	vkDestroyShaderModule(engine->_device, meshVertexShader, nullptr);
 	engine->_mainDeletionQueue.push_function([=]() {
@@ -1672,11 +1561,12 @@ void GLTFMetallic_Roughness::clear_resources(VkDevice device)
 {
 }
 
-MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, MaterialPass pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator)
+MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, MaterialSurface pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator)
 {
     MaterialInstance matData;
     matData.passType = pass;
-    if (pass == MaterialPass::Transparent) {
+    matData.gbufferVariant = PipelineVariant::GBuffer_MetallicRoughness;
+    if (pass == MaterialSurface::Transparent) {
         matData.pipeline = &transparentPipeline;
     }
     else {

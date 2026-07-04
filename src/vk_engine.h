@@ -14,6 +14,9 @@
 //bootstrap library
 #include "camera.h"
 #include "light_system.h"
+#include "pipeline_registry.h"
+#include "render_pass.h"
+#include "Renderpasses/geometry_pass.h"
 #include "VkBootstrap.h"
 #include "vk_scene.h"
 #include "vk_outliner.h"
@@ -67,6 +70,11 @@ struct FrameData {
 
 	// 3. 指向上面两个 Buffer 的描述符集 (Set 0)
 	VkDescriptorSet globalDescriptor;
+
+	// Lighting resources owned by the engine frame, filled by LightSystem.
+	AllocatedBuffer lightDataBuffer;
+	AllocatedBuffer lightBuffer;
+	VkDescriptorSet lightDescriptor{ VK_NULL_HANDLE };
 };
 
 struct ComputePushConstants {
@@ -136,7 +144,7 @@ struct GLTFMetallic_Roughness {
 	void build_pipelines(VulkanEngine* engine);
 	void clear_resources(VkDevice device);
 
-	MaterialInstance write_material(VkDevice device, MaterialPass pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator);
+	MaterialInstance write_material(VkDevice device, MaterialSurface pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator);
 };
 constexpr unsigned int FRAME_OVERLAP = 3;
 
@@ -146,7 +154,7 @@ public:
 	bool _isInitialized{ false };
 	int _frameNumber {0};
 	bool stop_rendering{ false };
-	VkExtent2D _windowExtent{ 1700 , 900 };
+	VkExtent2D _windowExtent{ 2500 , 1400 };
 
 	struct SDL_Window* _window{ nullptr };
 
@@ -194,7 +202,9 @@ public:
 
 	DescriptorAllocatorGrowable globalDescriptorAllocator;
 	DescriptorSystem _descriptorSystem;
+	PipelineRegistry pipelineRegistry;
 	LightSystem lightSystem;
+	GeometryPass geometryPass;
 
 	// --- Bindless Setup ---
 	VkDescriptorSetLayout _bindlessDescriptorLayout;
@@ -254,8 +264,7 @@ public:
 
 	void init_triangle_pipeline();
 
-	void geometry_pass(VkCommandBuffer cmd);
-	void lighting_pass(VkCommandBuffer cmd, VkImageView targetImageView);
+	void lighting_pass(LightingPassContext& ctx);
 
 	static VulkanEngine& Get();
 
@@ -272,6 +281,7 @@ public:
 	//run main loop
 	void run();
 	void immediate_submit(std::function<void(VkCommandBuffer cmd)>&& function);
+	RenderPassFrameContext make_pass_frame_context(VkCommandBuffer cmd);
 
 	AllocatedBuffer create_buffer(size_t allocSize, VkBufferUsageFlags usage, VmaMemoryUsage memoryUsage);
 

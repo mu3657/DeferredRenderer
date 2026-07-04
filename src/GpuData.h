@@ -37,6 +37,12 @@ struct GPULight {
     glm::vec4 params;           // x/y = spot cone cosines, z = shadow index, w = flags
 };
 
+struct GPUShadowData {
+    glm::mat4 lightViewProj;
+    glm::vec4 lightDir;
+    glm::vec4 params; // bias, normalBias, texelSize, enabled
+};
+
 struct GPULightData {
     uint32_t lightCount{0};
     uint32_t directionalLightCount{0};

@@ -14,7 +14,7 @@ void MeshNode::Draw(const glm::mat4& topMatrix, DrawContext& ctx) {
         def.transform = nodeMatrix;
         def.vertexBufferAddress = mesh->meshBuffers.vertexBufferAddress;
 //TODO:material pass to be determined for now we just separate them based on the material's passType
-        if (s.material->data.passType == MaterialPass::Transparent) {
+        if (s.material->data.passType == MaterialSurface::Transparent) {
             ctx.TransparentSurfaces.push_back(def);
         } else {
             ctx.OpaqueSurfaces.push_back(def);

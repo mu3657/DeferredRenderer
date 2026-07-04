@@ -53,42 +53,10 @@ uint32_t light_type_to_uint(LightType type)
 }
 }
 
-void LightSystem::init(VulkanEngine* engine, uint32_t frameOverlap)
+void LightSystem::init(VulkanEngine* engine)
 {
     _engine = engine;
-    _frames.resize(frameOverlap);
     _cpuLights.reserve(MAX_GPU_LIGHTS);
-
-    for (uint32_t i = 0; i < frameOverlap; i++) {
-        FrameResources& frame = _frames[i];
-
-        frame.lightDataBuffer = _engine->create_buffer(
-            sizeof(GPULightData),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VMA_MEMORY_USAGE_CPU_TO_GPU);
-
-        frame.lightBuffer = _engine->create_buffer(
-            sizeof(GPULight) * MAX_GPU_LIGHTS,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VMA_MEMORY_USAGE_CPU_TO_GPU);
-
-        frame.descriptorSet = _engine->_descriptorSystem.allocate_frame(DescriptorLayoutID::LightData, i);
-
-        _engine->_descriptorSystem.write_buffer(
-            frame.descriptorSet,
-            0,
-            frame.lightDataBuffer.buffer,
-            sizeof(GPULightData),
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
-
-        _engine->_descriptorSystem.write_buffer(
-            frame.descriptorSet,
-            1,
-            frame.lightBuffer.buffer,
-            sizeof(GPULight) * MAX_GPU_LIGHTS,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    }
-
     _initialized = true;
 }
 
@@ -98,16 +66,6 @@ void LightSystem::cleanup()
         return;
     }
 
-    for (FrameResources& frame : _frames) {
-        if (frame.lightDataBuffer.buffer != VK_NULL_HANDLE) {
-            _engine->destroy_buffer(frame.lightDataBuffer);
-        }
-        if (frame.lightBuffer.buffer != VK_NULL_HANDLE) {
-            _engine->destroy_buffer(frame.lightBuffer);
-        }
-    }
-
-    _frames.clear();
     _cpuLights.clear();
     _engine = nullptr;
     _initialized = false;
@@ -169,13 +127,12 @@ void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneDat
     _lightData.lightCount = static_cast<uint32_t>(_cpuLights.size());
 }
 
-void LightSystem::upload_frame(uint32_t frameIndex)
+void LightSystem::upload_frame(FrameData& frame)
 {
-    if (!_initialized || frameIndex >= _frames.size()) {
+    if (!_initialized) {
         return;
     }
 
-    FrameResources& frame = _frames[frameIndex];
     memcpy(frame.lightDataBuffer.info.pMappedData, &_lightData, sizeof(GPULightData));
 
     if (!_cpuLights.empty()) {
@@ -214,15 +171,6 @@ void LightSystem::draw_debug_ui()
     }
 
     ImGui::End();
-}
-
-VkDescriptorSet LightSystem::descriptor_set(uint32_t frameIndex) const
-{
-    if (frameIndex >= _frames.size()) {
-        return VK_NULL_HANDLE;
-    }
-
-    return _frames[frameIndex].descriptorSet;
 }
 
 void LightSystem::append_fallback_directional(const GPUSceneData& sceneData)

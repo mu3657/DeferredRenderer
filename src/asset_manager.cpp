@@ -304,9 +304,9 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
 
     assets::MaterialInfo matInfo = assets::read_material_info(&file);
 
-    MaterialPass pass = MaterialPass::MainColor;
+    MaterialSurface pass = MaterialSurface::MainColor;
     if (matInfo.transparency == assets::TransparencyMode::Transparent) {
-        pass = MaterialPass::Transparent;
+        pass = MaterialSurface::Transparent;
     }
 
     // Resolve Textures
