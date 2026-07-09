@@ -13,9 +13,89 @@ layout(set = 1, binding = 0) uniform sampler2D gAlbedo;
 layout(set = 1, binding = 1) uniform sampler2D gNormal;
 layout(set = 1, binding = 2) uniform sampler2D gMaterial;
 layout(set = 1, binding = 3) uniform sampler2D gDepth;
+layout(set = 3, binding = 0) uniform sampler2D shadowMap;
+
+const int SHADOW_CASCADE_COUNT = 4;
+
+layout(set = 3, binding = 1) uniform ShadowDataBuffer {
+    mat4 lightViewProj[SHADOW_CASCADE_COUNT];
+    vec4 cascadeSplits;
+    vec4 lightDir;
+    vec4 params; // x = bias, y = strength, z = texelSize, w = enabled
+} shadowData;
 
 // Basic PBR Lighting functions (simplified for minimalism)
 const float PI = 3.14159265359;
+
+int selectShadowCascade(vec3 worldPos)
+{
+    float viewDepth = -(sceneData.view * vec4(worldPos, 1.0)).z;
+    if (viewDepth > shadowData.cascadeSplits.w) {
+        return -1;
+    }
+    if (viewDepth <= shadowData.cascadeSplits.x) {
+        return 0;
+    }
+    if (viewDepth <= shadowData.cascadeSplits.y) {
+        return 1;
+    }
+    if (viewDepth <= shadowData.cascadeSplits.z) {
+        return 2;
+    }
+    return 3;
+}
+
+vec2 cascadeAtlasOffset(int cascadeIndex)
+{
+    return vec2(float(cascadeIndex % 2), float(cascadeIndex / 2)) * 0.5;
+}
+
+float sampleDirectionalShadow(vec3 worldPos, vec3 N, vec3 L)
+{
+    if (shadowData.params.w <= 0.0) {
+        return 1.0;
+    }
+
+    int cascadeIndex = selectShadowCascade(worldPos);
+    if (cascadeIndex < 0) {
+        return 1.0;
+    }
+
+    vec4 lightClip = shadowData.lightViewProj[cascadeIndex] * vec4(worldPos, 1.0);
+    vec3 lightNdc = lightClip.xyz / lightClip.w;
+
+    vec2 localShadowUV = lightNdc.xy * 0.5 + 0.5;
+    float receiverDepth = lightNdc.z;
+
+    if (lightClip.w <= 0.0 ||
+    any(lessThan(localShadowUV, vec2(0.0))) ||
+    any(greaterThan(localShadowUV, vec2(1.0))) ||
+    receiverDepth < 0.0 ||
+    receiverDepth > 1.0) {
+        return 1.0;
+    }
+
+    float ndotl = max(dot(N, L), 0.0);
+    float bias = max(shadowData.params.x, 0.0025 * (1.0 - ndotl));
+    float texelSize = shadowData.params.z;
+
+    float visibility = 0.0;
+    vec2 atlasOffset = cascadeAtlasOffset(cascadeIndex);
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            vec2 offset = vec2(x, y) * texelSize;
+            vec2 localSampleUV = clamp(localShadowUV + offset, vec2(0.0), vec2(1.0));
+            vec2 atlasUV = atlasOffset + localSampleUV * 0.5;
+            float closestDepth = texture(shadowMap, atlasUV).r;
+
+            visibility += (receiverDepth + bias < closestDepth) ? 0.0 : 1.0;
+        }
+    }
+
+    float pcfVisibility = visibility / 25.0;
+    float shadowStrength = clamp(shadowData.params.y, 0.0, 1.0);
+    return mix(1.0, pcfVisibility, shadowStrength);
+}
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
@@ -94,10 +174,9 @@ void main()
     vec4 materialSample = texture(gMaterial, inUV); // r=roughness, g=ao
     float depth         = texture(gDepth, inUV).r;
 
-    // Discard background (skybox logic can run before/after this)
-    if (depth >= 1.0) {
-        outFragColor = vec4(0.0); // Or sample a skybox here if you want
-        return;
+    // Reverse-Z depth clears the background to 0. Discard keeps the pre-drawn background.
+    if (depth <= 0.0) {
+        discard;
     }
 
     // 2. Unpack attributes
@@ -117,8 +196,11 @@ void main()
 
     vec3 Lo = vec3(0.0);
 
+    uint directionalSeen = 0;
     // --- Direct Lighting ---
     for (uint i = 0; i < lightData.lightCount; i++) {
+        float visibility = 1.0;
+
         GPULight light = lights[i];
         uint type = uint(light.directionType.w + 0.5);
 
@@ -128,6 +210,10 @@ void main()
         if (type == LIGHT_TYPE_DIRECTIONAL) {
             // directionType.xyz is the light emission direction. Shading uses the surface-to-light vector.
             L = normalize(-light.directionType.xyz);
+            if (directionalSeen == 0u) {
+                visibility = sampleDirectionalShadow(worldPos, N, L);
+            }
+            directionalSeen++;
         } else {
             vec3 toLight = light.positionRange.xyz - worldPos;
             float distanceToLight = length(toLight);
@@ -152,7 +238,7 @@ void main()
             radiance *= attenuation;
         }
 
-        Lo += evaluatePBRDirect(albedo, metallic, roughness, N, V, L, radiance);
+        Lo += evaluatePBRDirect(albedo, metallic, roughness, N, V, L, radiance*visibility);
     }
 
     // --- Ambient Lighting ---

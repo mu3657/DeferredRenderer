@@ -304,9 +304,9 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
 
     assets::MaterialInfo matInfo = assets::read_material_info(&file);
 
-    MaterialSurface pass = MaterialSurface::MainColor;
+    MaterialSurface surface = MaterialSurface::Opaque;
     if (matInfo.transparency == assets::TransparencyMode::Transparent) {
-        pass = MaterialSurface::Transparent;
+        surface = MaterialSurface::Transparent;
     }
 
     // Resolve Textures
@@ -351,7 +351,7 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     resources.data = constants;
 
     // Build Material Instance
-    MaterialInstance matInstance = _engine->metalRoughMaterial.write_material(_engine->_device, pass, resources, _engine->globalDescriptorAllocator);
+    MaterialInstance matInstance = _engine->metalRoughMaterial.write_material(_engine->_device, surface, resources, _engine->globalDescriptorAllocator);
 
     auto newMat = std::make_shared<Material>();
     newMat->data = matInstance;

@@ -6,6 +6,7 @@
 #include <vk_types.h>
 
 constexpr uint32_t MAX_GPU_LIGHTS = 256;
+constexpr uint32_t SHADOW_CASCADE_COUNT = 4;
 
 struct GPUSceneData {
     glm::mat4 view;
@@ -38,9 +39,10 @@ struct GPULight {
 };
 
 struct GPUShadowData {
-    glm::mat4 lightViewProj;
+    glm::mat4 lightViewProj[SHADOW_CASCADE_COUNT];
+    glm::vec4 cascadeSplits; // positive camera view-space distances
     glm::vec4 lightDir;
-    glm::vec4 params; // bias, normalBias, texelSize, enabled
+    glm::vec4 params; // bias, strength, texelSize, enabled
 };
 
 struct GPULightData {

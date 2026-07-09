@@ -21,7 +21,7 @@ public:
 
     const GPULightData& light_data() const { return _lightData; }
     const std::vector<GPULight>& lights() const { return _cpuLights; }
-
+    GPULight GetDirectionalLight();
 private:
     VulkanEngine* _engine{nullptr};
     std::vector<GPULight> _cpuLights;

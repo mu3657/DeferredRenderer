@@ -23,6 +23,7 @@
 #include "imgui_impl_vulkan.h"
 
 #include "vk_pipelines.h"
+#include "Renderpasses/shadow_pass.h"
 VulkanEngine* loadedEngine = nullptr;
 #ifdef NDEBUG
 const bool bUseValidationLayers = false;
@@ -46,6 +47,13 @@ std::string scene_display_name(const std::string& path)
 
     return stem.empty() ? path : stem;
 }
+
+float elapsed_ms(std::chrono::steady_clock::time_point start)
+{
+    const auto end = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    return static_cast<float>(elapsed.count()) / 1000.f;
+}
 }
 
 
@@ -67,7 +75,7 @@ void VulkanEngine::init()
         _windowExtent.height,
         window_flags
     );
-	init_renderdoc();
+	// init_renderdoc();
     init_vulkan();
 
     init_swapchain();
@@ -79,11 +87,23 @@ void VulkanEngine::init()
     init_descriptors();
     init_default_data();
     init_gbuffer(); 
-    pipelineRegistry.init(this);
+    pipelineRegistry.init(_device);
     _mainDeletionQueue.push_function([this]() {
         pipelineRegistry.cleanup();
     });
     init_pipelines();
+    RenderPassInitContext passInitContext{
+        *this,
+        _descriptorSystem,
+        _device,
+        _allocator,
+    };
+    geometryPass.init(passInitContext);
+    shadowPass.init(passInitContext);
+    _mainDeletionQueue.push_function([this]() {
+        shadowPass.cleanup();
+        geometryPass.cleanup();
+    });
     init_imgui();
 
 	init_camera();
@@ -326,13 +346,17 @@ RenderPassFrameContext VulkanEngine::make_pass_frame_context(VkCommandBuffer cmd
 
 void VulkanEngine::draw()
 {
-	ZoneScoped;
+	ZoneScopedN("Frame Draw");
 	if (capture_next_frame && rdoc_api) {
 		rdoc_api->StartFrameCapture(NULL, NULL);
 	}
 
+    stats.reset_pass_stats();
 
+    const auto sceneUpdateStart = std::chrono::steady_clock::now();
 	update_scene();
+    stats.scene_update_time = elapsed_ms(sceneUpdateStart);
+    TracyPlot("Scene Update CPU ms", stats.scene_update_time);
 
     VK_CHECK(vkWaitForFences(_device, 1, &get_current_frame()._renderFence, true, 1000000000));
 
@@ -367,7 +391,7 @@ void VulkanEngine::draw()
     //start the command buffer recording
     // _drawExtent.width = _drawImage.imageExtent.width;
     // _drawExtent.height = _drawImage.imageExtent.height;
-	auto start = std::chrono::system_clock::now();
+	const auto renderRecordStart = std::chrono::steady_clock::now();
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));
     RenderPassFrameContext passContext = make_pass_frame_context(cmd);
 
@@ -386,12 +410,17 @@ void VulkanEngine::draw()
     vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-    GeometryPassContext geometryContext{ passContext, sceneData, mainDrawContext };
-	geometryPass.execute(geometryContext);
-	auto end = std::chrono::system_clock::now();
-	auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+	ShadowPassContext shadowContext{ passContext, sceneData, mainDrawContext, lightSystem };
+	const auto shadowPassStart = std::chrono::steady_clock::now();
+	shadowPass.execute(shadowContext);
+	stats.shadow.cpu_time_ms = elapsed_ms(shadowPassStart);
+    TracyPlot("ShadowPass CPU ms", stats.shadow.cpu_time_ms);
 
-	stats.mesh_draw_time = elapsed.count() / 1000.f;
+    GeometryPassContext geometryContext{ passContext, sceneData, mainDrawContext };
+	const auto geometryPassStart = std::chrono::steady_clock::now();
+	geometryPass.execute(geometryContext);
+	stats.geometry.cpu_time_ms = elapsed_ms(geometryPassStart);
+    TracyPlot("GeometryPass CPU ms", stats.geometry.cpu_time_ms);
 
 
 	vkutil::transition_image(cmd, _gAlbedo.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -400,7 +429,23 @@ void VulkanEngine::draw()
 	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 
     LightingPassContext lightingContext{ passContext, _drawImage.imageView, lightSystem };
+	const auto lightingPassStart = std::chrono::steady_clock::now();
 	lighting_pass(lightingContext);
+	stats.lighting.cpu_time_ms = elapsed_ms(lightingPassStart);
+    TracyPlot("LightingPass CPU ms", stats.lighting.cpu_time_ms);
+
+	stats.drawcall_count =
+        stats.shadow.drawcall_count
+        + stats.geometry.drawcall_count
+        + stats.lighting.drawcall_count;
+	stats.triangle_count =
+        stats.shadow.triangle_count
+        + stats.geometry.triangle_count
+        + stats.lighting.triangle_count;
+	stats.mesh_draw_time = elapsed_ms(renderRecordStart);
+    TracyPlot("Frame Draw Calls", static_cast<int64_t>(stats.drawcall_count));
+    TracyPlot("Frame Triangles Submitted", static_cast<int64_t>(stats.triangle_count));
+    TracyPlot("Render Record CPU ms", stats.mesh_draw_time);
 
 	//transtion the draw image and the swapchain image into their correct transfer layouts
 	vkutil::transition_image(cmd, _drawImage.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -480,9 +525,9 @@ void VulkanEngine::run()
     	float deltaTime = (float)(currentTime - lastTime) / (float)frequency;
     	// fmt::print("deltaTime: {}\n", deltaTime);
     	lastTime = currentTime;
+        stats.frametime = deltaTime * 1000.f;
 
         while (SDL_PollEvent(&e) ) {
-        	auto start = std::chrono::system_clock::now();
             //close the window when user alt-f4s or clicks the X button
             if (e.type == SDL_QUIT) bQuit = true;
             if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F11) {
@@ -506,13 +551,6 @@ void VulkanEngine::run()
                     stop_rendering = false;
                 }
             }
-
-        	//get clock again, compare with start clock
-        	auto end = std::chrono::system_clock::now();
-
-        	//convert to microseconds (integer), and then come back to miliseconds
-        	auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-        	stats.frametime = elapsed.count() / 1000.f;
         }
 
         // 每帧只更新一次相机（放在事件循环之外）
@@ -532,17 +570,33 @@ void VulkanEngine::run()
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-    	ImGui::Begin("Stats");
+        ImGui::Begin("Stats");
 
-    	ImGui::Text("frametime %f ms", stats.frametime);
-    	ImGui::Text("draw time %f ms", stats.mesh_draw_time);
-    	ImGui::Text("update time %f ms", stats.scene_update_time);
-    	ImGui::Text("triangles %i", stats.triangle_count);
-    	ImGui::Text("draws %i", stats.drawcall_count);
+        ImGui::Text("Frame %.3f ms", stats.frametime);
+        ImGui::Text("Scene update %.3f ms", stats.scene_update_time);
+        ImGui::Text("Render record %.3f ms", stats.mesh_draw_time);
+        ImGui::Text("Submitted triangles %i", stats.triangle_count);
+        ImGui::Text("Submitted draws %i", stats.drawcall_count);
+        ImGui::Separator();
+        ImGui::Text(
+            "Shadow    %.3f ms | draws %i | tris %i",
+            stats.shadow.cpu_time_ms,
+            stats.shadow.drawcall_count,
+            stats.shadow.triangle_count);
+        ImGui::Text(
+            "Geometry  %.3f ms | draws %i | tris %i",
+            stats.geometry.cpu_time_ms,
+            stats.geometry.drawcall_count,
+            stats.geometry.triangle_count);
+        ImGui::Text(
+            "Lighting  %.3f ms | draws %i | tris %i",
+            stats.lighting.cpu_time_ms,
+            stats.lighting.drawcall_count,
+            stats.lighting.triangle_count);
 		if (ImGui::Button("Capture Frame (RenderDoc)")) {
 			capture_next_frame = true;
 		}
-    	ImGui::End();
+        ImGui::End();
 
         if (ImGui::Begin("background")) {
 
@@ -563,6 +617,7 @@ void VulkanEngine::run()
 
         draw_scene_browser();
         lightSystem.draw_debug_ui();
+        shadowPass.draw_debug_ui();
 
         // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
         sceneOutliner.draw(*this);
@@ -1091,7 +1146,7 @@ void VulkanEngine::init_pipelines()
 
     materialResources.data = constants;
 
-    defaultData = metalRoughMaterial.write_material(_device, MaterialSurface::MainColor,
+    defaultData = metalRoughMaterial.write_material(_device, MaterialSurface::Opaque,
         materialResources, globalDescriptorAllocator);
 }
 
@@ -1260,9 +1315,10 @@ void VulkanEngine::destroy_image(const AllocatedImage& img)
 
 void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 {
-	ZoneScoped;
+	ZoneScopedN("LightingPass");
     VkCommandBuffer cmd = ctx.cmd;
     VkImageView targetImageView = ctx.targetImageView;
+    stats.lighting = {};
 
 	VkRenderingAttachmentInfo swapchainAttachment = vkinit::attachment_info(targetImageView, nullptr, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	VkRenderingInfo renderInfo = {};
@@ -1296,6 +1352,7 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
 
+	VkDescriptorSet shadowSet = shadowPass.descriptor_set(ctx.frameIndex);
 
 	vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,_deferredLightingPipeline);
 	//vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout, 0, 1, &_gBufferDescriptorSet, 0, nullptr);
@@ -1308,8 +1365,14 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 							1, 1, &_gBufferDescriptorSet, 0, nullptr);         // 绑定 Set 1 (G-Buffer)
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
                             2, 1, &currentFrame.lightDescriptor, 0, nullptr);  // Set 2 (LightData)
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
+							3, 1, &shadowSet, 0, nullptr);
 	// 绘制 3 个没有 Vertex Buffer 指派的顶点
 	vkCmdDraw(cmd, 3, 1, 0, 0);
+    stats.lighting.drawcall_count = 1;
+    stats.lighting.triangle_count = 1;
+    TracyPlot("LightingPass Draw Calls", static_cast<int64_t>(stats.lighting.drawcall_count));
+    TracyPlot("LightingPass Triangles", static_cast<int64_t>(stats.lighting.triangle_count));
 	//
 	vkCmdEndRendering(cmd);
 
@@ -1397,20 +1460,23 @@ void VulkanEngine::init_background_pipelines()
 void VulkanEngine::init_Deferredlighting_pipeline()
 {
 	VkShaderModule lightingShader;
-	if (!vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/deferred_lighting.vert.spv", _device, &lightingShader)) {
+	if (!vkutil::load_shader_module("../cmake-build-debug/shaders/deferred_lighting.vert.spv", _device, &lightingShader)
+        && !vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/deferred_lighting.vert.spv", _device, &lightingShader)) {
 		fmt::print("Error when building the deferred lighting shader module \n");
 	}
 
 	VkShaderModule deferredLightingShader;
-	if (!vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/deferred_lighting.frag.spv", _device, &deferredLightingShader)) {
+	if (!vkutil::load_shader_module("../cmake-build-debug/shaders/deferred_lighting.frag.spv", _device, &deferredLightingShader)
+        && !vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/deferred_lighting.frag.spv", _device, &deferredLightingShader)) {
 		fmt::print("Error when building the deferred lighting shader module \n");
 	}
 	VkPipelineLayoutCreateInfo layoutCreateInfo = vkinit::pipeline_layout_create_info();
-	layoutCreateInfo.setLayoutCount = 3;
+	layoutCreateInfo.setLayoutCount = 4;
 	VkDescriptorSetLayout lightingLayouts[] = {
         _gpuSceneDataDescriptorLayout,
         _gBufferDescriptorLayout,
-        _descriptorSystem.layout(DescriptorLayoutID::LightData)
+        _descriptorSystem.layout(DescriptorLayoutID::LightData),
+		_descriptorSystem.layout(DescriptorLayoutID::ShadowInput)
     };
 	layoutCreateInfo.pSetLayouts = lightingLayouts;
 	layoutCreateInfo.pPushConstantRanges = nullptr;
@@ -1469,11 +1535,7 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 	mesh_layout_info.pPushConstantRanges = &matrixRange;
 	mesh_layout_info.pushConstantRangeCount = 1;
 
-	VkPipelineLayout newLayout;
-	VK_CHECK(vkCreatePipelineLayout(engine->_device, &mesh_layout_info, nullptr, &newLayout));
-
-    opaquePipeline.layout = newLayout;
-    transparentPipeline.layout = newLayout;
+	VkPipelineLayout newLayout = engine->pipelineRegistry.create_pipeline_layout(mesh_layout_info);
 
 	// build the stage-create-info for both vertex and fragment stages. This lets
 	// the pipeline know the shader modules per stage
@@ -1499,42 +1561,31 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 	pipelineBuilder._pipelineLayout = newLayout;
 
 	// finally build the pipeline
-    opaquePipeline.pipeline = pipelineBuilder.build_pipeline(engine->_device);
+    opaquePipeline = engine->pipelineRegistry.create_material_pipeline(
+        PipelineKey{
+            RenderPassType::GBuffer,
+            PipelineVariant::GBuffer_MetallicRoughness,
+            ShadingModel::MetallicRoughness,
+            MaterialSurface::Opaque,
+        },
+        pipelineBuilder);
 
 	// create the transparent variant
 	pipelineBuilder.enable_blending_additive();
 
 	pipelineBuilder.enable_depthtest(false, VK_COMPARE_OP_GREATER_OR_EQUAL);
 
-	transparentPipeline.pipeline = pipelineBuilder.build_pipeline(engine->_device);
-
-    engine->pipelineRegistry.register_material_pipeline(
+	transparentPipeline = engine->pipelineRegistry.create_material_pipeline(
         PipelineKey{
             RenderPassType::GBuffer,
             PipelineVariant::GBuffer_MetallicRoughness,
-            MaterialSurface::MainColor,
-        },
-        &opaquePipeline);
-
-    engine->pipelineRegistry.register_material_pipeline(
-        PipelineKey{
-            RenderPassType::GBuffer,
-            PipelineVariant::GBuffer_MetallicRoughness,
+            ShadingModel::MetallicRoughness,
             MaterialSurface::Transparent,
         },
-        &transparentPipeline);
+        pipelineBuilder);
 
 	vkDestroyShaderModule(engine->_device, meshFragShader, nullptr);
 	vkDestroyShaderModule(engine->_device, meshVertexShader, nullptr);
-	engine->_mainDeletionQueue.push_function([=]() {
-		// 1. 销毁具体的管线实体
-		vkDestroyPipeline(engine->_device, opaquePipeline.pipeline, nullptr);
-		vkDestroyPipeline(engine->_device, transparentPipeline.pipeline, nullptr);
-
-		// 2. 销毁管线的总布线图 (Pipeline Layout)
-		// newLayout 在上面被 [=] 按值捕获了，所以在这里绝对安全
-		vkDestroyPipelineLayout(engine->_device, newLayout, nullptr);
-	});
 
 }
 
@@ -1561,16 +1612,19 @@ void GLTFMetallic_Roughness::clear_resources(VkDevice device)
 {
 }
 
-MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, MaterialSurface pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator)
+MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, MaterialSurface surface, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator)
 {
     MaterialInstance matData;
-    matData.passType = pass;
+    matData.surface = surface;
+    matData.shadingModel = technique.shading_model();
+    matData.technique = &technique;
+    matData.castsShadow = surface != MaterialSurface::Transparent;
     matData.gbufferVariant = PipelineVariant::GBuffer_MetallicRoughness;
-    if (pass == MaterialSurface::Transparent) {
-        matData.pipeline = &transparentPipeline;
+    if (surface == MaterialSurface::Transparent) {
+        matData.pipeline = transparentPipeline;
     }
     else {
-        matData.pipeline = &opaquePipeline;
+        matData.pipeline = opaquePipeline;
     }
 
     VulkanEngine& engine = VulkanEngine::Get();

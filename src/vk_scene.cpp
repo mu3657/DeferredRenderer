@@ -42,11 +42,10 @@ RenderObject* RenderScene::get_object(uint32_t id) {
 
 void RenderScene::update_draw_context(DrawContext& ctx) {
     // Collect into context.
-    // By default, if the material defines transparent vs opaque, we would separate them.
-    // For now we just push everything to the opaque surfaces or based on the passType.
+    // By default, if the material defines transparent vs opaque, we separate them by surface type.
     
     for (const auto& obj : _objects) {
-        if (obj.material && obj.material->passType == MaterialSurface::Transparent) {
+        if (obj.material && obj.material->surface == MaterialSurface::Transparent) {
             ctx.TransparentSurfaces.push_back(obj);
         } else {
             ctx.OpaqueSurfaces.push_back(obj);

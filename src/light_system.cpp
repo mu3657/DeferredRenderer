@@ -173,6 +173,24 @@ void LightSystem::draw_debug_ui()
     ImGui::End();
 }
 
+ GPULight LightSystem::GetDirectionalLight()
+{
+    for (GPULight DL:_cpuLights)
+    {
+        if (static_cast<int>(DL.directionType.w) == static_cast<int>(LightType::Directional))
+        {
+            return DL;
+        }
+    }
+    GPULight defaultDirectionalLight = {};
+    defaultDirectionalLight.positionRange = glm::vec4(0.f, 0.f, 0.f, 0.f);
+    defaultDirectionalLight.directionType = glm::vec4(0.f, -1.f, 0.f, static_cast<float>(light_type_to_uint(LightType::Directional)));
+    defaultDirectionalLight.colorIntensity = glm::vec4(1.f, 1.f, 1.f, 1.f);
+    defaultDirectionalLight.params = glm::vec4(1.f, 1.f, -1.f, 1.f);
+
+    return  defaultDirectionalLight;
+}
+
 void LightSystem::append_fallback_directional(const GPUSceneData& sceneData)
 {
     const glm::vec3 lightToSurface = safe_normalize(-glm::vec3(sceneData.sunlightDirection), glm::vec3(0.f, -1.f, -0.5f));

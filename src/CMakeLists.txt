@@ -17,6 +17,8 @@ add_executable (engine
   vk_pipelines.cpp
   pipeline_registry.h
   pipeline_registry.cpp
+  material_system.h
+  material_system.cpp
   vk_engine.h
   vk_engine.cpp
   vk_loader.h
@@ -31,10 +33,11 @@ add_executable (engine
         vk_scene.cpp
         vk_outliner.h
         vk_outliner.cpp
-        shadow_pass.h
+        Renderpasses/shadow_pass.h
         render_pass.h
         Renderpasses/geometry_pass.h
         Renderpasses/geometry_pass.cpp
+        Renderpasses/shadow_pass.cpp
 )
 
 set_property(TARGET engine PROPERTY CXX_STANDARD 20)

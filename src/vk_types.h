@@ -75,9 +75,19 @@ struct GPUDrawPushConstants {
 };
 
 enum class MaterialSurface :uint8_t {
-    MainColor,
+    Opaque,
+    Masked,
     Transparent,
     Other
+};
+
+enum class ShadingModel : uint8_t {
+    MetallicRoughness,
+    CharacterSkin,
+    CharacterHair,
+    CharacterEye,
+    CharacterCloth,
+    Unlit,
 };
 
 enum class PipelineVariant : uint8_t {
@@ -93,11 +103,16 @@ struct MaterialPipeline {
 	VkPipelineLayout layout;
 };
 
+class MaterialTechnique;
+
 struct MaterialInstance {
     // Legacy fallback while pass-owned pipeline lookup is being introduced.
-    MaterialPipeline* pipeline;
-    uint32_t materialID;
-    MaterialSurface passType;
+    MaterialPipeline* pipeline{nullptr};
+    uint32_t materialID{0};
+    MaterialSurface surface{MaterialSurface::Opaque};
+    ShadingModel shadingModel{ShadingModel::MetallicRoughness};
+    MaterialTechnique* technique{nullptr};
+    bool castsShadow{true};
     PipelineVariant gbufferVariant{PipelineVariant::GBuffer_MetallicRoughness};
 };
 

@@ -9,53 +9,21 @@
 #include <array>
 #include <vector>
 
-namespace {
-bool is_visible(const RenderObject& obj, const glm::mat4& viewproj)
-{
-    std::array<glm::vec3, 8> corners{
-        glm::vec3{1, 1, 1},
-        glm::vec3{1, 1, -1},
-        glm::vec3{1, -1, 1},
-        glm::vec3{1, -1, -1},
-        glm::vec3{-1, 1, 1},
-        glm::vec3{-1, 1, -1},
-        glm::vec3{-1, -1, 1},
-        glm::vec3{-1, -1, -1},
-    };
-
-    glm::mat4 matrix = viewproj * obj.transform;
-
-    glm::vec3 min = {1.5, 1.5, 1.5};
-    glm::vec3 max = {-1.5, -1.5, -1.5};
-
-    for (int c = 0; c < 8; c++) {
-        glm::vec4 v = matrix * glm::vec4(obj.bounds.origin + (corners[c] * obj.bounds.extents), 1.f);
-
-        v.x = v.x / v.w;
-        v.y = v.y / v.w;
-        v.z = v.z / v.w;
-
-        min = glm::min(glm::vec3{v.x, v.y, v.z}, min);
-        max = glm::max(glm::vec3{v.x, v.y, v.z}, max);
-    }
-
-    return !(min.z > 1.f || max.z < 0.f || min.x > 1.f || max.x < -1.f || min.y > 1.f || max.y < -1.f);
-}
-}
-
 void GeometryPass::execute(GeometryPassContext& ctx)
 {
-    ZoneScoped;
+    ZoneScopedN("GeometryPass");
 
     VulkanEngine& engine = ctx.engine;
     VkCommandBuffer cmd = ctx.cmd;
     DrawContext& drawContext = ctx.drawContext;
+    RenderPassStats& passStats = engine.stats.geometry;
+    passStats = {};
 
     std::vector<uint32_t> opaqueDraws;
     opaqueDraws.reserve(drawContext.OpaqueSurfaces.size());
 
     for (uint32_t i = 0; i < drawContext.OpaqueSurfaces.size(); i++) {
-        if (is_visible(drawContext.OpaqueSurfaces[i], ctx.sceneData.viewproj)) {
+        if (util::is_visible(drawContext.OpaqueSurfaces[i], ctx.sceneData.viewproj)) {
             opaqueDraws.push_back(i);
         }
     }
@@ -69,9 +37,6 @@ void GeometryPass::execute(GeometryPassContext& ctx)
 
         return A.material < B.material;
     });
-
-    engine.stats.drawcall_count = 0;
-    engine.stats.triangle_count = 0;
 
     VkClearValue clearColor;
     clearColor.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
@@ -121,13 +86,8 @@ void GeometryPass::execute(GeometryPassContext& ctx)
     VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
 
     auto draw = [&](const RenderObject& r) {
-        PipelineKey pipelineKey{
-            RenderPassType::GBuffer,
-            r.material->gbufferVariant,
-            r.material->passType,
-        };
-        MaterialPipeline* pipeline = engine.pipelineRegistry.get_material_pipeline(pipelineKey);
-        if (!pipeline) {
+        MaterialPipeline* pipeline = engine.pipelineRegistry.get_material_pipeline(RenderPassType::GBuffer, *r.material);
+        if (!pipeline && !r.material->technique) {
             pipeline = r.material->pipeline;
         }
         if (!pipeline) {
@@ -168,8 +128,8 @@ void GeometryPass::execute(GeometryPassContext& ctx)
             sizeof(GPUDrawPushConstants),
             &pushConstants);
 
-        engine.stats.drawcall_count++;
-        engine.stats.triangle_count += r.indexCount / 3;
+        passStats.drawcall_count++;
+        passStats.triangle_count += r.indexCount / 3;
         vkCmdDrawIndexed(cmd, r.indexCount, 1, r.firstIndex, 0, 0);
     };
 
@@ -184,4 +144,7 @@ void GeometryPass::execute(GeometryPassContext& ctx)
     drawContext.TransparentSurfaces.clear();
 
     vkCmdEndRendering(cmd);
+
+    TracyPlot("GeometryPass Draw Calls", static_cast<int64_t>(passStats.drawcall_count));
+    TracyPlot("GeometryPass Triangles", static_cast<int64_t>(passStats.triangle_count));
 }

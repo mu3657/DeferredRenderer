@@ -25,9 +25,9 @@ public:
 
     void clear();
 
-    VkPipeline build_pipeline(VkDevice device);
+    VkPipeline build_pipeline(VkDevice device, VkPipelineCache pipelineCache = VK_NULL_HANDLE);
 
-    void set_shaders(VkShaderModule vertexShader, VkShaderModule fragmentShader);
+    void set_shaders(VkShaderModule vertexShader, VkShaderModule fragmentShader = VK_NULL_HANDLE);
 
     void set_input_topology(VkPrimitiveTopology topology);
 

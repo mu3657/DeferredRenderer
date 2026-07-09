@@ -49,7 +49,7 @@ bool vkutil::load_shader_module(const char* filePath,
     *outShaderModule = shaderModule;
     return true;
 }
-VkPipeline PipelineBuilder::build_pipeline(VkDevice device) {
+VkPipeline PipelineBuilder::build_pipeline(VkDevice device, VkPipelineCache pipelineCache) {
     // make viewport state from our stored viewport and scissor.
     // at the moment we wont support multiple viewports or scissors
     VkPipelineViewportStateCreateInfo viewportState = {};
@@ -106,7 +106,7 @@ VkPipeline PipelineBuilder::build_pipeline(VkDevice device) {
     // its easy to error out on create graphics pipeline, so we handle it a bit
     // better than the common VK_CHECK case
     VkPipeline newPipeline;
-    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo,
+    if (vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo,
             nullptr, &newPipeline)
         != VK_SUCCESS) {
         fmt::println("failed to create pipeline");
@@ -116,15 +116,22 @@ VkPipeline PipelineBuilder::build_pipeline(VkDevice device) {
         }
 }
 
+
 void PipelineBuilder::set_shaders(VkShaderModule vertexShader, VkShaderModule fragmentShader)
 {
     _shaderStages.clear();
 
     _shaderStages.push_back(
-        vkinit::pipeline_shader_stage_create_info(VK_SHADER_STAGE_VERTEX_BIT, vertexShader));
+        vkinit::pipeline_shader_stage_create_info(
+            VK_SHADER_STAGE_VERTEX_BIT,
+            vertexShader));
 
-    _shaderStages.push_back(
-        vkinit::pipeline_shader_stage_create_info(VK_SHADER_STAGE_FRAGMENT_BIT, fragmentShader));
+    if (fragmentShader != VK_NULL_HANDLE) {
+        _shaderStages.push_back(
+            vkinit::pipeline_shader_stage_create_info(
+                VK_SHADER_STAGE_FRAGMENT_BIT,
+                fragmentShader));
+    }
 }
 void PipelineBuilder::set_input_topology(VkPrimitiveTopology topology)
 {

@@ -33,7 +33,7 @@ find_program(GLSL_VALIDATOR glslangValidator HINTS $ENV{VULKAN_SDK}/Bin)
 set(SHADER_SEARCH_PATH "${PROJECT_SOURCE_DIR}/shaders")
 message(STATUS "Searching shaders in: ${SHADER_SEARCH_PATH}")
 
-file(GLOB_RECURSE GLSL_SOURCE_FILES
+file(GLOB_RECURSE GLSL_SOURCE_FILES CONFIGURE_DEPENDS
         "${SHADER_SEARCH_PATH}/*.frag"
         "${SHADER_SEARCH_PATH}/*.vert"
         "${SHADER_SEARCH_PATH}/*.comp"

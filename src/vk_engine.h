@@ -1,5 +1,3 @@
-// vulkan_guide.h : Include file for standard system include files,
-// or project specific include files.
 
 #pragma once
 
@@ -14,12 +12,14 @@
 //bootstrap library
 #include "camera.h"
 #include "light_system.h"
+#include "material_system.h"
 #include "pipeline_registry.h"
 #include "render_pass.h"
 #include "Renderpasses/geometry_pass.h"
 #include "VkBootstrap.h"
 #include "vk_scene.h"
 #include "vk_outliner.h"
+#include "Renderpasses/shadow_pass.h"
 
 #if defined(_WIN32)
 	#define WIN32_LEAN_AND_MEAN
@@ -91,17 +91,37 @@ struct ComputeEffect {
 
 	ComputePushConstants data;
 };
+struct RenderPassStats {
+	int drawcall_count{0};
+	int triangle_count{0};
+	float cpu_time_ms{0.f};
+};
+
 struct EngineStats {
-	float frametime;
-	int triangle_count;
-	int drawcall_count;
-	float scene_update_time;
-	float mesh_draw_time;
+	float frametime{0.f};
+	int triangle_count{0};
+	int drawcall_count{0};
+	float scene_update_time{0.f};
+	float mesh_draw_time{0.f};
+	RenderPassStats shadow;
+	RenderPassStats geometry;
+	RenderPassStats lighting;
+
+	void reset_pass_stats()
+	{
+		triangle_count = 0;
+		drawcall_count = 0;
+		mesh_draw_time = 0.f;
+		shadow = {};
+		geometry = {};
+		lighting = {};
+	}
 };
 class VulkanEngine;
 struct GLTFMetallic_Roughness {
-	MaterialPipeline opaquePipeline;
-	MaterialPipeline transparentPipeline;
+	MaterialPipeline* opaquePipeline{nullptr};
+	MaterialPipeline* transparentPipeline{nullptr};
+	MetallicRoughnessTechnique technique;
 
 	struct MaterialConstants {
 		glm::vec4 colorFactors;
@@ -144,7 +164,7 @@ struct GLTFMetallic_Roughness {
 	void build_pipelines(VulkanEngine* engine);
 	void clear_resources(VkDevice device);
 
-	MaterialInstance write_material(VkDevice device, MaterialSurface pass, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator);
+	MaterialInstance write_material(VkDevice device, MaterialSurface surface, const MaterialResources& resources, DescriptorAllocatorGrowable& descriptorAllocator);
 };
 constexpr unsigned int FRAME_OVERLAP = 3;
 
@@ -205,7 +225,7 @@ public:
 	PipelineRegistry pipelineRegistry;
 	LightSystem lightSystem;
 	GeometryPass geometryPass;
-
+    ShadowPass shadowPass;
 	// --- Bindless Setup ---
 	VkDescriptorSetLayout _bindlessDescriptorLayout;
 	VkDescriptorSet _bindlessDescriptorSet;
@@ -340,3 +360,37 @@ private:
 	void init_imgui();
 
 };
+
+namespace util {
+	inline bool is_visible(const RenderObject& obj, const glm::mat4& viewproj)
+	{
+		std::array<glm::vec3, 8> corners{
+			glm::vec3{1, 1, 1},
+			glm::vec3{1, 1, -1},
+			glm::vec3{1, -1, 1},
+			glm::vec3{1, -1, -1},
+			glm::vec3{-1, 1, 1},
+			glm::vec3{-1, 1, -1},
+			glm::vec3{-1, -1, 1},
+			glm::vec3{-1, -1, -1},
+		};
+
+		glm::mat4 matrix = viewproj * obj.transform;
+
+		glm::vec3 min = {1.5, 1.5, 1.5};
+		glm::vec3 max = {-1.5, -1.5, -1.5};
+
+		for (int c = 0; c < 8; c++) {
+			glm::vec4 v = matrix * glm::vec4(obj.bounds.origin + (corners[c] * obj.bounds.extents), 1.f);
+
+			v.x = v.x / v.w;
+			v.y = v.y / v.w;
+			v.z = v.z / v.w;
+
+			min = glm::min(glm::vec3{v.x, v.y, v.z}, min);
+			max = glm::max(glm::vec3{v.x, v.y, v.z}, max);
+		}
+
+		return !(min.z > 1.f || max.z < 0.f || min.x > 1.f || max.x < -1.f || min.y > 1.f || max.y < -1.f);
+	}
+}
