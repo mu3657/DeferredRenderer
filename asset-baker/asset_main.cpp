@@ -367,9 +367,11 @@ void extract_gltf_vertices(tinygltf::Primitive& primitive, tinygltf::Model& mode
 				_vertices[i].normal[1] = *(dtf + (i * 3) + 1);
 				_vertices[i].normal[2] = *(dtf + (i * 3) + 2);
 
-				_vertices[i].color[0] = *(dtf + (i * 3) + 0);
-				_vertices[i].color[1] = *(dtf + (i * 3) + 1);
-				_vertices[i].color[2] = *(dtf + (i * 3) + 2);
+				// COLOR_0 is not imported by this legacy path yet. Keep the neutral
+				// vertex color instead of accidentally copying signed normals into it.
+				_vertices[i].color[0] = 1.0f;
+				_vertices[i].color[1] = 1.0f;
+				_vertices[i].color[2] = 1.0f;
 			}
 			else {
 				assert(false);

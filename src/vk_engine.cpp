@@ -75,7 +75,7 @@ void VulkanEngine::init()
         _windowExtent.height,
         window_flags
     );
-	// init_renderdoc();
+	init_renderdoc();
     init_vulkan();
 
     init_swapchain();
@@ -100,7 +100,9 @@ void VulkanEngine::init()
     };
     geometryPass.init(passInitContext);
     shadowPass.init(passInitContext);
+    transparentPass.init(passInitContext);
     _mainDeletionQueue.push_function([this]() {
+        transparentPass.cleanup();
         shadowPass.cleanup();
         geometryPass.cleanup();
     });
@@ -434,14 +436,29 @@ void VulkanEngine::draw()
 	stats.lighting.cpu_time_ms = elapsed_ms(lightingPassStart);
     TracyPlot("LightingPass CPU ms", stats.lighting.cpu_time_ms);
 
+    TransparentPassContext transparentContext{
+        passContext,
+        sceneData,
+        mainDrawContext,
+        lightSystem,
+        _drawImage.imageView,
+        _depthImage.imageView,
+    };
+    const auto transparentPassStart = std::chrono::steady_clock::now();
+    transparentPass.execute(transparentContext);
+    stats.transparent.cpu_time_ms = elapsed_ms(transparentPassStart);
+    TracyPlot("TransparentPass CPU ms", stats.transparent.cpu_time_ms);
+
 	stats.drawcall_count =
         stats.shadow.drawcall_count
         + stats.geometry.drawcall_count
-        + stats.lighting.drawcall_count;
+        + stats.lighting.drawcall_count
+        + stats.transparent.drawcall_count;
 	stats.triangle_count =
         stats.shadow.triangle_count
         + stats.geometry.triangle_count
-        + stats.lighting.triangle_count;
+        + stats.lighting.triangle_count
+        + stats.transparent.triangle_count;
 	stats.mesh_draw_time = elapsed_ms(renderRecordStart);
     TracyPlot("Frame Draw Calls", static_cast<int64_t>(stats.drawcall_count));
     TracyPlot("Frame Triangles Submitted", static_cast<int64_t>(stats.triangle_count));
@@ -1130,7 +1147,7 @@ void VulkanEngine::init_pipelines()
     GLTFMetallic_Roughness::MaterialResources materialResources;
     materialResources.colorImage        = _whiteImage;
     materialResources.colorSampler      = _defaultSamplerLinear;
-    materialResources.metalRoughImage   = _greyImage;
+    materialResources.metalRoughImage   = _whiteImage;
     materialResources.metalRoughSampler = _defaultSamplerLinear;
     materialResources.normalImage       = _defaultNormalImage;
     materialResources.normalSampler     = _defaultSamplerLinear;
@@ -1511,14 +1528,19 @@ void VulkanEngine::init_Deferredlighting_pipeline()
 }
 void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 {
-	VkShaderModule meshFragShader;
-	if (!vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/gbuffer.frag.spv", engine->_device, &meshFragShader)) {
+	VkShaderModule meshFragShader = VK_NULL_HANDLE;
+	if (!vkutil::load_shader_module("../cmake-build-debug/shaders/gbuffer.frag.spv", engine->_device, &meshFragShader)
+        && !vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/gbuffer.frag.spv", engine->_device, &meshFragShader)) {
 		fmt::println("Error when building the gbuffer fragment shader module");
+		return;
 	}
 
-	VkShaderModule meshVertexShader;
-	if (!vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/gbuffer.vert.spv", engine->_device, &meshVertexShader)) {
+	VkShaderModule meshVertexShader = VK_NULL_HANDLE;
+	if (!vkutil::load_shader_module("../cmake-build-debug/shaders/gbuffer.vert.spv", engine->_device, &meshVertexShader)
+        && !vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/gbuffer.vert.spv", engine->_device, &meshVertexShader)) {
 		fmt::println("Error when building the gbuffer vertex shader module");
+		vkDestroyShaderModule(engine->_device, meshFragShader, nullptr);
+		return;
 	}
 
 	VkPushConstantRange matrixRange{};
@@ -1570,19 +1592,56 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
         },
         pipelineBuilder);
 
-	// create the transparent variant
-	pipelineBuilder.enable_blending_additive();
+	VkShaderModule transparentFragShader = VK_NULL_HANDLE;
+	if (vkutil::load_shader_module(
+            "../cmake-build-debug/shaders/forward_transparent.frag.spv",
+            engine->_device,
+            &transparentFragShader)
+        || vkutil::load_shader_module(
+            "../cmake-build-debug-mingw/shaders/forward_transparent.frag.spv",
+            engine->_device,
+            &transparentFragShader)) {
+        VkDescriptorSetLayout transparentLayouts[] = {
+            engine->_gpuSceneDataDescriptorLayout,
+            engine->_bindlessDescriptorLayout,
+            engine->_descriptorSystem.layout(DescriptorLayoutID::LightData),
+            engine->_descriptorSystem.layout(DescriptorLayoutID::ShadowInput),
+        };
 
-	pipelineBuilder.enable_depthtest(false, VK_COMPARE_OP_GREATER_OR_EQUAL);
+        VkPipelineLayoutCreateInfo transparentLayoutInfo = vkinit::pipeline_layout_create_info();
+        transparentLayoutInfo.setLayoutCount = 4;
+        transparentLayoutInfo.pSetLayouts = transparentLayouts;
+        transparentLayoutInfo.pPushConstantRanges = &matrixRange;
+        transparentLayoutInfo.pushConstantRangeCount = 1;
 
-	transparentPipeline = engine->pipelineRegistry.create_material_pipeline(
-        PipelineKey{
-            RenderPassType::GBuffer,
-            PipelineVariant::GBuffer_MetallicRoughness,
-            ShadingModel::MetallicRoughness,
-            MaterialSurface::Transparent,
-        },
-        pipelineBuilder);
+        VkPipelineLayout transparentLayout =
+            engine->pipelineRegistry.create_pipeline_layout(transparentLayoutInfo);
+
+        PipelineBuilder transparentBuilder;
+        transparentBuilder.set_shaders(meshVertexShader, transparentFragShader);
+        transparentBuilder.set_input_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+        transparentBuilder.set_polygon_mode(VK_POLYGON_MODE_FILL);
+        transparentBuilder.set_cull_mode(VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE);
+        transparentBuilder.set_multisampling_none();
+        transparentBuilder.enable_blending_alphablend();
+        transparentBuilder.enable_depthtest(false, VK_COMPARE_OP_GREATER_OR_EQUAL);
+        transparentBuilder.set_color_attachment_format(engine->_drawImage.imageFormat);
+        transparentBuilder.set_depth_format(engine->_depthImage.imageFormat);
+        transparentBuilder._pipelineLayout = transparentLayout;
+
+        transparentPipeline = engine->pipelineRegistry.create_material_pipeline(
+            PipelineKey{
+                RenderPassType::ForwardTransparent,
+                PipelineVariant::Forward_MetallicRoughness,
+                ShadingModel::MetallicRoughness,
+                MaterialSurface::Transparent,
+            },
+            transparentBuilder);
+
+        vkDestroyShaderModule(engine->_device, transparentFragShader, nullptr);
+    } else {
+        fmt::println("Error when building the forward transparent fragment shader module");
+    }
 
 	vkDestroyShaderModule(engine->_device, meshFragShader, nullptr);
 	vkDestroyShaderModule(engine->_device, meshVertexShader, nullptr);

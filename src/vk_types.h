@@ -93,6 +93,7 @@ enum class ShadingModel : uint8_t {
 enum class PipelineVariant : uint8_t {
     GBuffer_MetallicRoughness,
     GBuffer_Unlit,
+    Forward_MetallicRoughness,
     ShadowDepth_Opaque,
     ShadowDepth_AlphaCutout,
     Lighting_Fullscreen,

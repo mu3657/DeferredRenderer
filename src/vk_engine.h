@@ -16,6 +16,7 @@
 #include "pipeline_registry.h"
 #include "render_pass.h"
 #include "Renderpasses/geometry_pass.h"
+#include "Renderpasses/transparent_pass.h"
 #include "VkBootstrap.h"
 #include "vk_scene.h"
 #include "vk_outliner.h"
@@ -106,6 +107,7 @@ struct EngineStats {
 	RenderPassStats shadow;
 	RenderPassStats geometry;
 	RenderPassStats lighting;
+	RenderPassStats transparent;
 
 	void reset_pass_stats()
 	{
@@ -115,6 +117,7 @@ struct EngineStats {
 		shadow = {};
 		geometry = {};
 		lighting = {};
+		transparent = {};
 	}
 };
 class VulkanEngine;
@@ -226,6 +229,7 @@ public:
 	LightSystem lightSystem;
 	GeometryPass geometryPass;
     ShadowPass shadowPass;
+    TransparentPass transparentPass;
 	// --- Bindless Setup ---
 	VkDescriptorSetLayout _bindlessDescriptorLayout;
 	VkDescriptorSet _bindlessDescriptorSet;

@@ -38,16 +38,19 @@ public:
 
     AllocatedImage _shadowDepthImage{};
     VkSampler _shadowSampler{VK_NULL_HANDLE};
-    VkExtent2D _shadowExtent{2048, 2048};
+    VkExtent2D _shadowExtent{4096, 4096};
 
     bool _enabled{true};
-    float _maxDistance{160.f};
+    float _maxDistance{50.f};
     float _splitLambda{0.75f};
+    float _cascadeBlendRatio{0.1f};
     float _depthPadding{30.f};
     float _bias{0.006f};
     float _strength{0.75f};
+    std::array<int, SHADOW_CASCADE_COUNT> _pcfKernelRadii{2, 1, 1, 0};
     std::array<float, SHADOW_CASCADE_COUNT> _lastTexelWorldSize{};
     std::array<float, SHADOW_CASCADE_COUNT> _lastCascadeSplits{};
+    std::array<float, SHADOW_CASCADE_COUNT> _lastCascadeBlendWidths{};
     std::array<uint32_t, SHADOW_CASCADE_COUNT> _lastVisibleCasters{};
 
     MaterialPipeline* _opaquePipeline{nullptr};

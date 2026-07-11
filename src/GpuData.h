@@ -41,6 +41,10 @@ struct GPULight {
 struct GPUShadowData {
     glm::mat4 lightViewProj[SHADOW_CASCADE_COUNT];
     glm::vec4 cascadeSplits; // positive camera view-space distances
+    // Half-width of each transition around cascadeSplits; the fourth component is unused.
+    glm::vec4 cascadeBlendWidths;
+    // Per-cascade PCF kernel radius in texels, stored as floats for std140 compatibility.
+    glm::vec4 pcfKernelRadii;
     glm::vec4 lightDir;
     glm::vec4 params; // bias, strength, texelSize, enabled
 };

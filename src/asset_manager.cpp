@@ -328,7 +328,8 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     GLTFMetallic_Roughness::MaterialResources resources;
     resources.colorImage        = get_texture("baseColor", _engine->_whiteImage);
     resources.colorSampler      = _engine->_defaultSamplerLinear;
-    resources.metalRoughImage   = get_texture("metallicRoughness", _engine->_greyImage);
+    // glTF factors are multiplied by the texture, so a missing texture must be neutral.
+    resources.metalRoughImage   = get_texture("metallicRoughness", _engine->_whiteImage);
     resources.metalRoughSampler = _engine->_defaultSamplerLinear;
     resources.normalImage       = get_texture("normals", _engine->_defaultNormalImage);
     resources.normalSampler     = _engine->_defaultSamplerLinear;
@@ -340,6 +341,13 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     // Parse Factors
     GLTFMetallic_Roughness::MaterialConstants constants{};
     constants.colorFactors = parse_vec4(matInfo.customProperties["baseColorFactor"], glm::vec4(1.0f));
+
+    // Some legacy materials carry a meaningful alpha but were exported as
+    // OPAQUE. Use the authored alpha only; material names are not a domain rule.
+    if (surface == MaterialSurface::Opaque
+        && constants.colorFactors.a < 0.999f) {
+        surface = MaterialSurface::Transparent;
+    }
     
     float metallic = parse_float(matInfo.customProperties["metallicFactor"], 1.0f);
     float roughness = parse_float(matInfo.customProperties["roughnessFactor"], 1.0f);

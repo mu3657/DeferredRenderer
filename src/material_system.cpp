@@ -5,13 +5,13 @@ bool MetallicRoughnessTechnique::supports_pass(RenderPassType pass, MaterialSurf
     switch (pass) {
     case RenderPassType::GBuffer:
         return surface == MaterialSurface::Opaque
-            || surface == MaterialSurface::Masked
-            || surface == MaterialSurface::Transparent;
+            || surface == MaterialSurface::Masked;
     case RenderPassType::ShadowDepth:
         return surface == MaterialSurface::Opaque || surface == MaterialSurface::Masked;
+    case RenderPassType::ForwardTransparent:
+        return surface == MaterialSurface::Transparent;
     case RenderPassType::Lighting:
     case RenderPassType::ForwardOpaque:
-    case RenderPassType::ForwardTransparent:
     case RenderPassType::Velocity:
     case RenderPassType::Outline:
         return false;
@@ -27,6 +27,8 @@ PipelineKey MetallicRoughnessTechnique::pipeline_key(RenderPassType pass, Materi
         variant = surface == MaterialSurface::Masked
             ? PipelineVariant::ShadowDepth_AlphaCutout
             : PipelineVariant::ShadowDepth_Opaque;
+    } else if (pass == RenderPassType::ForwardTransparent) {
+        variant = PipelineVariant::Forward_MetallicRoughness;
     }
 
     return PipelineKey{

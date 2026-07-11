@@ -136,12 +136,8 @@ void GeometryPass::execute(GeometryPassContext& ctx)
     for (auto& r : opaqueDraws) {
         draw(drawContext.OpaqueSurfaces[r]);
     }
-    for (auto& r : drawContext.TransparentSurfaces) {
-        draw(r);
-    }
 
     drawContext.OpaqueSurfaces.clear();
-    drawContext.TransparentSurfaces.clear();
 
     vkCmdEndRendering(cmd);
 

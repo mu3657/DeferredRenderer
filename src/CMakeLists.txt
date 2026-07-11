@@ -38,6 +38,8 @@ add_executable (engine
         Renderpasses/geometry_pass.h
         Renderpasses/geometry_pass.cpp
         Renderpasses/shadow_pass.cpp
+        Renderpasses/transparent_pass.h
+        Renderpasses/transparent_pass.cpp
 )
 
 set_property(TARGET engine PROPERTY CXX_STANDARD 20)

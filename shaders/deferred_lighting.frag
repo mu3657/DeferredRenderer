@@ -20,6 +20,8 @@ const int SHADOW_CASCADE_COUNT = 4;
 layout(set = 3, binding = 1) uniform ShadowDataBuffer {
     mat4 lightViewProj[SHADOW_CASCADE_COUNT];
     vec4 cascadeSplits;
+    vec4 cascadeBlendWidths;
+    vec4 pcfKernelRadii;
     vec4 lightDir;
     vec4 params; // x = bias, y = strength, z = texelSize, w = enabled
 } shadowData;
@@ -27,22 +29,31 @@ layout(set = 3, binding = 1) uniform ShadowDataBuffer {
 // Basic PBR Lighting functions (simplified for minimalism)
 const float PI = 3.14159265359;
 
-int selectShadowCascade(vec3 worldPos)
+struct ShadowCascadeSelection {
+    int primary;
+    int secondary;
+    float blend;
+};
+
+ShadowCascadeSelection selectShadowCascades(float viewDepth)
 {
-    float viewDepth = -(sceneData.view * vec4(worldPos, 1.0)).z;
     if (viewDepth > shadowData.cascadeSplits.w) {
-        return -1;
+        return ShadowCascadeSelection(-1, -1, 0.0);
     }
-    if (viewDepth <= shadowData.cascadeSplits.x) {
-        return 0;
+
+    for (int cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT - 1; cascadeIndex++) {
+        float split = shadowData.cascadeSplits[cascadeIndex];
+        float blendWidth = shadowData.cascadeBlendWidths[cascadeIndex];
+        if (blendWidth > 0.0 && viewDepth >= split - blendWidth && viewDepth <= split + blendWidth) {
+            float blend = smoothstep(split - blendWidth, split + blendWidth, viewDepth);
+            return ShadowCascadeSelection(cascadeIndex, cascadeIndex + 1, blend);
+        }
+        if (viewDepth < split - blendWidth) {
+            return ShadowCascadeSelection(cascadeIndex, -1, 0.0);
+        }
     }
-    if (viewDepth <= shadowData.cascadeSplits.y) {
-        return 1;
-    }
-    if (viewDepth <= shadowData.cascadeSplits.z) {
-        return 2;
-    }
-    return 3;
+
+    return ShadowCascadeSelection(SHADOW_CASCADE_COUNT - 1, -1, 0.0);
 }
 
 vec2 cascadeAtlasOffset(int cascadeIndex)
@@ -50,17 +61,8 @@ vec2 cascadeAtlasOffset(int cascadeIndex)
     return vec2(float(cascadeIndex % 2), float(cascadeIndex / 2)) * 0.5;
 }
 
-float sampleDirectionalShadow(vec3 worldPos, vec3 N, vec3 L)
+float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
 {
-    if (shadowData.params.w <= 0.0) {
-        return 1.0;
-    }
-
-    int cascadeIndex = selectShadowCascade(worldPos);
-    if (cascadeIndex < 0) {
-        return 1.0;
-    }
-
     vec4 lightClip = shadowData.lightViewProj[cascadeIndex] * vec4(worldPos, 1.0);
     vec3 lightNdc = lightClip.xyz / lightClip.w;
 
@@ -78,11 +80,12 @@ float sampleDirectionalShadow(vec3 worldPos, vec3 N, vec3 L)
     float ndotl = max(dot(N, L), 0.0);
     float bias = max(shadowData.params.x, 0.0025 * (1.0 - ndotl));
     float texelSize = shadowData.params.z;
+    int kernelRadius = clamp(int(shadowData.pcfKernelRadii[cascadeIndex] + 0.5), 0, 3);
 
     float visibility = 0.0;
     vec2 atlasOffset = cascadeAtlasOffset(cascadeIndex);
-    for (int y = -2; y <= 2; y++) {
-        for (int x = -2; x <= 2; x++) {
+    for (int y = -kernelRadius; y <= kernelRadius; y++) {
+        for (int x = -kernelRadius; x <= kernelRadius; x++) {
             vec2 offset = vec2(x, y) * texelSize;
             vec2 localSampleUV = clamp(localShadowUV + offset, vec2(0.0), vec2(1.0));
             vec2 atlasUV = atlasOffset + localSampleUV * 0.5;
@@ -92,9 +95,31 @@ float sampleDirectionalShadow(vec3 worldPos, vec3 N, vec3 L)
         }
     }
 
-    float pcfVisibility = visibility / 25.0;
+    float pcfSampleCount = float((kernelRadius * 2 + 1) * (kernelRadius * 2 + 1));
+    float pcfVisibility = visibility / pcfSampleCount;
     float shadowStrength = clamp(shadowData.params.y, 0.0, 1.0);
     return mix(1.0, pcfVisibility, shadowStrength);
+}
+
+float sampleDirectionalShadow(vec3 worldPos, vec3 N, vec3 L)
+{
+    if (shadowData.params.w <= 0.0) {
+        return 1.0;
+    }
+
+    float viewDepth = -(sceneData.view * vec4(worldPos, 1.0)).z;
+    ShadowCascadeSelection selection = selectShadowCascades(viewDepth);
+    if (selection.primary < 0) {
+        return 1.0;
+    }
+
+    float visibility = sampleShadowCascade(selection.primary, worldPos, N, L);
+    if (selection.secondary >= 0) {
+        float nextVisibility = sampleShadowCascade(selection.secondary, worldPos, N, L);
+        visibility = mix(visibility, nextVisibility, selection.blend);
+    }
+
+    return visibility;
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {

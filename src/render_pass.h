@@ -64,6 +64,30 @@ struct LightingPassContext : RenderPassFrameContext {
     }
 };
 
+struct TransparentPassContext : RenderPassFrameContext {
+    GPUSceneData& sceneData;
+    DrawContext& drawContext;
+    LightSystem& lightSystem;
+    VkImageView targetImageView;
+    VkImageView depthImageView;
+
+    TransparentPassContext(
+        RenderPassFrameContext& base,
+        GPUSceneData& sceneData_,
+        DrawContext& drawContext_,
+        LightSystem& lightSystem_,
+        VkImageView targetImageView_,
+        VkImageView depthImageView_)
+        : RenderPassFrameContext(base)
+        , sceneData(sceneData_)
+        , drawContext(drawContext_)
+        , lightSystem(lightSystem_)
+        , targetImageView(targetImageView_)
+        , depthImageView(depthImageView_)
+    {
+    }
+};
+
 class RenderPassBase {
 public:
     RenderPassBase(const RenderPassBase&) = delete;

@@ -154,6 +154,25 @@ std::array<float, SHADOW_CASCADE_COUNT> make_cascade_splits(
     return splits;
 }
 
+std::array<float, SHADOW_CASCADE_COUNT> make_cascade_blend_widths(
+    float nearDistance,
+    const std::array<float, SHADOW_CASCADE_COUNT>& splits,
+    float blendRatio)
+{
+    blendRatio = std::clamp(blendRatio, 0.f, 0.25f);
+
+    std::array<float, SHADOW_CASCADE_COUNT> blendWidths{};
+    float cascadeNear = nearDistance;
+    for (uint32_t cascadeIndex = 0; cascadeIndex + 1 < SHADOW_CASCADE_COUNT; cascadeIndex++) {
+        const float currentRange = splits[cascadeIndex] - cascadeNear;
+        const float nextRange = splits[cascadeIndex + 1] - splits[cascadeIndex];
+        blendWidths[cascadeIndex] = std::max(0.f, std::min(currentRange, nextRange) * blendRatio);
+        cascadeNear = splits[cascadeIndex];
+    }
+
+    return blendWidths;
+}
+
 VkRect2D cascade_atlas_rect(VkExtent2D atlasExtent, uint32_t cascadeIndex)
 {
     const uint32_t cascadeWidth = atlasExtent.width / 2;
@@ -354,27 +373,39 @@ void ShadowPass::execute(ShadowPassContext& ctx)
     constexpr float cameraNearDistance = 0.1f;
     const std::array<float, SHADOW_CASCADE_COUNT> cascadeSplits =
         make_cascade_splits(cameraNearDistance, _maxDistance, _splitLambda);
+    const std::array<float, SHADOW_CASCADE_COUNT> cascadeBlendWidths =
+        make_cascade_blend_widths(cameraNearDistance, cascadeSplits, _cascadeBlendRatio);
     const VkExtent2D cascadeExtent{_shadowExtent.width / 2, _shadowExtent.height / 2};
 
-    float cascadeNear = cameraNearDistance;
+    std::array<GPUSceneData, SHADOW_CASCADE_COUNT> cascadeSceneData{};
     for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {
-        GPUSceneData shadowSceneData = make_shadow_scene_data(
+        const float logicalCascadeNear = cascadeIndex == 0
+            ? cameraNearDistance
+            : cascadeSplits[cascadeIndex - 1];
+        const float logicalCascadeFar = cascadeSplits[cascadeIndex];
+        const float renderCascadeNear = cascadeIndex == 0
+            ? logicalCascadeNear
+            : std::max(cameraNearDistance, logicalCascadeNear - cascadeBlendWidths[cascadeIndex - 1]);
+        const float renderCascadeFar = cascadeIndex + 1 == SHADOW_CASCADE_COUNT
+            ? logicalCascadeFar
+            : logicalCascadeFar + cascadeBlendWidths[cascadeIndex];
+
+        cascadeSceneData[cascadeIndex] = make_shadow_scene_data(
             ctx.sceneData,
             directionalLight,
             cascadeExtent,
-            cascadeNear,
-            cascadeSplits[cascadeIndex],
+            renderCascadeNear,
+            renderCascadeFar,
             _depthPadding,
             _lastTexelWorldSize[cascadeIndex]);
 
-        _shadowData.lightViewProj[cascadeIndex] = shadowSceneData.viewproj;
+        _shadowData.lightViewProj[cascadeIndex] = cascadeSceneData[cascadeIndex].viewproj;
         _lastCascadeSplits[cascadeIndex] = cascadeSplits[cascadeIndex];
+        _lastCascadeBlendWidths[cascadeIndex] = cascadeBlendWidths[cascadeIndex];
         std::memcpy(
             shadowFrame.sceneBuffers[cascadeIndex].info.pMappedData,
-            &shadowSceneData,
+            &cascadeSceneData[cascadeIndex],
             sizeof(GPUSceneData));
-
-        cascadeNear = cascadeSplits[cascadeIndex];
     }
 
     _shadowData.cascadeSplits = glm::vec4(
@@ -382,6 +413,16 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         cascadeSplits[1],
         cascadeSplits[2],
         cascadeSplits[3]);
+    _shadowData.cascadeBlendWidths = glm::vec4(
+        cascadeBlendWidths[0],
+        cascadeBlendWidths[1],
+        cascadeBlendWidths[2],
+        cascadeBlendWidths[3]);
+    _shadowData.pcfKernelRadii = glm::vec4(
+        static_cast<float>(std::clamp(_pcfKernelRadii[0], 0, 3)),
+        static_cast<float>(std::clamp(_pcfKernelRadii[1], 0, 3)),
+        static_cast<float>(std::clamp(_pcfKernelRadii[2], 0, 3)),
+        static_cast<float>(std::clamp(_pcfKernelRadii[3], 0, 3)));
     _shadowData.lightDir = directionalLight.directionType;
     _shadowData.params = glm::vec4(
         _bias,
@@ -418,16 +459,8 @@ void ShadowPass::execute(ShadowPassContext& ctx)
 
     vkCmdBeginRendering(cmd, &renderInfo);
 
-    cascadeNear = cameraNearDistance;
     for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {
-        GPUSceneData shadowSceneData = make_shadow_scene_data(
-            ctx.sceneData,
-            directionalLight,
-            cascadeExtent,
-            cascadeNear,
-            cascadeSplits[cascadeIndex],
-            _depthPadding,
-            _lastTexelWorldSize[cascadeIndex]);
+        const GPUSceneData& shadowSceneData = cascadeSceneData[cascadeIndex];
 
         std::vector<uint32_t> opaqueDraws;
         opaqueDraws.reserve(drawContext.OpaqueSurfaces.size());
@@ -531,8 +564,6 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         for (uint32_t drawIndex : opaqueDraws) {
             draw(drawContext.OpaqueSurfaces[drawIndex]);
         }
-
-        cascadeNear = cascadeSplits[cascadeIndex];
     }
 
     vkCmdEndRendering(cmd);
@@ -557,17 +588,22 @@ void ShadowPass::draw_debug_ui()
     ImGui::Checkbox("Enabled", &_enabled);
     ImGui::SliderFloat("Max distance", &_maxDistance, 10.f, 300.f, "%.1f");
     ImGui::SliderFloat("Split lambda", &_splitLambda, 0.f, 1.f, "%.2f");
+    ImGui::SliderFloat("Cascade blend ratio", &_cascadeBlendRatio, 0.f, 0.25f, "%.3f");
     ImGui::SliderFloat("Depth padding", &_depthPadding, 1.f, 60.f, "%.1f");
     ImGui::SliderFloat("Bias", &_bias, 0.0005f, 0.03f, "%.5f");
     ImGui::SliderFloat("Strength", &_strength, 0.f, 1.f, "%.2f");
     ImGui::Text("Shadow atlas: %ux%u", _shadowExtent.width, _shadowExtent.height);
     for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {
         ImGui::Text(
-            "Cascade %u split %.2f casters %u texel %.4f",
+            "Cascade %u split %.2f blend %.2f casters %u texel %.4f",
             cascadeIndex,
             _lastCascadeSplits[cascadeIndex],
+            _lastCascadeBlendWidths[cascadeIndex],
             _lastVisibleCasters[cascadeIndex],
             _lastTexelWorldSize[cascadeIndex]);
+        ImGui::PushID(static_cast<int>(cascadeIndex));
+        ImGui::SliderInt("PCF radius", &_pcfKernelRadii[cascadeIndex], 0, 3);
+        ImGui::PopID();
     }
 
     ImGui::End();
