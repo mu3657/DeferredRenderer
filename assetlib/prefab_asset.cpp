@@ -46,7 +46,7 @@ assets::PrefabInfo assets::read_prefab_info(AssetFile* file)
 	if (prefab_metadata.contains("node_lights")) {
 		std::unordered_map<uint64_t, nlohmann::json> lightnodes = prefab_metadata["node_lights"];
 		for (auto pair : lightnodes) {
-			assets::PrefabInfo::NodeLight node;
+			assets::PrefabInfo::NodeLight node{};
 
 			node.color[0] = pair.second["color"][0];
 			node.color[1] = pair.second["color"][1];
@@ -54,6 +54,8 @@ assets::PrefabInfo assets::read_prefab_info(AssetFile* file)
 			node.intensity = pair.second["intensity"];
 			node.type = pair.second["type"];
 			node.range = pair.second["range"];
+			node.width = pair.second.value("width", 1.0f);
+			node.height = pair.second.value("height", 1.0f);
 
 			info.node_lights[pair.first] = node;
 		}
@@ -94,6 +96,8 @@ assets::AssetFile assets::pack_prefab(const PrefabInfo& info)
 		lightnode["intensity"] = pair.second.intensity;
 		lightnode["type"] = pair.second.type;
 		lightnode["range"] = pair.second.range;
+		lightnode["width"] = pair.second.width;
+		lightnode["height"] = pair.second.height;
 		lightindex[pair.first] = lightnode;
 	}
 

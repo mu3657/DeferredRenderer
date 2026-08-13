@@ -17,10 +17,12 @@ namespace assets {
 		};
 
 		struct NodeLight {
-			float color[3];
-			float intensity;
-			int type; // 0 = point, 1 = directional, 2 = spot
-			float range;
+			float color[3]{1.f, 1.f, 1.f};
+			float intensity{1.f};
+			int type{0}; // 0 = point, 1 = directional, 2 = spot, 3 = rect area
+			float range{0.f};
+			float width{1.f};
+			float height{1.f};
 		};
 
 		std::unordered_map<uint64_t, NodeMesh> node_meshes;

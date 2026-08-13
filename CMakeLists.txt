@@ -3,7 +3,7 @@
 #
 cmake_minimum_required (VERSION 4.0)
 
-project ("vulkan_guide")
+project ("vulkan_engine")
 # --- 1. MSVC 全域設定 (必須放在 add_subdirectory 之前) ---
 if(MSVC)
     # 強制所有目標使用動態 Runtime 庫 (Debug 下為 /MDd)

@@ -64,7 +64,8 @@ GPUSceneData make_shadow_scene_data(
     float cascadeNearDistance,
     float cascadeFarDistance,
     float depthPadding,
-    float& outTexelWorldSize)
+    float& outTexelWorldSize,
+    float& outDepthRange)
 {
     cascadeNearDistance = std::max(cascadeNearDistance, 0.01f);
     cascadeFarDistance = std::max(cascadeFarDistance, cascadeNearDistance + 1.f);
@@ -121,6 +122,7 @@ GPUSceneData make_shadow_scene_data(
 
     const float nearDistance = std::max(0.01f, -maxBounds.z - depthPadding);
     const float farDistance = std::max(nearDistance + 1.f, -minBounds.z + depthPadding);
+    outDepthRange = farDistance - nearDistance;
 
     // This renderer uses reverse-Z depth: clear depth to 0 and compare GREATER_OR_EQUAL.
     glm::mat4 proj = glm::ortho(left, right, bottom, top, farDistance, nearDistance);
@@ -203,8 +205,11 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
 
     VkSamplerCreateInfo sampl = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
 
-    sampl.magFilter = VK_FILTER_LINEAR;
-    sampl.minFilter = VK_FILTER_LINEAR;
+    // PCF comparisons are performed manually in the lighting shaders. Filtering
+    // depth before the comparison blends blocker and background depths and causes
+    // light seams around contact edges.
+    sampl.magFilter = VK_FILTER_NEAREST;
+    sampl.minFilter = VK_FILTER_NEAREST;
     sampl.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     sampl.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     sampl.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
@@ -244,6 +249,7 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
     pipelineBuilder.set_input_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
     pipelineBuilder.set_polygon_mode(VK_POLYGON_MODE_FILL);
     pipelineBuilder.set_cull_mode(VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE);
+    pipelineBuilder.enable_depth_bias();
     pipelineBuilder.set_multisampling_none();
     pipelineBuilder.disable_blending();
     pipelineBuilder.enable_depthtest(true, VK_COMPARE_OP_GREATER_OR_EQUAL);
@@ -397,7 +403,8 @@ void ShadowPass::execute(ShadowPassContext& ctx)
             renderCascadeNear,
             renderCascadeFar,
             _depthPadding,
-            _lastTexelWorldSize[cascadeIndex]);
+            _lastTexelWorldSize[cascadeIndex],
+            _lastDepthRange[cascadeIndex]);
 
         _shadowData.lightViewProj[cascadeIndex] = cascadeSceneData[cascadeIndex].viewproj;
         _lastCascadeSplits[cascadeIndex] = cascadeSplits[cascadeIndex];
@@ -423,9 +430,19 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         static_cast<float>(std::clamp(_pcfKernelRadii[1], 0, 3)),
         static_cast<float>(std::clamp(_pcfKernelRadii[2], 0, 3)),
         static_cast<float>(std::clamp(_pcfKernelRadii[3], 0, 3)));
+    _shadowData.cascadeTexelWorldSizes = glm::vec4(
+        _lastTexelWorldSize[0],
+        _lastTexelWorldSize[1],
+        _lastTexelWorldSize[2],
+        _lastTexelWorldSize[3]);
+    _shadowData.cascadeDepthRanges = glm::vec4(
+        _lastDepthRange[0],
+        _lastDepthRange[1],
+        _lastDepthRange[2],
+        _lastDepthRange[3]);
     _shadowData.lightDir = directionalLight.directionType;
     _shadowData.params = glm::vec4(
-        _bias,
+        _receiverBiasTexels,
         _strength,
         1.0f / static_cast<float>(cascadeExtent.width),
         _enabled && directionalLight.colorIntensity.w > 0.f ? 1.0f : 0.0f);
@@ -499,6 +516,14 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         viewport.maxDepth = 1.f;
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &cascadeRect);
+        // Reverse-Z keeps the closest caster at the greatest depth. Negative
+        // raster bias moves caster depths away from the light and suppresses
+        // slope-dependent self-shadowing without moving the receiver surface.
+        vkCmdSetDepthBias(
+            cmd,
+            -_rasterConstantBias,
+            0.f,
+            -_rasterSlopeBias);
 
         MaterialPipeline* lastPipeline = nullptr;
         VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
@@ -590,7 +615,9 @@ void ShadowPass::draw_debug_ui()
     ImGui::SliderFloat("Split lambda", &_splitLambda, 0.f, 1.f, "%.2f");
     ImGui::SliderFloat("Cascade blend ratio", &_cascadeBlendRatio, 0.f, 0.25f, "%.3f");
     ImGui::SliderFloat("Depth padding", &_depthPadding, 1.f, 60.f, "%.1f");
-    ImGui::SliderFloat("Bias", &_bias, 0.0005f, 0.03f, "%.5f");
+    ImGui::SliderFloat("Receiver bias (texels)", &_receiverBiasTexels, 0.f, 1.f, "%.2f");
+    ImGui::SliderFloat("Raster constant bias", &_rasterConstantBias, 0.f, 5.f, "%.2f");
+    ImGui::SliderFloat("Raster slope bias", &_rasterSlopeBias, 0.f, 5.f, "%.2f");
     ImGui::SliderFloat("Strength", &_strength, 0.f, 1.f, "%.2f");
     ImGui::Text("Shadow atlas: %ux%u", _shadowExtent.width, _shadowExtent.height);
     for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {

@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include <vk_types.h>
@@ -36,6 +37,8 @@ struct GPULight {
     glm::vec4 directionType;    // xyz = light emission direction, w = LightType
     glm::vec4 colorIntensity;   // rgb = linear color, w = intensity
     glm::vec4 params;           // x/y = spot cone cosines, z = shadow index, w = flags
+    glm::vec4 areaRight;        // xyz = rectangle right, w = half width
+    glm::vec4 areaUp;           // xyz = rectangle up, w = half height
 };
 
 struct GPUShadowData {
@@ -45,8 +48,10 @@ struct GPUShadowData {
     glm::vec4 cascadeBlendWidths;
     // Per-cascade PCF kernel radius in texels, stored as floats for std140 compatibility.
     glm::vec4 pcfKernelRadii;
+    glm::vec4 cascadeTexelWorldSizes;
+    glm::vec4 cascadeDepthRanges;
     glm::vec4 lightDir;
-    glm::vec4 params; // bias, strength, texelSize, enabled
+    glm::vec4 params; // bias in shadow texels, strength, texelSize, enabled
 };
 
 struct GPULightData {
@@ -54,8 +59,15 @@ struct GPULightData {
     uint32_t directionalLightCount{0};
     uint32_t pointLightCount{0};
     uint32_t spotLightCount{0};
+    uint32_t rectAreaLightCount{0};
+    uint32_t padding0{0};
+    uint32_t padding1{0};
+    uint32_t padding2{0};
     glm::vec4 ambientColor{0.1f};
 };
 
-static_assert(sizeof(GPULight) == 64);
-static_assert(sizeof(GPULightData) == 32);
+static_assert(sizeof(GPULight) == 96);
+static_assert(offsetof(GPULight, areaRight) == 64);
+static_assert(offsetof(GPULight, areaUp) == 80);
+static_assert(sizeof(GPULightData) == 48);
+static_assert(offsetof(GPULightData, ambientColor) == 32);

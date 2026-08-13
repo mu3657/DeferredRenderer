@@ -40,6 +40,8 @@ add_executable (engine
         Renderpasses/shadow_pass.cpp
         Renderpasses/transparent_pass.h
         Renderpasses/transparent_pass.cpp
+        Renderpasses/ContactShadow_pass.h
+        Renderpasses/ContactShadow_pass.cpp
 )
 
 set_property(TARGET engine PROPERTY CXX_STANDARD 20)

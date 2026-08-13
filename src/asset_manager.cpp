@@ -213,6 +213,8 @@ std::shared_ptr<LoadedScene> AssetManager::load_prefab(const std::string& path) 
             lightNode->light.intensity = nl.intensity;
             lightNode->light.type      = static_cast<LightType>(nl.type);
             lightNode->light.range     = nl.range;
+            lightNode->light.width     = nl.width;
+            lightNode->light.height    = nl.height;
             // worldPosition will be computed during Draw() when the transform is known;
             // store a weak_ptr so the lighting pass can read the up-to-date GpuLight each frame.
             scene->lightNodes.push_back(lightNode);

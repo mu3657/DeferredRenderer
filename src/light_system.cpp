@@ -25,6 +25,13 @@ glm::vec3 light_forward_from_world(const glm::mat4& worldTransform)
     return safe_normalize(glm::mat3(worldTransform) * glm::vec3(0.f, 0.f, -1.f), glm::vec3(0.f, -1.f, 0.f));
 }
 
+glm::vec3 light_right_from_world(const glm::mat4& worldTransform, const glm::vec3& forward)
+{
+    glm::vec3 right = glm::mat3(worldTransform) * glm::vec3(1.f, 0.f, 0.f);
+    right -= forward * glm::dot(right, forward);
+    return safe_normalize(right, glm::vec3(1.f, 0.f, 0.f));
+}
+
 glm::mat4 compute_world_transform(const Node& node)
 {
     if (std::shared_ptr<Node> parent = node.parent.lock()) {
@@ -93,7 +100,9 @@ void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneDat
             const glm::mat4 worldTransform = compute_world_transform(*lightNode);
             const glm::vec3 worldPosition = glm::vec3(worldTransform[3]);
             const glm::vec3 forward = light_forward_from_world(worldTransform);
-            const float range = (src.type == LightType::Directional) ? 0.f : std::max(src.range, 0.001f);
+            const glm::vec3 right = light_right_from_world(worldTransform, forward);
+            const glm::vec3 up = safe_normalize(glm::cross(right, forward), glm::vec3(0.f, 1.f, 0.f));
+            const float range = (src.type == LightType::Directional) ? 0.f : std::max(src.range, 0.f);
 
             gpuLight.positionRange = glm::vec4(worldPosition, range);
             gpuLight.directionType = glm::vec4(forward, static_cast<float>(light_type_to_uint(src.type)));
@@ -103,6 +112,8 @@ void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneDat
                 std::cos(glm::radians(30.f)),
                 -1.f,
                 1.f);
+            gpuLight.areaRight = glm::vec4(right, std::max(src.width * 0.5f, 0.005f));
+            gpuLight.areaUp = glm::vec4(up, std::max(src.height * 0.5f, 0.005f));
 
             switch (src.type) {
                 case LightType::Directional:
@@ -114,13 +125,18 @@ void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneDat
                 case LightType::Spot:
                     _lightData.spotLightCount++;
                     break;
+                case LightType::RectArea:
+                    _lightData.rectAreaLightCount++;
+                    break;
             }
 
             _cpuLights.push_back(gpuLight);
         }
     }
 
-    if (_cpuLights.empty() && _enableFallbackDirectional) {
+    if (_lightData.directionalLightCount == 0
+        && _enableFallbackDirectional
+        && _cpuLights.size() < MAX_GPU_LIGHTS) {
         append_fallback_directional(sceneData);
     }
 
@@ -153,6 +169,7 @@ void LightSystem::draw_debug_ui()
     ImGui::Text("Directional: %u", _lightData.directionalLightCount);
     ImGui::Text("Point: %u", _lightData.pointLightCount);
     ImGui::Text("Spot: %u", _lightData.spotLightCount);
+    ImGui::Text("Rect Area: %u", _lightData.rectAreaLightCount);
 
     ImGui::Separator();
     for (uint32_t i = 0; i < _lightData.lightCount && i < static_cast<uint32_t>(_cpuLights.size()); i++) {
@@ -165,6 +182,8 @@ void LightSystem::draw_debug_ui()
             typeName = "Point";
         } else if (type == static_cast<int>(LightType::Spot)) {
             typeName = "Spot";
+        } else if (type == static_cast<int>(LightType::RectArea)) {
+            typeName = "Rect Area";
         }
 
         ImGui::Text("#%u %s intensity %.2f range %.2f", i, typeName, light.colorIntensity.w, light.positionRange.w);
@@ -187,6 +206,8 @@ void LightSystem::draw_debug_ui()
     defaultDirectionalLight.directionType = glm::vec4(0.f, -1.f, 0.f, static_cast<float>(light_type_to_uint(LightType::Directional)));
     defaultDirectionalLight.colorIntensity = glm::vec4(1.f, 1.f, 1.f, 1.f);
     defaultDirectionalLight.params = glm::vec4(1.f, 1.f, -1.f, 1.f);
+    defaultDirectionalLight.areaRight = glm::vec4(0.f);
+    defaultDirectionalLight.areaUp = glm::vec4(0.f);
 
     return  defaultDirectionalLight;
 }
@@ -200,6 +221,8 @@ void LightSystem::append_fallback_directional(const GPUSceneData& sceneData)
     fallback.directionType = glm::vec4(lightToSurface, static_cast<float>(light_type_to_uint(LightType::Directional)));
     fallback.colorIntensity = sceneData.sunlightColor;
     fallback.params = glm::vec4(1.f, 1.f, -1.f, 1.f);
+    fallback.areaRight = glm::vec4(0.f);
+    fallback.areaUp = glm::vec4(0.f);
 
     _cpuLights.push_back(fallback);
     _lightData.directionalLightCount = 1;

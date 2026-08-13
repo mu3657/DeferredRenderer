@@ -32,6 +32,7 @@ static const char* light_type_name(LightType type) {
     switch (type) {
         case LightType::Directional: return "Directional";
         case LightType::Spot:        return "Spot";
+        case LightType::RectArea:    return "Rect Area";
         default:                     return "Point";
     }
 }
@@ -169,8 +170,23 @@ static std::shared_ptr<Node> create_light_node(
     node->worldTransform = glm::mat4(1.f);
     node->light.type = type;
     node->light.color = glm::vec3(1.f, 0.96f, 0.86f);
-    node->light.intensity = (type == LightType::Directional) ? 2.5f : 80.f;
+    switch (type) {
+        case LightType::Directional:
+            node->light.intensity = 2.5f;
+            break;
+        case LightType::Point:
+            node->light.intensity = 0.f;
+            break;
+        case LightType::RectArea:
+            node->light.intensity = 40.f;
+            break;
+        case LightType::Spot:
+            node->light.intensity = 80.f;
+            break;
+    }
     node->light.range = (type == LightType::Directional) ? 0.f : 12.f;
+    node->light.width = (type == LightType::RectArea) ? 2.f : 1.f;
+    node->light.height = 1.f;
     node->light.worldPosition = glm::vec3(0.f);
 
     attach_node(scene, node, parent);
@@ -204,6 +220,9 @@ static void draw_create_menu_items(
         }
         if (ImGui::MenuItem("Spot Light")) {
             createdNode = create_light_node(engine, scene, parent, LightType::Spot);
+        }
+        if (ImGui::MenuItem("Rect Area Light")) {
+            createdNode = create_light_node(engine, scene, parent, LightType::RectArea);
         }
         ImGui::EndMenu();
     }
@@ -509,7 +528,12 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
     if (auto* ln = dynamic_cast<LightNode*>(node.get())) {
         if (ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::BeginCombo("Type", light_type_name(ln->light.type))) {
-                const LightType types[] = { LightType::Point, LightType::Directional, LightType::Spot };
+                const LightType types[] = {
+                    LightType::Point,
+                    LightType::Directional,
+                    LightType::Spot,
+                    LightType::RectArea,
+                };
                 for (LightType type : types) {
                     const bool selected = (ln->light.type == type);
                     if (ImGui::Selectable(light_type_name(type), selected)) {
@@ -518,6 +542,10 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
                             ln->light.range = 0.f;
                         } else if (ln->light.range <= 0.f) {
                             ln->light.range = 12.f;
+                        }
+                        if (type == LightType::RectArea) {
+                            ln->light.width = std::max(ln->light.width, 1.f);
+                            ln->light.height = std::max(ln->light.height, 1.f);
                         }
                     }
                     if (selected) {
@@ -533,6 +561,11 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
             ImGui::BeginDisabled(ln->light.type == LightType::Directional);
             ImGui::DragFloat("Range", &ln->light.range, 0.5f, 0.f, 10000.f);
             ImGui::EndDisabled();
+
+            if (ln->light.type == LightType::RectArea) {
+                ImGui::DragFloat("Width", &ln->light.width, 0.05f, 0.01f, 10000.f);
+                ImGui::DragFloat("Height", &ln->light.height, 0.05f, 0.01f, 10000.f);
+            }
         }
     }
 

@@ -24,6 +24,8 @@ layout(set = 3, binding = 1) uniform ShadowDataBuffer {
     vec4 cascadeSplits;
     vec4 cascadeBlendWidths;
     vec4 pcfKernelRadii;
+    vec4 cascadeTexelWorldSizes;
+    vec4 cascadeDepthRanges;
     vec4 lightDir;
     vec4 params;
 } shadowData;
@@ -76,7 +78,10 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
     }
 
     float ndotl = max(dot(N, L), 0.0);
-    float bias = max(shadowData.params.x, 0.0025 * (1.0 - ndotl));
+    float texelWorldSize = shadowData.cascadeTexelWorldSizes[cascadeIndex];
+    float depthRange = max(shadowData.cascadeDepthRanges[cascadeIndex], 0.0001);
+    float biasWorld = texelWorldSize * shadowData.params.x * mix(2.0, 1.0, ndotl);
+    float bias = biasWorld / depthRange;
     float texelSize = shadowData.params.z;
     int kernelRadius = clamp(int(shadowData.pcfKernelRadii[cascadeIndex] + 0.5), 0, 3);
 
@@ -86,8 +91,8 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
         for (int x = -kernelRadius; x <= kernelRadius; x++) {
             vec2 localSampleUV = clamp(
                 localShadowUV + vec2(x, y) * texelSize,
-                vec2(0.0),
-                vec2(1.0));
+                vec2(texelSize * 0.5),
+                vec2(1.0 - texelSize * 0.5));
             vec2 atlasUV = atlasOffset + localSampleUV * 0.5;
             float closestDepth = texture(shadowMap, atlasUV).r;
             visibility += (receiverDepth + bias < closestDepth) ? 0.0 : 1.0;
@@ -172,6 +177,8 @@ vec3 evaluatePBRDirect(
     return (diffuseWeight * albedo / PI + specular) * radiance * NdotL;
 }
 
+#include "area_light.glsl"
+
 void main()
 {
     MaterialData mat = materials[inMaterialID];
@@ -202,6 +209,19 @@ void main()
     for (uint i = 0; i < lightData.lightCount; i++) {
         GPULight light = lights[i];
         uint type = uint(light.directionType.w + 0.5);
+
+        if (type == LIGHT_TYPE_RECT_AREA) {
+            lighting += evaluateRectAreaLight(
+                baseColor.rgb,
+                metallic,
+                roughness,
+                N,
+                V,
+                inWorldPos,
+                light);
+            continue;
+        }
+
         vec3 L;
         vec3 radiance = light.colorIntensity.rgb * light.colorIntensity.w;
         float visibility = 1.0;

@@ -1,0 +1,113 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform SceneData {
+    mat4 view;
+    mat4 proj;
+    mat4 viewproj;
+    vec4 ambientColor;
+    vec4 sunlightDirection;
+    vec4 sunlightColor;
+} sceneData;
+
+layout(set = 1, binding = 0) uniform sampler2D depthTexture;
+layout(set = 1, binding = 1) uniform sampler2D normalTexture;
+layout(rgba16f, set = 1, binding = 2) uniform writeonly image2D contactShadowOutput;
+
+layout(push_constant) uniform ContactShadowPushConstants {
+    mat4 invViewProj;
+    vec4 lightDirectionMaxDistance;
+    vec4 traceParams;
+    vec4 marchParams;
+} pushData;
+
+vec3 reconstructWorldPosition(vec2 uv, float depth)
+{
+    vec4 clipPosition = vec4(uv * 2.0 - 1.0, depth, 1.0);
+    vec4 worldPosition = pushData.invViewProj * clipPosition;
+    return worldPosition.xyz / worldPosition.w;
+}
+
+void storeVisibility(ivec2 pixel, float visibility)
+{
+    imageStore(contactShadowOutput, pixel, vec4(visibility, 0.0, 0.0, 1.0));
+}
+
+void main()
+{
+    ivec2 outputSize = imageSize(contactShadowOutput);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, outputSize))) {
+        return;
+    }
+
+    if (pushData.traceParams.w < 0.5) {
+        storeVisibility(pixel, 1.0);
+        return;
+    }
+
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(outputSize);
+    float receiverDepth = texelFetch(depthTexture, pixel, 0).r;
+
+    // This renderer uses reverse-Z and clears the background to zero.
+    if (receiverDepth <= 0.0) {
+        storeVisibility(pixel, 1.0);
+        return;
+    }
+
+    vec3 normal = normalize(texelFetch(normalTexture, pixel, 0).xyz * 2.0 - 1.0);
+    vec3 surfaceToLight = normalize(pushData.lightDirectionMaxDistance.xyz);
+    if (dot(normal, surfaceToLight) <= 0.0) {
+        storeVisibility(pixel, 1.0);
+        return;
+    }
+
+    float maxDistance = max(pushData.lightDirectionMaxDistance.w, 0.0001);
+    float thickness = max(pushData.traceParams.x, 0.0001);
+    float normalBias = max(pushData.traceParams.y, 0.0);
+    float strength = clamp(pushData.traceParams.z, 0.0, 1.0);
+    int stepCount = clamp(int(pushData.marchParams.x + 0.5), 1, 64);
+    float stepExponent = max(pushData.marchParams.y, 0.1);
+    float edgeFadeWidth = max(pushData.marchParams.z, 0.0001);
+
+    vec3 receiverWorld = reconstructWorldPosition(uv, receiverDepth);
+    vec3 rayOrigin = receiverWorld + normal * normalBias;
+    float visibility = 1.0;
+
+    for (int stepIndex = 1; stepIndex <= stepCount; stepIndex++) {
+        float linearT = float(stepIndex) / float(stepCount);
+        float marchT = pow(linearT, stepExponent);
+        vec3 rayWorld = rayOrigin + surfaceToLight * (marchT * maxDistance);
+
+        vec4 rayClip = sceneData.viewproj * vec4(rayWorld, 1.0);
+        if (rayClip.w <= 0.0) {
+            break;
+        }
+
+        vec2 sampleUV = rayClip.xy / rayClip.w * 0.5 + 0.5;
+        if (any(lessThanEqual(sampleUV, vec2(0.0))) || any(greaterThanEqual(sampleUV, vec2(1.0)))) {
+            break;
+        }
+
+        float sceneDepth = textureLod(depthTexture, sampleUV, 0.0).r;
+        if (sceneDepth <= 0.0) {
+            continue;
+        }
+
+        vec3 sceneWorld = reconstructWorldPosition(sampleUV, sceneDepth);
+        float rayViewDistance = -(sceneData.view * vec4(rayWorld, 1.0)).z;
+        float sceneViewDistance = -(sceneData.view * vec4(sceneWorld, 1.0)).z;
+        float depthDelta = rayViewDistance - sceneViewDistance;
+
+        if (depthDelta > 0.0 && depthDelta < thickness) {
+            vec2 distanceToEdge = min(sampleUV, vec2(1.0) - sampleUV);
+            float edgeFade = smoothstep(0.0, edgeFadeWidth, min(distanceToEdge.x, distanceToEdge.y));
+            float distanceFade = 1.0 - marchT;
+            visibility = 1.0 - strength * edgeFade * distanceFade;
+            break;
+        }
+    }
+
+    storeVisibility(pixel, visibility);
+}

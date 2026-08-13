@@ -16,6 +16,7 @@
 #include "pipeline_registry.h"
 #include "render_pass.h"
 #include "Renderpasses/geometry_pass.h"
+#include "Renderpasses/ContactShadow_pass.h"
 #include "Renderpasses/transparent_pass.h"
 #include "VkBootstrap.h"
 #include "vk_scene.h"
@@ -208,7 +209,7 @@ public:
 
 	AllocatedImage _drawImage;
 	AllocatedImage _depthImage;
-
+	AllocatedImage _contactShadowImage;
 	AllocatedImage _gAlbedo; // 漫反射 (RGB) + 材质遮罩 (A)
 	AllocatedImage _gNormal; // 世界空间法线 (RGB)
 	AllocatedImage _gORM;    // AO (R), 粗糙度 (G), 金属度 (B)
@@ -229,6 +230,7 @@ public:
 	LightSystem lightSystem;
 	GeometryPass geometryPass;
     ShadowPass shadowPass;
+    ContactShadowPass contactShadowPass;
     TransparentPass transparentPass;
 	// --- Bindless Setup ---
 	VkDescriptorSetLayout _bindlessDescriptorLayout;
@@ -346,6 +348,7 @@ private:
 	void draw_scene_browser();
 	void scan_scene_library();
 	void init_swapchain();
+	void init_contactshadowimage();
 	void init_gbuffer();
 	void init_commands();
 	void init_sync_structures();

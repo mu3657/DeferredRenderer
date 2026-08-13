@@ -13,6 +13,8 @@ enum class DescriptorLayoutID : uint8_t {
     GBufferInput,
     LightData,
     ShadowInput,
+    ContactShadowCompute,
+    ContactShadowInput,
     GIInput,
     Count
 };

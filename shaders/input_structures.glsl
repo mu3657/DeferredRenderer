@@ -52,12 +52,15 @@ layout(set = 1, binding = 1) uniform sampler2D globalTextures[];
 const uint LIGHT_TYPE_POINT = 0;
 const uint LIGHT_TYPE_DIRECTIONAL = 1;
 const uint LIGHT_TYPE_SPOT = 2;
+const uint LIGHT_TYPE_RECT_AREA = 3;
 
 struct GPULight {
     vec4 positionRange;
     vec4 directionType;
     vec4 colorIntensity;
     vec4 params;
+    vec4 areaRight;
+    vec4 areaUp;
 };
 
 layout(set = 2, binding = 0) uniform LightData {
@@ -65,6 +68,10 @@ layout(set = 2, binding = 0) uniform LightData {
     uint directionalLightCount;
     uint pointLightCount;
     uint spotLightCount;
+    uint rectAreaLightCount;
+    uint padding0;
+    uint padding1;
+    uint padding2;
     vec4 ambientColor;
 } lightData;
 

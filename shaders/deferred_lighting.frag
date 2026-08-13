@@ -14,6 +14,7 @@ layout(set = 1, binding = 1) uniform sampler2D gNormal;
 layout(set = 1, binding = 2) uniform sampler2D gMaterial;
 layout(set = 1, binding = 3) uniform sampler2D gDepth;
 layout(set = 3, binding = 0) uniform sampler2D shadowMap;
+layout(set = 4, binding = 0) uniform sampler2D contactShadowTexture;
 
 const int SHADOW_CASCADE_COUNT = 4;
 
@@ -22,8 +23,10 @@ layout(set = 3, binding = 1) uniform ShadowDataBuffer {
     vec4 cascadeSplits;
     vec4 cascadeBlendWidths;
     vec4 pcfKernelRadii;
+    vec4 cascadeTexelWorldSizes;
+    vec4 cascadeDepthRanges;
     vec4 lightDir;
-    vec4 params; // x = bias, y = strength, z = texelSize, w = enabled
+    vec4 params; // x = bias in shadow texels, y = strength, z = texelSize, w = enabled
 } shadowData;
 
 // Basic PBR Lighting functions (simplified for minimalism)
@@ -78,7 +81,10 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
     }
 
     float ndotl = max(dot(N, L), 0.0);
-    float bias = max(shadowData.params.x, 0.0025 * (1.0 - ndotl));
+    float texelWorldSize = shadowData.cascadeTexelWorldSizes[cascadeIndex];
+    float depthRange = max(shadowData.cascadeDepthRanges[cascadeIndex], 0.0001);
+    float biasWorld = texelWorldSize * shadowData.params.x * mix(2.0, 1.0, ndotl);
+    float bias = biasWorld / depthRange;
     float texelSize = shadowData.params.z;
     int kernelRadius = clamp(int(shadowData.pcfKernelRadii[cascadeIndex] + 0.5), 0, 3);
 
@@ -87,7 +93,10 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
     for (int y = -kernelRadius; y <= kernelRadius; y++) {
         for (int x = -kernelRadius; x <= kernelRadius; x++) {
             vec2 offset = vec2(x, y) * texelSize;
-            vec2 localSampleUV = clamp(localShadowUV + offset, vec2(0.0), vec2(1.0));
+            vec2 localSampleUV = clamp(
+                localShadowUV + offset,
+                vec2(texelSize * 0.5),
+                vec2(1.0 - texelSize * 0.5));
             vec2 atlasUV = atlasOffset + localSampleUV * 0.5;
             float closestDepth = texture(shadowMap, atlasUV).r;
 
@@ -184,6 +193,8 @@ vec3 evaluatePBRDirect(vec3 albedo, float metallic, float roughness, vec3 N, vec
     return (kD * albedo / PI + specular) * radiance * NdotL;
 }
 
+#include "area_light.glsl"
+
 // Reconstruct world position from depth
 vec3 reconstructPosition(vec2 uv, float depth, mat4 invViewProj) {
     vec4 clipSpace = vec4(uv * 2.0 - 1.0, depth, 1.0);
@@ -229,6 +240,11 @@ void main()
         GPULight light = lights[i];
         uint type = uint(light.directionType.w + 0.5);
 
+        if (type == LIGHT_TYPE_RECT_AREA) {
+            Lo += evaluateRectAreaLight(albedo, metallic, roughness, N, V, worldPos, light);
+            continue;
+        }
+
         vec3 L = vec3(0.0);
         vec3 radiance = light.colorIntensity.rgb * light.colorIntensity.w;
 
@@ -237,6 +253,7 @@ void main()
             L = normalize(-light.directionType.xyz);
             if (directionalSeen == 0u) {
                 visibility = sampleDirectionalShadow(worldPos, N, L);
+                visibility = min(visibility, texture(contactShadowTexture, inUV).r);
             }
             directionalSeen++;
         } else {

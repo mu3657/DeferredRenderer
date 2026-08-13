@@ -444,45 +444,75 @@ void extract_gltf_vertices(tinygltf::Primitive& primitive, tinygltf::Model& mode
 }
 
 
-void extract_gltf_indices(tinygltf::Primitive& primitive, tinygltf::Model& model, std::vector<uint32_t>& _primindices)
+bool extract_gltf_indices(tinygltf::Primitive& primitive, tinygltf::Model& model, std::vector<uint32_t>& _primindices)
 {
-	int indexaccesor = primitive.indices;
+	if (primitive.indices < 0) {
+		auto positionIt = primitive.attributes.find("POSITION");
+		if (positionIt == primitive.attributes.end()
+			|| positionIt->second < 0
+			|| positionIt->second >= static_cast<int>(model.accessors.size())) {
+			fmt::println("Error: non-indexed glTF primitive has no valid POSITION accessor.");
+			return false;
+		}
 
-	int indexbuffer = model.accessors[indexaccesor].bufferView;
-	int componentType = model.accessors[indexaccesor].componentType;
-	size_t indexsize = tinygltf::GetComponentSizeInBytes(componentType);
+		const size_t vertexCount = model.accessors[positionIt->second].count;
+		if (vertexCount > 0xffffffffull) {
+			fmt::println("Error: glTF primitive has too many vertices for 32-bit indices.");
+			return false;
+		}
 
-	tinygltf::BufferView& indexview = model.bufferViews[indexbuffer];
-	int bufferidx = indexview.buffer;
+		_primindices.reserve(vertexCount);
+		for (size_t i = 0; i < vertexCount; i++) {
+			_primindices.push_back(static_cast<uint32_t>(i));
+		}
+		return true;
+	}
 
-	tinygltf::Buffer& buffindex = (model.buffers[bufferidx]);
+	if (primitive.indices >= static_cast<int>(model.accessors.size())) {
+		fmt::println("Error: glTF index accessor {} is out of range.", primitive.indices);
+		return false;
+	}
 
-	uint8_t* dataptr = buffindex.data.data() + indexview.byteOffset;
+	tinygltf::Accessor& indexAccessor = model.accessors[primitive.indices];
+	if (indexAccessor.type != TINYGLTF_TYPE_SCALAR) {
+		fmt::println("Error: glTF index accessor must use SCALAR elements.");
+		return false;
+	}
+	if (indexAccessor.bufferView < 0
+		|| indexAccessor.bufferView >= static_cast<int>(model.bufferViews.size())) {
+		fmt::println("Error: glTF index accessor has no valid buffer view.");
+		return false;
+	}
 
 	std::vector<uint8_t> unpackedIndices;
-	unpack_gltf_buffer(model, model.accessors[indexaccesor], unpackedIndices);
+	unpack_gltf_buffer(model, indexAccessor, unpackedIndices);
+	_primindices.reserve(indexAccessor.count);
 
-	for (int i = 0; i < model.accessors[indexaccesor].count; i++) {
-
-		uint32_t index;
-		switch (componentType) {
-		case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:
-		{
-			uint16_t* bfr = (uint16_t*)unpackedIndices.data();
-			index = *(bfr + i);
+	switch (indexAccessor.componentType) {
+	case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: {
+		const uint8_t* indices = reinterpret_cast<const uint8_t*>(unpackedIndices.data());
+		for (size_t i = 0; i < indexAccessor.count; i++) {
+			_primindices.push_back(indices[i]);
 		}
 		break;
-		case TINYGLTF_COMPONENT_TYPE_SHORT:
-		{
-			int16_t* bfr = (int16_t*)unpackedIndices.data();
-			index = *(bfr + i);
+	}
+	case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT: {
+		const uint16_t* indices = reinterpret_cast<const uint16_t*>(unpackedIndices.data());
+		for (size_t i = 0; i < indexAccessor.count; i++) {
+			_primindices.push_back(indices[i]);
 		}
 		break;
-		default:
-			assert(false);
-		}
-
-		_primindices.push_back(index);
+	}
+	case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT: {
+		const uint32_t* indices = reinterpret_cast<const uint32_t*>(unpackedIndices.data());
+		_primindices.insert(_primindices.end(), indices, indices + indexAccessor.count);
+		break;
+	}
+	default:
+		fmt::println(
+			"Error: unsupported glTF index component type {}.",
+			indexAccessor.componentType);
+		return false;
 	}
 
 	// for (int i = 0; i < _primindices.size() / 3; i++)
@@ -491,6 +521,7 @@ void extract_gltf_indices(tinygltf::Primitive& primitive, tinygltf::Model& model
 	//
 	// 	std::swap(_primindices[i * 3 + 1], _primindices[i * 3 + 2]);
 	// }
+	return true;
 }
 
 std::string calculate_gltf_mesh_name(tinygltf::Model& model, int meshIndex, int primitiveIndex)
@@ -535,7 +566,10 @@ bool extract_gltf_meshes(tinygltf::Model& model, const fs::path& input, const fs
 
 			auto& primitive = glmesh.primitives[primindex];
 
-			extract_gltf_indices(primitive, model, _indices);
+			if (!extract_gltf_indices(primitive, model, _indices)) {
+				fmt::println("Skipping mesh {} primitive {} because its indices are invalid.", meshindex, primindex);
+				continue;
+			}
 			extract_gltf_vertices(primitive, model, _vertices);
 
 
@@ -567,6 +601,15 @@ std::string calculate_gltf_material_name(tinygltf::Model& model, int materialInd
 	itoa(materialIndex, buffer, 10);
 	std::string matname = "MAT_" + std::string{ &buffer[0] } + "_" + model.materials[materialIndex].name;
 	return matname;
+}
+
+std::string calculate_gltf_material_name_or_default(tinygltf::Model& model, int materialIndex)
+{
+	if (materialIndex < 0 || materialIndex >= static_cast<int>(model.materials.size())) {
+		return "DefaultMaterial";
+	}
+
+	return calculate_gltf_material_name(model, materialIndex);
 }
 
 // Helper: given a tinygltf image, resolve the output .tx path.
@@ -628,6 +671,34 @@ static fs::path resolve_gltf_image_tx_path(
 
 void extract_gltf_materials(tinygltf::Model& model, const fs::path& input, const fs::path& outputFolder, const ConverterState& convState)
 {
+	bool needsDefaultMaterial = false;
+	for (const auto& mesh : model.meshes) {
+		for (const auto& primitive : mesh.primitives) {
+			if (primitive.material < 0
+				|| primitive.material >= static_cast<int>(model.materials.size())) {
+				needsDefaultMaterial = true;
+				break;
+			}
+		}
+		if (needsDefaultMaterial) {
+			break;
+		}
+	}
+
+	if (needsDefaultMaterial) {
+		assets::MaterialInfo defaultMaterial{};
+		defaultMaterial.baseEffect = "defaultPBR";
+		defaultMaterial.transparency = TransparencyMode::Opaque;
+		defaultMaterial.customProperties["baseColorFactor"] = "1 1 1 1";
+		defaultMaterial.customProperties["metallicFactor"] = "0";
+		defaultMaterial.customProperties["roughnessFactor"] = "1";
+		defaultMaterial.customProperties["emissiveFactor"] = "0 0 0";
+		defaultMaterial.customProperties["doubleSided"] = "false";
+
+		assets::AssetFile defaultFile = assets::pack_material(&defaultMaterial);
+		save_binaryfile((outputFolder / "DefaultMaterial.mat").string().c_str(), defaultFile);
+	}
+
 	int nm = 0;
 	for (auto& glmat : model.materials) {
 		std::string matname = calculate_gltf_material_name(model, nm);
@@ -785,9 +856,11 @@ void extract_gltf_nodes(tinygltf::Model& model, const fs::path& input, const fs:
 
 				if (lightVal.Has("color") && lightVal.Get("color").IsArray()) {
 					auto col = lightVal.Get("color").Get<tinygltf::Value::Array>();
-					l.color[0] = static_cast<float>(col[0].GetNumberAsDouble());
-					l.color[1] = static_cast<float>(col[1].GetNumberAsDouble());
-					l.color[2] = static_cast<float>(col[2].GetNumberAsDouble());
+					if (col.size() >= 3) {
+						l.color[0] = static_cast<float>(col[0].GetNumberAsDouble());
+						l.color[1] = static_cast<float>(col[1].GetNumberAsDouble());
+						l.color[2] = static_cast<float>(col[2].GetNumberAsDouble());
+					}
 				}
 				if (lightVal.Has("intensity") && lightVal.Get("intensity").IsNumber()) {
 					l.intensity = static_cast<float>(lightVal.Get("intensity").GetNumberAsDouble());
@@ -879,9 +952,7 @@ void extract_gltf_nodes(tinygltf::Model& model, const fs::path& input, const fs:
 
 				fs::path meshpath = outputFolder / (meshname + ".mesh");
 
-				int material = primitive.material;
-
-				std::string matname = calculate_gltf_material_name(model, material);
+				std::string matname = calculate_gltf_material_name_or_default(model, primitive.material);
 
 				fs::path materialpath = outputFolder / (matname + ".mat");
 
@@ -970,23 +1041,7 @@ void extract_gltf_nodes(tinygltf::Model& model, const fs::path& input, const fs:
 
 			prefab.node_names[newnode] = prefab.node_names[i] +  "_PRIM_" + &buffer[0];
 
-			int material = primitive.material;
-			std::string matname; // 提前声明，供下面组装路径使用
-
-			// 安全拦截-1
-			if (material >= 0) {
-				// 正常情况：提取 glTF 材质并计算名字
-				auto mat = model.materials[material];
-				matname = calculate_gltf_material_name(model, material);
-			} else {
-				// 异常情况：网格没有材质
-				// 我们强制给它分配一个引擎内置的默认材质名字
-				matname = "DefaultMaterial";
-
-				// 💡 提示：为了让你的引擎在加载时不出错，你可以：
-				// A. 提前在输出目录 (outputFolder) 里手动生成一个叫 "DefaultMaterial.mat" 的纯白 PBR 材质文件。
-				// B. 或者在引擎运行时的 asset_manager 里写死一个逻辑：遇到 "DefaultMaterial" 就直接返回引擎内置的纯白贴图/默认参数。
-			}
+			std::string matname = calculate_gltf_material_name_or_default(model, primitive.material);
 
 			std::string meshname = calculate_gltf_mesh_name(model, node.mesh, primindex);
 
@@ -1263,6 +1318,11 @@ void extract_assimp_nodes(const aiScene* scene, const fs::path& input, const fs:
 		switch(light->mType) {
 			case aiLightSource_DIRECTIONAL: l.type = 1; break;
 			case aiLightSource_SPOT:        l.type = 2; break;
+			case aiLightSource_AREA:
+				l.type = 3;
+				l.width = light->mSize.x > 0.f ? light->mSize.x : 1.f;
+				l.height = light->mSize.y > 0.f ? light->mSize.y : 1.f;
+				break;
 			case aiLightSource_POINT:       l.type = 0; break;
 			default: l.type = 0; break;
 		}

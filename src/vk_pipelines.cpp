@@ -96,11 +96,17 @@ VkPipeline PipelineBuilder::build_pipeline(VkDevice device, VkPipelineCache pipe
     pipelineInfo.layout = _pipelineLayout;
 
 
-    VkDynamicState state[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    std::vector<VkDynamicState> dynamicStates = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+    };
+    if (_rasterizer.depthBiasEnable == VK_TRUE) {
+        dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
+    }
 
     VkPipelineDynamicStateCreateInfo dynamicInfo = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    dynamicInfo.pDynamicStates = &state[0];
-    dynamicInfo.dynamicStateCount = 2;
+    dynamicInfo.pDynamicStates = dynamicStates.data();
+    dynamicInfo.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
 
     pipelineInfo.pDynamicState = &dynamicInfo;
     // its easy to error out on create graphics pipeline, so we handle it a bit
@@ -150,6 +156,10 @@ void PipelineBuilder::set_cull_mode(VkCullModeFlags cullMode, VkFrontFace frontF
 {
     _rasterizer.cullMode = cullMode;
     _rasterizer.frontFace = frontFace;
+}
+void PipelineBuilder::enable_depth_bias()
+{
+    _rasterizer.depthBiasEnable = VK_TRUE;
 }
 void PipelineBuilder::set_multisampling_none()
 {

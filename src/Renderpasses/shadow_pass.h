@@ -45,10 +45,13 @@ public:
     float _splitLambda{0.75f};
     float _cascadeBlendRatio{0.1f};
     float _depthPadding{30.f};
-    float _bias{0.006f};
-    float _strength{0.75f};
+    float _receiverBiasTexels{0.1f};
+    float _rasterConstantBias{1.25f};
+    float _rasterSlopeBias{1.75f};
+    float _strength{1.0f};
     std::array<int, SHADOW_CASCADE_COUNT> _pcfKernelRadii{2, 1, 1, 0};
     std::array<float, SHADOW_CASCADE_COUNT> _lastTexelWorldSize{};
+    std::array<float, SHADOW_CASCADE_COUNT> _lastDepthRange{};
     std::array<float, SHADOW_CASCADE_COUNT> _lastCascadeSplits{};
     std::array<float, SHADOW_CASCADE_COUNT> _lastCascadeBlendWidths{};
     std::array<uint32_t, SHADOW_CASCADE_COUNT> _lastVisibleCasters{};

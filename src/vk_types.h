@@ -171,14 +171,17 @@ enum class LightType : int {
     Point       = 0,
     Directional = 1,
     Spot        = 2,
+    RectArea    = 3,
 };
 
 struct GpuLight {
-    glm::vec3  color;
-    float      intensity;
-    LightType  type;
-    float      range;          // 0 = infinite (directional)
-    glm::vec3  worldPosition;  // filled in during Draw() traversal
+    glm::vec3  color{1.f};
+    float      intensity{1.f};
+    LightType  type{LightType::Point};
+    float      range{10.f};    // 0 = unbounded
+    float      width{1.f};     // full rectangle width for RectArea
+    float      height{1.f};    // full rectangle height for RectArea
+    glm::vec3  worldPosition{0.f}; // filled in during Draw() traversal
     float      _pad{};
 };
 

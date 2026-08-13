@@ -86,7 +86,8 @@ void VulkanEngine::init()
 
     init_descriptors();
     init_default_data();
-    init_gbuffer(); 
+    init_gbuffer();
+	init_contactshadowimage();
     pipelineRegistry.init(_device);
     _mainDeletionQueue.push_function([this]() {
         pipelineRegistry.cleanup();
@@ -100,9 +101,11 @@ void VulkanEngine::init()
     };
     geometryPass.init(passInitContext);
     shadowPass.init(passInitContext);
+    contactShadowPass.init(passInitContext);
     transparentPass.init(passInitContext);
     _mainDeletionQueue.push_function([this]() {
         transparentPass.cleanup();
+        contactShadowPass.cleanup();
         shadowPass.cleanup();
         geometryPass.cleanup();
     });
@@ -429,6 +432,16 @@ void VulkanEngine::draw()
 	vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+	vkutil::transition_image(cmd, _contactShadowImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+    ContactShadowPassContext contactShadowContext{passContext, sceneData, lightSystem};
+    contactShadowPass.execute(contactShadowContext);
+
+	vkutil::transition_image(
+        cmd,
+        _contactShadowImage.image,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     LightingPassContext lightingContext{ passContext, _drawImage.imageView, lightSystem };
 	const auto lightingPassStart = std::chrono::steady_clock::now();
@@ -635,6 +648,7 @@ void VulkanEngine::run()
         draw_scene_browser();
         lightSystem.draw_debug_ui();
         shadowPass.draw_debug_ui();
+        contactShadowPass.draw_debug_ui();
 
         // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
         sceneOutliner.draw(*this);
@@ -1370,6 +1384,7 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 
 
 	VkDescriptorSet shadowSet = shadowPass.descriptor_set(ctx.frameIndex);
+	VkDescriptorSet contactShadowSet = contactShadowPass.lighting_descriptor_set();
 
 	vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,_deferredLightingPipeline);
 	//vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout, 0, 1, &_gBufferDescriptorSet, 0, nullptr);
@@ -1384,6 +1399,8 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
                             2, 1, &currentFrame.lightDescriptor, 0, nullptr);  // Set 2 (LightData)
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							3, 1, &shadowSet, 0, nullptr);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
+							4, 1, &contactShadowSet, 0, nullptr);
 	// 绘制 3 个没有 Vertex Buffer 指派的顶点
 	vkCmdDraw(cmd, 3, 1, 0, 0);
     stats.lighting.drawcall_count = 1;
@@ -1488,12 +1505,13 @@ void VulkanEngine::init_Deferredlighting_pipeline()
 		fmt::print("Error when building the deferred lighting shader module \n");
 	}
 	VkPipelineLayoutCreateInfo layoutCreateInfo = vkinit::pipeline_layout_create_info();
-	layoutCreateInfo.setLayoutCount = 4;
+	layoutCreateInfo.setLayoutCount = 5;
 	VkDescriptorSetLayout lightingLayouts[] = {
         _gpuSceneDataDescriptorLayout,
         _gBufferDescriptorLayout,
         _descriptorSystem.layout(DescriptorLayoutID::LightData),
-		_descriptorSystem.layout(DescriptorLayoutID::ShadowInput)
+		_descriptorSystem.layout(DescriptorLayoutID::ShadowInput),
+		_descriptorSystem.layout(DescriptorLayoutID::ContactShadowInput)
     };
 	layoutCreateInfo.pSetLayouts = lightingLayouts;
 	layoutCreateInfo.pPushConstantRanges = nullptr;
@@ -1877,6 +1895,39 @@ void VulkanEngine::init_swapchain()
 
 
 }
+void VulkanEngine::init_contactshadowimage()
+{
+	VkExtent3D shadowImageExtent = { _windowExtent.width, _windowExtent.height, 1 };
+	// RGBA16F is a core storage-image format. The visibility value lives in R;
+	// a single-channel R16F target would require shaderStorageImageExtendedFormats.
+	_contactShadowImage.imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+	_contactShadowImage.imageExtent = shadowImageExtent;
+
+	VkImageUsageFlags shadowImageUsages{};
+	shadowImageUsages |= VK_IMAGE_USAGE_STORAGE_BIT;
+	shadowImageUsages |= VK_IMAGE_USAGE_SAMPLED_BIT;
+
+	VkImageCreateInfo img_info = vkinit::image_create_info(_contactShadowImage.imageFormat, shadowImageUsages, shadowImageExtent);
+	//for the draw image, we want to allocate it from gpu local memory
+	VmaAllocationCreateInfo img_allocinfo = {};
+	img_allocinfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+	img_allocinfo.requiredFlags = VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+	//allocate and create the image
+	vmaCreateImage(_allocator, &img_info, &img_allocinfo, &_contactShadowImage.image, &_contactShadowImage.allocation, nullptr);
+
+	//build a image-view for the draw image to use for rendering
+	VkImageViewCreateInfo view_info = vkinit::imageview_create_info(_contactShadowImage.imageFormat, _contactShadowImage.image, VK_IMAGE_ASPECT_COLOR_BIT);
+
+	VK_CHECK(vkCreateImageView(_device, &view_info, nullptr, &_contactShadowImage.imageView));
+
+	_mainDeletionQueue.push_function([=, this]()
+	{
+		vkDestroyImageView(_device, _contactShadowImage.imageView, nullptr);
+		vmaDestroyImage(_allocator, _contactShadowImage.image, _contactShadowImage.allocation);
+	}
+	);
+}
 void VulkanEngine::init_gbuffer() {
     VkExtent3D gbufferExtent = { _windowExtent.width, _windowExtent.height, 1 };
 	VmaAllocationCreateInfo vmaallocInfo = {};
@@ -1941,6 +1992,7 @@ void VulkanEngine::init_gbuffer() {
     _descriptorSystem.write_image(_gBufferDescriptorSet, 2, _gORM.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     _descriptorSystem.write_image(_gBufferDescriptorSet, 3, _depthImage.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 }
+
 void VulkanEngine::destroy_swapchain()
 {
     vkDestroySwapchainKHR(_device, _swapchain, nullptr);
