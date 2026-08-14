@@ -16,6 +16,8 @@ void DescriptorSystem::init(VkDevice device, uint32_t frameOverlap)
 
     std::vector<DescriptorAllocatorGrowable::PoolSizeRatio> persistentSizes = {
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 2},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16},
@@ -166,8 +168,8 @@ void DescriptorSystem::create_layouts()
 
     {
         DescriptorLayoutBuilder builder;
-        builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-        builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
+        builder.add_binding(1, VK_DESCRIPTOR_TYPE_SAMPLER);
         builder.add_binding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         _layouts[layout_index(DescriptorLayoutID::ContactShadowCompute)] =
             builder.build(_device, VK_SHADER_STAGE_COMPUTE_BIT);

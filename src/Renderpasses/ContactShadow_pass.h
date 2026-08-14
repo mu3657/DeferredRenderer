@@ -32,15 +32,19 @@ private:
     VulkanEngine* _engine{nullptr};
     VkPipelineLayout _pipelineLayout{VK_NULL_HANDLE};
     VkPipeline _pipeline{VK_NULL_HANDLE};
+    VkSampler _pointBorderSampler{VK_NULL_HANDLE};
     VkDescriptorSet _computeDescriptorSet{VK_NULL_HANDLE};
     VkDescriptorSet _lightingDescriptorSet{VK_NULL_HANDLE};
 
     bool _enabled{true};
-    int _stepCount{24};
-    float _maxDistance{1.5f};
-    float _thickness{0.08f};
-    float _normalBias{0.02f};
+    float _surfaceThickness{0.005f};
+    float _bilinearThreshold{0.02f};
+    float _shadowContrast{4.0f};
     float _strength{1.0f};
-    float _edgeFade{0.05f};
-    float _stepExponent{1.0f};
+    bool _ignoreEdgePixels{false};
+    bool _usePrecisionOffset{false};
+    bool _bilinearSamplingOffsetMode{false};
+    bool _debugEdgeMask{false};
+    bool _debugThreadIndex{false};
+    bool _debugWaveIndex{false};
 };

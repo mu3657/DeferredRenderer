@@ -28,6 +28,7 @@ add_subdirectory(assetlib)
 add_subdirectory(asset-baker)
 # 1. 明确找到编译器
 find_program(GLSL_VALIDATOR glslangValidator HINTS $ENV{VULKAN_SDK}/Bin)
+find_program(DXC_EXECUTABLE dxc HINTS $ENV{VULKAN_SDK}/Bin)
 
 # 2. 强制指定搜索目录并打印出来调试
 set(SHADER_SEARCH_PATH "${PROJECT_SOURCE_DIR}/shaders")
@@ -37,6 +38,10 @@ file(GLOB_RECURSE GLSL_SOURCE_FILES CONFIGURE_DEPENDS
         "${SHADER_SEARCH_PATH}/*.frag"
         "${SHADER_SEARCH_PATH}/*.vert"
         "${SHADER_SEARCH_PATH}/*.comp"
+)
+
+file(GLOB_RECURSE HLSL_SOURCE_FILES CONFIGURE_DEPENDS
+        "${SHADER_SEARCH_PATH}/*.comp.hlsl"
 )
 
 # 3. 检查是否找到了文件
@@ -59,6 +64,33 @@ foreach(GLSL ${GLSL_SOURCE_FILES})
             COMMAND ${GLSL_VALIDATOR} -V "${GLSL}" -o "${SPIRV}"
             DEPENDS ${GLSL}
             COMMENT "Compiling ${FILE_NAME}"
+            VERBATIM
+    )
+    list(APPEND SPIRV_BINARY_FILES ${SPIRV})
+endforeach()
+
+foreach(HLSL ${HLSL_SOURCE_FILES})
+    if(NOT DXC_EXECUTABLE)
+        message(FATAL_ERROR "DXC is required to compile ${HLSL}")
+    endif()
+
+    get_filename_component(FILE_NAME ${HLSL} NAME)
+    set(SPIRV "${CMAKE_BINARY_DIR}/shaders/${FILE_NAME}.spv")
+
+    message(STATUS "Configuring DXC command for: ${FILE_NAME}")
+
+    add_custom_command(
+            OUTPUT ${SPIRV}
+            COMMAND ${DXC_EXECUTABLE}
+                    -spirv
+                    -T cs_6_0
+                    -E main
+                    -fspv-target-env=vulkan1.3
+                    -Fo "${SPIRV}"
+                    "${HLSL}"
+            DEPENDS ${HLSL}
+                    "${PROJECT_SOURCE_DIR}/src/bendsss/bend_sss_gpu.h"
+            COMMENT "Compiling ${FILE_NAME} with DXC"
             VERBATIM
     )
     list(APPEND SPIRV_BINARY_FILES ${SPIRV})

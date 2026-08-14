@@ -1898,9 +1898,8 @@ void VulkanEngine::init_swapchain()
 void VulkanEngine::init_contactshadowimage()
 {
 	VkExtent3D shadowImageExtent = { _windowExtent.width, _windowExtent.height, 1 };
-	// RGBA16F is a core storage-image format. The visibility value lives in R;
-	// a single-channel R16F target would require shaderStorageImageExtendedFormats.
-	_contactShadowImage.imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+	// Bend's RWTexture2D<float> maps to the core Vulkan R32F storage format.
+	_contactShadowImage.imageFormat = VK_FORMAT_R32_SFLOAT;
 	_contactShadowImage.imageExtent = shadowImageExtent;
 
 	VkImageUsageFlags shadowImageUsages{};
