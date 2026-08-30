@@ -1,0 +1,288 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform DDGIProbeBlendPushConstants {
+    uvec4 irradianceLayout; // tiles per row, tile texels, interior texels, unused
+    uvec4 distanceLayout;   // tiles per row, tile texels, interior texels, unused
+    uvec4 passParams;       // pass kind, unused
+} pushConstants;
+
+layout(std140, set = 0, binding = 0) uniform DDGIVolumeConstants {
+    vec4 originMaxRayDistance;
+    vec4 spacingHysteresis;
+    uvec4 probeCountsRaysPerProbe;
+    vec4 biasAndEncoding;
+    vec4 blendThresholds;
+    uvec4 texelsAndUpdate;
+    ivec4 scrollOffsets;
+    vec4 rayRotation;
+    uvec4 frameAndFlags;
+} volume;
+
+layout(rgba32f, set = 0, binding = 1) uniform readonly image2DArray rayData;
+layout(rgba32f, set = 0, binding = 2) uniform image2DArray irradianceAtlas;
+layout(rgba32f, set = 0, binding = 3) uniform image2DArray distanceAtlas;
+
+const uint PASS_IRRADIANCE_INTERIOR = 0u;
+const uint PASS_DISTANCE_INTERIOR = 1u;
+const uint PASS_BORDER_UPDATE = 2u;
+const uint VOLUME_FLAG_RESET_HISTORY = 1u << 4;
+const float PI = 3.14159265358979323846;
+const float GOLDEN_ANGLE = 2.39996322972865332;
+
+vec2 sign_not_zero(vec2 value)
+{
+    return vec2(value.x >= 0.0 ? 1.0 : -1.0,
+                value.y >= 0.0 ? 1.0 : -1.0);
+}
+
+vec3 octahedral_direction(uvec2 texel, uint interiorTexels)
+{
+    vec2 octahedral = (vec2(texel) + vec2(0.5))
+        * (2.0 / float(interiorTexels)) - vec2(1.0);
+    vec3 direction = vec3(
+        octahedral,
+        1.0 - abs(octahedral.x) - abs(octahedral.y));
+    if (direction.z < 0.0) {
+        direction.xy = (vec2(1.0) - abs(direction.yx))
+            * sign_not_zero(direction.xy);
+    }
+    return normalize(direction);
+}
+
+vec3 rotate_by_quaternion(vec3 direction, vec4 quaternion)
+{
+    vec3 q = quaternion.xyz;
+    return direction + 2.0 * cross(q, cross(q, direction) + quaternion.w * direction);
+}
+
+vec3 fibonacci_direction(uint rayIndex, uint rayCount)
+{
+    float index = float(rayIndex) + 0.5;
+    float z = 1.0 - 2.0 * index / float(rayCount);
+    float radius = sqrt(max(0.0, 1.0 - z * z));
+    float phi = GOLDEN_ANGLE * index;
+    return vec3(cos(phi) * radius, sin(phi) * radius, z);
+}
+
+uvec3 probe_coordinates(uint probeIndex)
+{
+    uvec3 counts = volume.probeCountsRaysPerProbe.xyz;
+    uint planeSize = counts.x * counts.y;
+    return uvec3(
+        probeIndex % counts.x,
+        (probeIndex / counts.x) % counts.y,
+        probeIndex / planeSize);
+}
+
+uvec3 probe_texture_coordinates(uint probeIndex)
+{
+    uvec3 coordinates = probe_coordinates(probeIndex);
+    return uvec3(coordinates.x, coordinates.z, coordinates.y);
+}
+
+ivec3 ray_data_texel(uint rayIndex, uint probeIndex)
+{
+    uvec3 coordinates = probe_texture_coordinates(probeIndex);
+    uint row = coordinates.x
+        + coordinates.y * volume.probeCountsRaysPerProbe.x;
+    return ivec3(int(rayIndex), int(row), int(coordinates.z));
+}
+
+ivec3 atlas_interior_texel(
+    uint probeIndex,
+    uvec2 localTexel,
+    uvec4 atlasLayout)
+{
+    uvec3 coordinates = probe_texture_coordinates(probeIndex);
+    return ivec3(
+        ivec2(coordinates.xy * atlasLayout.y) + ivec2(localTexel) + ivec2(1),
+        int(coordinates.z));
+}
+
+void blend_irradiance(uint probeIndex, uvec2 localTexel)
+{
+    uint interiorTexels = pushConstants.irradianceLayout.z;
+    if (localTexel.x >= interiorTexels || localTexel.y >= interiorTexels) {
+        return;
+    }
+
+    vec3 texelDirection = octahedral_direction(localTexel, interiorTexels);
+    uint rayCount = volume.probeCountsRaysPerProbe.w;
+    uint backfaceCount = 0u;
+    uint maxBackfaces = max(
+        1u,
+        uint(float(rayCount) * clamp(volume.blendThresholds.x, 0.0, 1.0)));
+    vec3 weightedRadiance = vec3(0.0);
+    float weightSum = 0.0;
+    for (uint rayIndex = 0u; rayIndex < rayCount; ++rayIndex) {
+        vec3 rayDirection = normalize(rotate_by_quaternion(
+            fibonacci_direction(rayIndex, rayCount), volume.rayRotation));
+        float weight = max(dot(texelDirection, rayDirection), 0.0);
+        vec4 raySample = imageLoad(
+            rayData, ray_data_texel(rayIndex, probeIndex));
+        // Negative distance marks a back-face hit. It must not contribute a
+        // black sample or cosine weight to irradiance, otherwise probes near
+        // or inside geometry are systematically darkened.
+        if (raySample.w < 0.0) {
+            ++backfaceCount;
+            if (backfaceCount >= maxBackfaces) {
+                // Preserve existing history. A later relocation pass can move
+                // this probe to a useful position; until then, rejecting the
+                // update is safer than blending invalid radiance.
+                return;
+            }
+            continue;
+        }
+        vec3 rayRadiance = raySample.rgb;
+        if (any(isnan(rayRadiance)) || any(isinf(rayRadiance))) {
+            rayRadiance = vec3(0.0);
+        }
+        weightedRadiance += min(rayRadiance, vec3(65000.0)) * weight;
+        weightSum += weight;
+    }
+
+    // Match RTXGI ProbeBlendingCS storage convention. Sampling later squares
+    // the gamma-preserving interpolation and applies 2PI.
+    vec3 irradiance = weightedRadiance * (0.5 / max(weightSum, 1e-5));
+    irradiance *= max(volume.biasAndEncoding.w, 0.0);
+    float encodingGamma = max(volume.biasAndEncoding.z, 1e-3);
+    vec3 encodedIrradiance = pow(
+        max(irradiance, vec3(0.0)), vec3(1.0 / encodingGamma));
+    encodedIrradiance = min(encodedIrradiance, vec3(65000.0));
+
+    ivec3 atlasTexel = atlas_interior_texel(
+        probeIndex, localTexel, pushConstants.irradianceLayout);
+    bool resetHistory = (volume.frameAndFlags.y & VOLUME_FLAG_RESET_HISTORY) != 0u;
+    if (!resetHistory) {
+        vec3 history = imageLoad(irradianceAtlas, atlasTexel).rgb;
+        encodedIrradiance = mix(
+            encodedIrradiance,
+            history,
+            clamp(volume.spacingHysteresis.w, 0.0, 1.0));
+    }
+    imageStore(irradianceAtlas, atlasTexel, vec4(encodedIrradiance, 1.0));
+}
+
+void blend_distance(uint probeIndex, uvec2 localTexel)
+{
+    uint interiorTexels = pushConstants.distanceLayout.z;
+    if (localTexel.x >= interiorTexels || localTexel.y >= interiorTexels) {
+        return;
+    }
+
+    vec3 texelDirection = octahedral_direction(localTexel, interiorTexels);
+    uint rayCount = volume.probeCountsRaysPerProbe.w;
+    vec2 weightedMoments = vec2(0.0);
+    float weightSum = 0.0;
+    for (uint rayIndex = 0u; rayIndex < rayCount; ++rayIndex) {
+        vec3 rayDirection = normalize(rotate_by_quaternion(
+            fibonacci_direction(rayIndex, rayCount), volume.rayRotation));
+        float cosine = max(dot(texelDirection, rayDirection), 0.0);
+        float weight = pow(cosine, 8.0);
+        float distance = abs(imageLoad(
+            rayData, ray_data_texel(rayIndex, probeIndex)).w);
+        if (isnan(distance) || isinf(distance)) {
+            distance = volume.originMaxRayDistance.w;
+        }
+        distance = clamp(distance, 0.0, volume.originMaxRayDistance.w);
+        weightedMoments += vec2(distance, distance * distance) * weight;
+        weightSum += weight;
+    }
+
+    // RTXGI stores half-distance moments and multiplies them by two at sample time.
+    vec2 moments = 0.5 * weightedMoments / max(weightSum, 1e-5);
+    ivec3 atlasTexel = atlas_interior_texel(
+        probeIndex, localTexel, pushConstants.distanceLayout);
+    bool resetHistory = (volume.frameAndFlags.y & VOLUME_FLAG_RESET_HISTORY) != 0u;
+    if (!resetHistory) {
+        vec2 history = imageLoad(distanceAtlas, atlasTexel).rg;
+        moments = mix(
+            moments,
+            history,
+            clamp(volume.spacingHysteresis.w, 0.0, 1.0));
+    }
+    imageStore(distanceAtlas, atlasTexel, vec4(moments, 0.0, 1.0));
+}
+
+ivec2 border_source(uvec2 tileTexel, uint interiorTexels)
+{
+    uint last = interiorTexels + 1u;
+    if (tileTexel.x == 0u) {
+        if (tileTexel.y == 0u) {
+            return ivec2(int(interiorTexels), int(interiorTexels));
+        }
+        if (tileTexel.y == last) {
+            return ivec2(int(interiorTexels), 1);
+        }
+        return ivec2(1, int(interiorTexels - tileTexel.y + 1u));
+    }
+    if (tileTexel.x == last) {
+        if (tileTexel.y == 0u) {
+            return ivec2(1, int(interiorTexels));
+        }
+        if (tileTexel.y == last) {
+            return ivec2(1, 1);
+        }
+        return ivec2(int(interiorTexels), int(interiorTexels - tileTexel.y + 1u));
+    }
+    if (tileTexel.y == 0u) {
+        return ivec2(int(interiorTexels - tileTexel.x + 1u), 1);
+    }
+    return ivec2(
+        int(interiorTexels - tileTexel.x + 1u),
+        int(interiorTexels));
+}
+
+bool is_border(uvec2 tileTexel, uint tileTexels)
+{
+    uint last = tileTexels - 1u;
+    return tileTexel.x == 0u || tileTexel.y == 0u
+        || tileTexel.x == last || tileTexel.y == last;
+}
+
+void update_atlas_border(
+    uint probeIndex,
+    uvec2 tileTexel,
+    uvec4 atlasLayout,
+    bool irradiance)
+{
+    if (tileTexel.x >= atlasLayout.y || tileTexel.y >= atlasLayout.y
+        || !is_border(tileTexel, atlasLayout.y)) {
+        return;
+    }
+
+    uvec3 coordinates = probe_texture_coordinates(probeIndex);
+    ivec2 tileOrigin = ivec2(coordinates.xy * atlasLayout.y);
+    ivec3 destination = ivec3(tileOrigin + ivec2(tileTexel), int(coordinates.z));
+    ivec3 source = ivec3(
+        tileOrigin + border_source(tileTexel, atlasLayout.z),
+        int(coordinates.z));
+    if (irradiance) {
+        imageStore(irradianceAtlas, destination, imageLoad(irradianceAtlas, source));
+    } else {
+        imageStore(distanceAtlas, destination, imageLoad(distanceAtlas, source));
+    }
+}
+
+void main()
+{
+    uint updateIndex = gl_GlobalInvocationID.z;
+    if (updateIndex >= volume.texelsAndUpdate.w) {
+        return;
+    }
+    uint probeIndex = volume.texelsAndUpdate.z + updateIndex;
+    uvec2 localTexel = gl_GlobalInvocationID.xy;
+
+    if (pushConstants.passParams.x == PASS_IRRADIANCE_INTERIOR) {
+        blend_irradiance(probeIndex, localTexel);
+    } else if (pushConstants.passParams.x == PASS_DISTANCE_INTERIOR) {
+        blend_distance(probeIndex, localTexel);
+    } else if (pushConstants.passParams.x == PASS_BORDER_UPDATE) {
+        update_atlas_border(
+            probeIndex, localTexel, pushConstants.irradianceLayout, true);
+        update_atlas_border(
+            probeIndex, localTexel, pushConstants.distanceLayout, false);
+    }
+}

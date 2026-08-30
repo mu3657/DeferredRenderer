@@ -1,0 +1,67 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform DDGIBlendDiagnosticPushConstants {
+    uint firstProbe;
+    uint probeCount;
+    uint probeCountX;
+    uint probeCountY;
+} pushConstants;
+
+layout(rgba32f, set = 0, binding = 2) uniform readonly image2DArray irradianceAtlas;
+layout(std430, set = 0, binding = 6) buffer DDGIBlendDiagnostics {
+    uint rayCount;
+    uint nonZeroRadianceRays;
+    uint frontFaceHits;
+    uint backFaceHits;
+    uint missCount;
+    uint nonFiniteRays;
+    uint maxRadianceBits;
+    uint irradianceTexelCount;
+    uint nonZeroIrradianceTexels;
+    uint nonFiniteIrradianceTexels;
+    uint maxIrradianceBits;
+    uint reserved0;
+    uvec4 reserved1;
+} diagnostics;
+
+void main()
+{
+    uint updateIndex = gl_WorkGroupID.z;
+    if (updateIndex >= pushConstants.probeCount) {
+        return;
+    }
+
+    uint probeIndex = pushConstants.firstProbe + updateIndex;
+    uint probeX = probeIndex % pushConstants.probeCountX;
+    uint probeY = (probeIndex / pushConstants.probeCountX)
+        % pushConstants.probeCountY;
+    uint probeZ = probeIndex
+        / (pushConstants.probeCountX * pushConstants.probeCountY);
+
+    // Irradiance tiles contain an 8x8 interior surrounded by a one-texel
+    // filtering border. Inspect only the freshly blended interior.
+    ivec3 texel = ivec3(
+        int(probeX * 10u + 1u + gl_LocalInvocationID.x),
+        int(probeZ * 10u + 1u + gl_LocalInvocationID.y),
+        int(probeY));
+    vec3 irradiance = imageLoad(irradianceAtlas, texel).rgb;
+    bool nonFinite = any(isnan(irradiance)) || any(isinf(irradiance));
+    vec3 finiteIrradiance = nonFinite
+        ? vec3(0.0)
+        : max(irradiance, vec3(0.0));
+
+    atomicAdd(diagnostics.irradianceTexelCount, 1u);
+    if (any(greaterThan(finiteIrradiance, vec3(1e-7)))) {
+        atomicAdd(diagnostics.nonZeroIrradianceTexels, 1u);
+    }
+    if (nonFinite) {
+        atomicAdd(diagnostics.nonFiniteIrradianceTexels, 1u);
+    }
+    atomicMax(
+        diagnostics.maxIrradianceBits,
+        floatBitsToUint(max(
+            finiteIrradiance.r,
+            max(finiteIrradiance.g, finiteIrradiance.b))));
+}

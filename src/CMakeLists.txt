@@ -42,13 +42,25 @@ add_executable (engine
         Renderpasses/transparent_pass.cpp
         Renderpasses/ContactShadow_pass.h
         Renderpasses/ContactShadow_pass.cpp
+        Renderpasses/ddgi_probe_trace_pass.h
+        Renderpasses/ddgi_probe_trace_pass.cpp
+        Renderpasses/ddgi_probe_blend_pass.h
+        Renderpasses/ddgi_probe_blend_pass.cpp
+        Renderpasses/ddgi_probe_debug_pass.h
+        Renderpasses/ddgi_probe_debug_pass.cpp
+        Renderpasses/tone_map_pass.h
+        Renderpasses/tone_map_pass.cpp
+        GlobalilluminationStructure/ddgi_volume.h
+        GlobalilluminationStructure/ddgi_volume.cpp
+        GlobalilluminationStructure/ray_tracing_scene.h
+        GlobalilluminationStructure/ray_tracing_scene.cpp
 )
 
 set_property(TARGET engine PROPERTY CXX_STANDARD 20)
 target_compile_definitions(engine PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_include_directories(engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
-target_link_libraries(engine PUBLIC vma glm Vulkan::Vulkan fmt::fmt stb_image SDL2::SDL2 vkbootstrap imgui fastgltf::fastgltf lz4 assetlib json assimp renderdoc tracy entt)
+target_link_libraries(engine PUBLIC vma glm Vulkan::Vulkan fmt::fmt stb_image SDL2::SDL2 vkbootstrap imgui fastgltf::fastgltf lz4 assetlib json assimp renderdoc tracy entt RTXGI-VK)
  target_compile_definitions(engine PUBLIC TRACY_ENABLE)
 
 

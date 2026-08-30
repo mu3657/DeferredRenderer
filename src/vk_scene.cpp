@@ -17,6 +17,8 @@ uint32_t RenderScene::add_object(MeshAsset* mesh, MaterialInstance* material, co
         obj.indexCount = surface.count;
         obj.firstIndex = surface.startIndex;
         obj.indexBuffer = mesh->meshBuffers.indexBuffer.buffer;
+        obj.indexBufferAddress = mesh->meshBuffers.indexBufferAddress;
+        obj.vertexCount = mesh->meshBuffers.vertexCount;
         obj.vertexBufferAddress = mesh->meshBuffers.vertexBufferAddress;
         
         // If the surface has a material from glTF, wrap it. Else fallback to provided material.

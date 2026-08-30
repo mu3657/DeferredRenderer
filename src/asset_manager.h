@@ -22,7 +22,7 @@ public:
 
 private:
     std::shared_ptr<Material> load_material(const std::string& path);
-    AllocatedImage load_texture(const std::string& path);
+    AllocatedImage load_texture(const std::string& path, bool srgb);
 
     VulkanEngine* _engine{ nullptr };
     std::unordered_map<std::string, std::shared_ptr<MeshAsset>> _meshes;

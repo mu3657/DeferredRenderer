@@ -12,6 +12,8 @@
 #include <vk_types.h>
 
 #include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 
@@ -28,7 +30,7 @@ VulkanEngine* loadedEngine = nullptr;
 #ifdef NDEBUG
 const bool bUseValidationLayers = false;
 #else
-const bool bUseValidationLayers = true;
+const bool bUseValidationLayers = false;
 #endif
 
 const size_t MAX_OBJECTS = 10000;
@@ -54,6 +56,92 @@ float elapsed_ms(std::chrono::steady_clock::time_point start)
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
     return static_cast<float>(elapsed.count()) / 1000.f;
 }
+
+struct alignas(16) DeferredLightingPushConstants {
+    glm::vec4 ddgiParams{};
+    glm::vec4 ddgiDebugParams{};
+};
+
+static_assert(sizeof(DeferredLightingPushConstants) == 32);
+
+std::optional<RayTracingMeshDesc> make_ray_tracing_mesh_desc(
+    const MeshAsset& mesh,
+    uint32_t materialCount)
+{
+    RayTracingMeshDesc desc{};
+    desc.sourceKey = &mesh;
+    desc.debugName = mesh.name;
+    desc.geometries.reserve(mesh.surfaces.size());
+
+    for (const GeoSurface& surface : mesh.surfaces) {
+        if (!surface.material
+            || surface.material->data.surface == MaterialSurface::Transparent) {
+            continue;
+        }
+        if (surface.startIndex > mesh.meshBuffers.indexCount
+            || surface.count > mesh.meshBuffers.indexCount - surface.startIndex
+            || (surface.count % 3) != 0) {
+            throw std::out_of_range(fmt::format(
+                "Mesh {} contains an invalid ray tracing index range [{}, {}) for {} indices",
+                mesh.name,
+                surface.startIndex,
+                surface.startIndex + surface.count,
+                mesh.meshBuffers.indexCount));
+        }
+        if (surface.material->data.materialID >= materialCount) {
+            throw std::out_of_range(fmt::format(
+                "Mesh {} references material {}, but only {} bindless materials are available",
+                mesh.name,
+                surface.material->data.materialID,
+                materialCount));
+        }
+
+        RayTracingGeometryDesc geometry{};
+        geometry.vertexBuffer = mesh.meshBuffers.vertexBuffer.buffer;
+        geometry.vertexBufferAddress = mesh.meshBuffers.vertexBufferAddress;
+        geometry.vertexCount = mesh.meshBuffers.vertexCount;
+        geometry.indexBuffer = mesh.meshBuffers.indexBuffer.buffer;
+        geometry.indexBufferAddress = mesh.meshBuffers.indexBufferAddress;
+        geometry.firstIndex = surface.startIndex;
+        geometry.indexCount = surface.count;
+        geometry.materialID = surface.material->data.materialID;
+        geometry.shaderFlags = RayTracingGeometryFlagDoubleSided;
+
+        if (surface.material->data.surface == MaterialSurface::Masked) {
+            geometry.shaderFlags |= RayTracingGeometryFlagAlphaTested;
+            geometry.buildFlags = 0;
+        }
+
+        desc.geometries.push_back(geometry);
+    }
+
+    if (desc.geometries.empty()) {
+        return std::nullopt;
+    }
+    return desc;
+}
+
+bool ray_tracing_instances_equal(
+    const std::vector<RayTracingInstanceDesc>& lhs,
+    const std::vector<RayTracingInstanceDesc>& rhs)
+{
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+
+    for (size_t index = 0; index < lhs.size(); ++index) {
+        const RayTracingInstanceDesc& a = lhs[index];
+        const RayTracingInstanceDesc& b = rhs[index];
+        if (a.blasIndex != b.blasIndex
+            || a.instanceID != b.instanceID
+            || a.mask != b.mask
+            || a.flags != b.flags
+            || std::memcmp(&a.transform, &b.transform, sizeof(glm::mat4)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
 }
 
 
@@ -75,7 +163,7 @@ void VulkanEngine::init()
         _windowExtent.height,
         window_flags
     );
-	init_renderdoc();
+	//init_renderdoc();
     init_vulkan();
 
     init_swapchain();
@@ -84,8 +172,30 @@ void VulkanEngine::init()
 
     init_sync_structures();
 
+    rayTracingScene.init(RayTracingSceneInitContext{
+        _chosenGPU,
+        _device,
+        _allocator,
+        FRAME_OVERLAP,
+    });
+
     init_descriptors();
     init_default_data();
+
+    DDGIVolumeDesc ddgiVolumeDesc{};
+    // Keep the first integration comfortably below the Windows TDR budget.
+    // Irradiance history will amortize a full volume update over multiple frames.
+    ddgiVolumeDesc.probesUpdatedPerFrame = 8;
+    ddgiVolume.init(
+        DDGIVolumeInitContext{
+            _chosenGPU,
+            _device,
+            _allocator,
+            _descriptorSystem,
+            FRAME_OVERLAP,
+        },
+        ddgiVolumeDesc);
+
     init_gbuffer();
 	init_contactshadowimage();
     pipelineRegistry.init(_device);
@@ -102,9 +212,18 @@ void VulkanEngine::init()
     geometryPass.init(passInitContext);
     shadowPass.init(passInitContext);
     contactShadowPass.init(passInitContext);
+    ddgiProbeTracePass.init(passInitContext);
+    ddgiProbeBlendPass.init(passInitContext);
+    ddgiProbeDebugPass.init(passInitContext);
+    toneMapPass.init(passInitContext);
     transparentPass.init(passInitContext);
     _mainDeletionQueue.push_function([this]() {
         transparentPass.cleanup();
+        toneMapPass.cleanup();
+        ddgiProbeDebugPass.cleanup();
+        ddgiProbeBlendPass.cleanup();
+        ddgiProbeTracePass.cleanup();
+        ddgiVolume.cleanup();
         contactShadowPass.cleanup();
         shadowPass.cleanup();
         geometryPass.cleanup();
@@ -283,6 +402,10 @@ void VulkanEngine::cleanup()
         vkDeviceWaitIdle(_device);
     	// make sure the gpu has stopped doing its things
 
+        rayTracingScene.cleanup();
+        _rayTracingBLASIndices.clear();
+        _lastRayTracingInstances.clear();
+
     	loadedScenes.clear();
 
         for (int i = 0; i < FRAME_OVERLAP; i++) {
@@ -363,9 +486,43 @@ void VulkanEngine::draw()
     stats.scene_update_time = elapsed_ms(sceneUpdateStart);
     TracyPlot("Scene Update CPU ms", stats.scene_update_time);
 
-    VK_CHECK(vkWaitForFences(_device, 1, &get_current_frame()._renderFence, true, 1000000000));
+    constexpr uint64_t FrameFencePollTimeoutNs = 1000000000ull;
+    const VkResult frameFenceResult = vkWaitForFences(
+        _device,
+        1,
+        &get_current_frame()._renderFence,
+        VK_TRUE,
+        FrameFencePollTimeoutNs);
+    if (frameFenceResult == VK_TIMEOUT) {
+        if (!_frameFenceTimeoutWarningPrinted) {
+            fmt::println(
+                "GPU frame {} is still running after 1 second; preserving the submission and polling again",
+                _frameNumber);
+            std::fflush(stdout);
+            _frameFenceTimeoutWarningPrinted = true;
+        }
+        return;
+    }
+    VK_CHECK(frameFenceResult);
+    _frameFenceTimeoutWarningPrinted = false;
+
+    const uint32_t completedFrameIndex = _frameNumber % FRAME_OVERLAP;
+    ddgiProbeBlendPass.notify_frame_completed(completedFrameIndex);
+    ddgiProbeTracePass.notify_frame_completed(completedFrameIndex);
+    if (!_rayTracingBuildCompletionLogged
+        && rayTracingScene.ready(completedFrameIndex)) {
+        const RayTracingSceneStats& rayTracingStats = rayTracingScene.stats();
+        fmt::println(
+            "Ray tracing scene build completed: {} BLAS, {} geometries, {} instances, TLAS ready",
+            rayTracingStats.blasCount,
+            rayTracingStats.geometryCount,
+            rayTracingStats.instanceCount);
+        std::fflush(stdout);
+        _rayTracingBuildCompletionLogged = true;
+    }
 
     get_current_frame()._deletionQueue.flush();
+    sync_ray_tracing_instances();
     // get_current_frame()._frameDescriptorsAllocator.clear_pools(_device);
 
 
@@ -376,10 +533,24 @@ void VulkanEngine::draw()
     //request image from the swapchain
     uint32_t swapchainImageIndex;
 
-    VkResult e = vkAcquireNextImageKHR(_device, _swapchain, 1000000000, get_current_frame()._swapchainSemaphore, nullptr, &swapchainImageIndex);
+    VkResult e = vkAcquireNextImageKHR(
+        _device,
+        _swapchain,
+        1000000000,
+        get_current_frame()._swapchainSemaphore,
+        nullptr,
+        &swapchainImageIndex);
+    if (e == VK_TIMEOUT || e == VK_NOT_READY) {
+        return;
+    }
     if (e == VK_ERROR_OUT_OF_DATE_KHR) {
         resize_requested = true;
         return ;
+    }
+    if (e == VK_SUBOPTIMAL_KHR) {
+        resize_requested = true;
+    } else {
+        VK_CHECK(e);
     }
 
     VK_CHECK(vkResetFences(_device, 1, &get_current_frame()._renderFence));
@@ -399,6 +570,40 @@ void VulkanEngine::draw()
 	const auto renderRecordStart = std::chrono::steady_clock::now();
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));
     RenderPassFrameContext passContext = make_pass_frame_context(cmd);
+
+    const bool buildingStaticRayTracingGeometry =
+        rayTracingScene.stats().pendingBLASBuilds > 0;
+    const bool hadFrameTLASBeforeBuild =
+        rayTracingScene.tlas(passContext.frameIndex) != VK_NULL_HANDLE;
+    {
+        ZoneScopedN("RayTracingScene Build");
+        const auto rayTracingBuildStart = std::chrono::steady_clock::now();
+        rayTracingScene.record_builds(cmd, passContext.frameIndex);
+        const RayTracingSceneStats& rayTracingStats = rayTracingScene.stats();
+        TracyPlot("RT Scene Build CPU ms", elapsed_ms(rayTracingBuildStart));
+        TracyPlot("RT BLAS Count", static_cast<int64_t>(rayTracingStats.blasCount));
+        TracyPlot("RT Geometry Count", static_cast<int64_t>(rayTracingStats.geometryCount));
+        TracyPlot("RT Instance Count", static_cast<int64_t>(rayTracingStats.instanceCount));
+    }
+
+    if (!buildingStaticRayTracingGeometry && hadFrameTLASBeforeBuild) {
+        ZoneScopedN("DDGI Probe Trace");
+        DDGIProbeTracePassContext ddgiTraceContext{
+            passContext,
+            rayTracingScene,
+            ddgiVolume,
+            lightSystem,
+        };
+        ddgiProbeTracePass.execute(ddgiTraceContext);
+        if (ddgiProbeTracePass.stats().rayCount > 0) {
+            ZoneScopedN("DDGI Probe Blend");
+            DDGIProbeBlendPassContext ddgiBlendContext{
+                passContext,
+                ddgiVolume,
+            };
+            ddgiProbeBlendPass.execute(ddgiBlendContext);
+        }
+    }
 
 	// transition our main draw image into general layout so we can write into it
 	// we will overwrite it all so we dont care about what was the older layout
@@ -446,7 +651,7 @@ void VulkanEngine::draw()
     LightingPassContext lightingContext{ passContext, _drawImage.imageView, lightSystem };
 	const auto lightingPassStart = std::chrono::steady_clock::now();
 	lighting_pass(lightingContext);
-	stats.lighting.cpu_time_ms = elapsed_ms(lightingPassStart);
+    stats.lighting.cpu_time_ms = elapsed_ms(lightingPassStart);
     TracyPlot("LightingPass CPU ms", stats.lighting.cpu_time_ms);
 
     TransparentPassContext transparentContext{
@@ -461,6 +666,21 @@ void VulkanEngine::draw()
     transparentPass.execute(transparentContext);
     stats.transparent.cpu_time_ms = elapsed_ms(transparentPassStart);
     TracyPlot("TransparentPass CPU ms", stats.transparent.cpu_time_ms);
+
+    // Keep probe visualization as the last scene-space draw so X-Ray/debug
+    // markers cannot be covered by transparent geometry rendered afterwards.
+    DDGIProbeDebugPassContext ddgiDebugContext{
+        passContext,
+        ddgiVolume,
+        _drawImage.imageView,
+        _depthImage.imageView,
+    };
+    ddgiProbeDebugPass.execute(ddgiDebugContext);
+
+    // Convert the completed HDR scene to display-referred sRGB before the
+    // UNORM swapchain blit. This prevents physically valid GGX peaks from
+    // becoming hard-clipped white highlights.
+    toneMapPass.execute(passContext);
 
 	stats.drawcall_count =
         stats.shadow.drawcall_count
@@ -649,6 +869,10 @@ void VulkanEngine::run()
         lightSystem.draw_debug_ui();
         shadowPass.draw_debug_ui();
         contactShadowPass.draw_debug_ui();
+        ddgiProbeTracePass.draw_debug_ui();
+        ddgiProbeBlendPass.draw_debug_ui();
+        ddgiProbeDebugPass.draw_debug_ui();
+        toneMapPass.draw_debug_ui();
 
         // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
         sceneOutliner.draw(*this);
@@ -722,6 +946,72 @@ void VulkanEngine::set_active_scene(const std::string& sceneName)
 
     activeSceneName = sceneName;
     sceneOutliner.rebuild(*it->second);
+    rebuild_ray_tracing_scene(*it->second);
+    ddgiProbeDebugPass.fit_volume_to_active_scene(ddgiVolume);
+}
+
+void VulkanEngine::rebuild_ray_tracing_scene(const LoadedScene& scene)
+{
+    rayTracingScene.unregister_all_meshes();
+    _rayTracingBLASIndices.clear();
+    _lastRayTracingInstances.clear();
+    _rayTracingBuildCompletionLogged = false;
+    ddgiVolume.request_history_reset();
+
+    uint32_t skippedMeshes = 0;
+    for (const auto& [name, node] : scene.nodes) {
+        const std::shared_ptr<MeshNode> meshNode =
+            std::dynamic_pointer_cast<MeshNode>(node);
+        if (!meshNode || !meshNode->mesh) {
+            continue;
+        }
+
+        const std::shared_ptr<MeshAsset>& mesh = meshNode->mesh;
+        if (_rayTracingBLASIndices.contains(mesh.get())) {
+            continue;
+        }
+
+        std::optional<RayTracingMeshDesc> desc =
+            make_ray_tracing_mesh_desc(*mesh, bindlessMaterialCount);
+        if (!desc.has_value()) {
+            ++skippedMeshes;
+            continue;
+        }
+
+        const uint32_t blasIndex = rayTracingScene.register_mesh(*desc);
+        _rayTracingBLASIndices.emplace(mesh.get(), blasIndex);
+    }
+
+    fmt::println(
+        "Ray tracing scene: registered {} mesh BLAS descriptions, skipped {} transparent-only meshes",
+        _rayTracingBLASIndices.size(),
+        skippedMeshes);
+    std::fflush(stdout);
+}
+
+void VulkanEngine::sync_ray_tracing_instances()
+{
+    std::vector<RayTracingInstanceDesc> instances;
+    instances.reserve(mainDrawContext.RayTracingInstances.size());
+
+    for (const RayTracingRenderInstance& renderInstance : mainDrawContext.RayTracingInstances) {
+        const auto blas = _rayTracingBLASIndices.find(renderInstance.mesh);
+        if (blas == _rayTracingBLASIndices.end()) {
+            continue;
+        }
+
+        RayTracingInstanceDesc instance{};
+        instance.blasIndex = blas->second;
+        instance.instanceID = renderInstance.instanceID;
+        instance.mask = renderInstance.mask;
+        instance.transform = renderInstance.transform;
+        instances.push_back(instance);
+    }
+
+    if (!ray_tracing_instances_equal(instances, _lastRayTracingInstances)) {
+        rayTracingScene.set_instances(instances);
+        _lastRayTracingInstances = std::move(instances);
+    }
 }
 
 void VulkanEngine::draw_scene_browser()
@@ -809,7 +1099,17 @@ void VulkanEngine::init_vulkan()
 	features12.descriptorBindingVariableDescriptorCount  = VK_TRUE;
 	features12.runtimeDescriptorArray                   = VK_TRUE;
 
-	features12.descriptorIndexing = VK_TRUE;
+    features12.descriptorIndexing = VK_TRUE;
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+    };
+    accelerationStructureFeatures.accelerationStructure = VK_TRUE;
+
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
+    };
+    rayQueryFeatures.rayQuery = VK_TRUE;
 
 
 
@@ -820,6 +1120,11 @@ void VulkanEngine::init_vulkan()
         .set_minimum_version(1, 3)
         .set_required_features_13(features)
         .set_required_features_12(features12)
+        .add_required_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
+        .add_required_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+        .add_required_extension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)
+        .add_required_extension_features(accelerationStructureFeatures)
+        .add_required_extension_features(rayQueryFeatures)
         .set_surface(_surface)
         .select()
         .value();
@@ -1013,7 +1318,9 @@ void VulkanEngine::init_descriptors() {
 
         _bindlessDescriptorLayout = builder.build(
             _device,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            VK_SHADER_STAGE_VERTEX_BIT
+                | VK_SHADER_STAGE_FRAGMENT_BIT
+                | VK_SHADER_STAGE_COMPUTE_BIT,
             nullptr,
             VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT); // pool 有这个 flag，layout 必须匹配
     }
@@ -1188,10 +1495,14 @@ GPUMeshBuffers VulkanEngine::uploadMesh(std::span<uint32_t> indices, std::span<V
     const size_t vertexBufferSize = vertices.size() * sizeof(Vertex);
     const size_t indexBufferSize = indices.size() * sizeof(uint32_t);
 
-    GPUMeshBuffers newSurface;
+    GPUMeshBuffers newSurface{};
 
     //create vertex buffer
-    newSurface.vertexBuffer = create_buffer(vertexBufferSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+    newSurface.vertexBuffer = create_buffer(vertexBufferSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+            | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VMA_MEMORY_USAGE_GPU_ONLY);
 
     //find the adress of the vertex buffer
@@ -1199,8 +1510,16 @@ GPUMeshBuffers VulkanEngine::uploadMesh(std::span<uint32_t> indices, std::span<V
     newSurface.vertexBufferAddress = vkGetBufferDeviceAddress(_device, &deviceAdressInfo);
 
     //create index buffer
-    newSurface.indexBuffer = create_buffer(indexBufferSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    newSurface.indexBuffer = create_buffer(indexBufferSize,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+            | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VMA_MEMORY_USAGE_GPU_ONLY);
+    deviceAdressInfo.buffer = newSurface.indexBuffer.buffer;
+    newSurface.indexBufferAddress = vkGetBufferDeviceAddress(_device, &deviceAdressInfo);
+    newSurface.vertexCount = static_cast<uint32_t>(vertices.size());
+    newSurface.indexCount = static_cast<uint32_t>(indices.size());
     AllocatedBuffer staging = create_buffer(vertexBufferSize + indexBufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
 
     void* data = staging.allocation->GetMappedData();
@@ -1351,6 +1670,18 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
     VkImageView targetImageView = ctx.targetImageView;
     stats.lighting = {};
 
+    ddgiVolume.sync_sampling_frame(ctx.frameIndex);
+    VkMemoryBarrier2 ddgiConstantsBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    ddgiConstantsBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    ddgiConstantsBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT;
+    ddgiConstantsBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    ddgiConstantsBarrier.dstAccessMask =
+        VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo ddgiConstantsDependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    ddgiConstantsDependency.memoryBarrierCount = 1;
+    ddgiConstantsDependency.pMemoryBarriers = &ddgiConstantsBarrier;
+    vkCmdPipelineBarrier2(cmd, &ddgiConstantsDependency);
+
 	VkRenderingAttachmentInfo swapchainAttachment = vkinit::attachment_info(targetImageView, nullptr, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	VkRenderingInfo renderInfo = {};
 	renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -1385,6 +1716,7 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 
 	VkDescriptorSet shadowSet = shadowPass.descriptor_set(ctx.frameIndex);
 	VkDescriptorSet contactShadowSet = contactShadowPass.lighting_descriptor_set();
+	VkDescriptorSet ddgiSet = ddgiVolume.sampling_descriptor_set(ctx.frameIndex);
 
 	vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,_deferredLightingPipeline);
 	//vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout, 0, 1, &_gBufferDescriptorSet, 0, nullptr);
@@ -1401,6 +1733,28 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 							3, 1, &shadowSet, 0, nullptr);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							4, 1, &contactShadowSet, 0, nullptr);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
+							5, 1, &ddgiSet, 0, nullptr);
+
+    DeferredLightingPushConstants lightingPushConstants{};
+    const bool ddgiHistoryValid = ddgiVolume.enabled()
+        && ddgiProbeBlendPass.history_valid(ddgiVolume.history_clear_serial());
+    const bool ddgiLightingEnabled =
+        ddgiHistoryValid && ddgiProbeBlendPass.lighting_enabled();
+    lightingPushConstants.ddgiParams = glm::vec4(
+        ddgiHistoryValid ? 1.f : 0.f,
+        ddgiProbeBlendPass.lighting_intensity(),
+        static_cast<float>(ddgiProbeBlendPass.lighting_debug_mode()),
+        ddgiLightingEnabled ? 1.f : 0.f);
+    lightingPushConstants.ddgiDebugParams = glm::vec4(
+        ddgiProbeBlendPass.heatmap_exposure(), 0.f, 0.f, 0.f);
+    vkCmdPushConstants(
+        cmd,
+        _deferredLightingPipelineLayout,
+        VK_SHADER_STAGE_FRAGMENT_BIT,
+        0,
+        sizeof(lightingPushConstants),
+        &lightingPushConstants);
 	// 绘制 3 个没有 Vertex Buffer 指派的顶点
 	vkCmdDraw(cmd, 3, 1, 0, 0);
     stats.lighting.drawcall_count = 1;
@@ -1505,17 +1859,21 @@ void VulkanEngine::init_Deferredlighting_pipeline()
 		fmt::print("Error when building the deferred lighting shader module \n");
 	}
 	VkPipelineLayoutCreateInfo layoutCreateInfo = vkinit::pipeline_layout_create_info();
-	layoutCreateInfo.setLayoutCount = 5;
+	layoutCreateInfo.setLayoutCount = 6;
 	VkDescriptorSetLayout lightingLayouts[] = {
         _gpuSceneDataDescriptorLayout,
         _gBufferDescriptorLayout,
         _descriptorSystem.layout(DescriptorLayoutID::LightData),
 		_descriptorSystem.layout(DescriptorLayoutID::ShadowInput),
-		_descriptorSystem.layout(DescriptorLayoutID::ContactShadowInput)
+		_descriptorSystem.layout(DescriptorLayoutID::ContactShadowInput),
+		_descriptorSystem.layout(DescriptorLayoutID::GIInput)
     };
 	layoutCreateInfo.pSetLayouts = lightingLayouts;
-	layoutCreateInfo.pPushConstantRanges = nullptr;
-	layoutCreateInfo.pushConstantRangeCount = 0;
+	VkPushConstantRange pushConstantRange{};
+	pushConstantRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	pushConstantRange.size = sizeof(DeferredLightingPushConstants);
+	layoutCreateInfo.pPushConstantRanges = &pushConstantRange;
+	layoutCreateInfo.pushConstantRangeCount = 1;
 
 	VkPipelineLayout pipelineLayout;
 	VK_CHECK(vkCreatePipelineLayout(_device, &layoutCreateInfo, nullptr, &pipelineLayout));
@@ -1682,6 +2040,11 @@ uint32_t VulkanEngine::upload_bindless_material(const GLTFMetallic_Roughness::Ma
     GLTFMetallic_Roughness::MaterialConstants* matArray =
         (GLTFMetallic_Roughness::MaterialConstants*)_materialBuffer.allocation->GetMappedData();
     matArray[id] = materialData;
+    VK_CHECK(vmaFlushAllocation(
+        _allocator,
+        _materialBuffer.allocation,
+        static_cast<VkDeviceSize>(id) * sizeof(GLTFMetallic_Roughness::MaterialConstants),
+        sizeof(GLTFMetallic_Roughness::MaterialConstants)));
     return id;
 }
 
@@ -2021,6 +2384,9 @@ void VulkanEngine::resize_swapchain()
 
 void VulkanEngine::update_scene()
 {
+	mainDrawContext.OpaqueSurfaces.clear();
+	mainDrawContext.TransparentSurfaces.clear();
+	mainDrawContext.RayTracingInstances.clear();
 
 
 	glm::mat4 view = mainCamera.getViewMatrix();

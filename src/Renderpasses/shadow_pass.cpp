@@ -187,6 +187,86 @@ VkRect2D cascade_atlas_rect(VkExtent2D atlasExtent, uint32_t cascadeIndex)
         VkExtent2D{cascadeWidth, cascadeHeight},
     };
 }
+
+VkRect2D punctual_atlas_rect(
+    VkExtent2D atlasExtent,
+    uint32_t tileResolution,
+    uint32_t tileIndex)
+{
+    const uint32_t tilesPerRow = atlasExtent.width / tileResolution;
+    return VkRect2D{
+        VkOffset2D{
+            static_cast<int32_t>((tileIndex % tilesPerRow) * tileResolution),
+            static_cast<int32_t>((tileIndex / tilesPerRow) * tileResolution),
+        },
+        VkExtent2D{tileResolution, tileResolution},
+    };
+}
+
+glm::vec3 point_shadow_face_direction(uint32_t faceIndex)
+{
+    static const std::array<glm::vec3, MAX_PUNCTUAL_SHADOW_FACES> directions{
+        glm::vec3(1.f, 0.f, 0.f),
+        glm::vec3(-1.f, 0.f, 0.f),
+        glm::vec3(0.f, 1.f, 0.f),
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, 0.f, 1.f),
+        glm::vec3(0.f, 0.f, -1.f),
+    };
+    return directions[std::min(faceIndex, MAX_PUNCTUAL_SHADOW_FACES - 1)];
+}
+
+glm::vec3 point_shadow_face_up(uint32_t faceIndex)
+{
+    static const std::array<glm::vec3, MAX_PUNCTUAL_SHADOW_FACES> upVectors{
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, 0.f, 1.f),
+        glm::vec3(0.f, 0.f, -1.f),
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, -1.f, 0.f),
+    };
+    return upVectors[std::min(faceIndex, MAX_PUNCTUAL_SHADOW_FACES - 1)];
+}
+
+GPUSceneData make_punctual_shadow_scene_data(
+    const GPUSceneData& cameraSceneData,
+    const GPULight& light,
+    uint32_t faceIndex)
+{
+    const glm::vec3 position = glm::vec3(light.positionRange);
+    const float range = std::max(light.positionRange.w, 0.05f);
+    const float nearDistance = std::clamp(range * 0.01f, 0.02f, 0.1f);
+    const float farDistance = std::max(range, nearDistance + 0.01f);
+    const bool pointLight =
+        static_cast<int>(light.directionType.w) == static_cast<int>(LightType::Point);
+
+    glm::vec3 direction{};
+    glm::vec3 up{};
+    float fieldOfView = glm::radians(90.f);
+    if (pointLight) {
+        direction = point_shadow_face_direction(faceIndex);
+        up = point_shadow_face_up(faceIndex);
+    } else {
+        direction = safe_normalize(glm::vec3(light.directionType), glm::vec3(0.f, -1.f, 0.f));
+        up = std::abs(glm::dot(direction, glm::vec3(0.f, 1.f, 0.f))) > 0.95f
+            ? glm::vec3(0.f, 0.f, 1.f)
+            : glm::vec3(0.f, 1.f, 0.f);
+        const float outerCosine = std::clamp(light.params.y, -0.999f, 0.999f);
+        fieldOfView = std::clamp(2.f * std::acos(outerCosine), glm::radians(1.f), glm::radians(179.f));
+    }
+
+    glm::mat4 view = glm::lookAt(position, position + direction, up);
+    // Reverse-Z is produced by swapping the perspective near/far arguments.
+    glm::mat4 projection = glm::perspective(fieldOfView, 1.f, farDistance, nearDistance);
+    projection[1][1] *= -1.f;
+
+    GPUSceneData result = cameraSceneData;
+    result.view = view;
+    result.proj = projection;
+    result.viewproj = projection * view;
+    return result;
+}
 }
 
 
@@ -195,10 +275,29 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
     _engine = &ctx.engine;
     _frames.resize(FRAME_OVERLAP);
 
+    VkPhysicalDeviceProperties deviceProperties{};
+    vkGetPhysicalDeviceProperties(_engine->_chosenGPU, &deviceProperties);
+    const size_t uniformAlignment = std::max<size_t>(
+        deviceProperties.limits.minUniformBufferOffsetAlignment,
+        1);
+    _punctualSceneStride =
+        (sizeof(GPUSceneData) + uniformAlignment - 1) & ~(uniformAlignment - 1);
+
 
     VkExtent3D shadowExtent = { _shadowExtent.width, _shadowExtent.height, 1 };
     _shadowDepthImage = _engine->create_image(
         shadowExtent,
+        VK_FORMAT_D32_SFLOAT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        false);
+
+    VkExtent3D punctualShadowExtent = {
+        _punctualShadowExtent.width,
+        _punctualShadowExtent.height,
+        1,
+    };
+    _punctualShadowDepthImage = _engine->create_image(
+        punctualShadowExtent,
         VK_FORMAT_D32_SFLOAT,
         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         false);
@@ -295,8 +394,38 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         }
 
+        _frames[i].punctualSceneBuffer = _engine->create_buffer(
+            _punctualSceneStride * MAX_PUNCTUAL_SHADOW_TILES,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        for (uint32_t tileIndex = 0; tileIndex < MAX_PUNCTUAL_SHADOW_TILES; tileIndex++) {
+            _frames[i].punctualSceneDescriptors[tileIndex] =
+                ctx.descriptors.allocate_frame(DescriptorLayoutID::FrameScene, i);
+
+            ctx.descriptors.write_buffer(
+                _frames[i].punctualSceneDescriptors[tileIndex],
+                0,
+                _frames[i].punctualSceneBuffer.buffer,
+                sizeof(GPUSceneData),
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                tileIndex * _punctualSceneStride);
+
+            ctx.descriptors.write_buffer(
+                _frames[i].punctualSceneDescriptors[tileIndex],
+                1,
+                _engine->_frames[i].objectStorageBuffer.buffer,
+                static_cast<size_t>(_engine->_frames[i].objectStorageBuffer.info.size),
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        }
+
         _frames[i].shadowDataBuffer = _engine->create_buffer(
             sizeof(GPUShadowData),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+        _frames[i].punctualShadowDataBuffer = _engine->create_buffer(
+            sizeof(GPUPunctualShadowData),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VMA_MEMORY_USAGE_CPU_TO_GPU);
 
@@ -316,6 +445,21 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
             1,
             _frames[i].shadowDataBuffer.buffer,
             sizeof(GPUShadowData),
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+        ctx.descriptors.write_image(
+            _frames[i].descriptor,
+            2,
+            _punctualShadowDepthImage.imageView,
+            _shadowSampler,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+
+        ctx.descriptors.write_buffer(
+            _frames[i].descriptor,
+            3,
+            _frames[i].punctualShadowDataBuffer.buffer,
+            sizeof(GPUPunctualShadowData),
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
     }
 
@@ -340,6 +484,14 @@ void ShadowPass::cleanup()
             _engine->destroy_buffer(frame.shadowDataBuffer);
             frame.shadowDataBuffer = {};
         }
+        if (frame.punctualSceneBuffer.buffer != VK_NULL_HANDLE) {
+            _engine->destroy_buffer(frame.punctualSceneBuffer);
+            frame.punctualSceneBuffer = {};
+        }
+        if (frame.punctualShadowDataBuffer.buffer != VK_NULL_HANDLE) {
+            _engine->destroy_buffer(frame.punctualShadowDataBuffer);
+            frame.punctualShadowDataBuffer = {};
+        }
     }
     _frames.clear();
 
@@ -351,6 +503,11 @@ void ShadowPass::cleanup()
     if (_shadowDepthImage.image != VK_NULL_HANDLE) {
         _engine->destroy_image(_shadowDepthImage);
         _shadowDepthImage = {};
+    }
+
+    if (_punctualShadowDepthImage.image != VK_NULL_HANDLE) {
+        _engine->destroy_image(_punctualShadowDepthImage);
+        _punctualShadowDepthImage = {};
     }
 
     _opaquePipeline = nullptr;
@@ -413,6 +570,11 @@ void ShadowPass::execute(ShadowPassContext& ctx)
             shadowFrame.sceneBuffers[cascadeIndex].info.pMappedData,
             &cascadeSceneData[cascadeIndex],
             sizeof(GPUSceneData));
+        VK_CHECK(vmaFlushAllocation(
+            engine._allocator,
+            shadowFrame.sceneBuffers[cascadeIndex].allocation,
+            0,
+            sizeof(GPUSceneData)));
     }
 
     _shadowData.cascadeSplits = glm::vec4(
@@ -448,19 +610,23 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         _enabled && directionalLight.colorIntensity.w > 0.f ? 1.0f : 0.0f);
 
     std::memcpy(shadowFrame.shadowDataBuffer.info.pMappedData, &_shadowData, sizeof(GPUShadowData));
+    VK_CHECK(vmaFlushAllocation(
+        engine._allocator,
+        shadowFrame.shadowDataBuffer.allocation,
+        0,
+        sizeof(GPUShadowData)));
 
-    if (!_enabled || directionalLight.colorIntensity.w <= 0.f) {
+    const bool renderDirectional = _enabled && directionalLight.colorIntensity.w > 0.f;
+    if (!renderDirectional) {
         _lastVisibleCasters.fill(0);
-        TracyPlot("ShadowPass Draw Calls", static_cast<int64_t>(passStats.drawcall_count));
-        TracyPlot("ShadowPass Triangles", static_cast<int64_t>(passStats.triangle_count));
-        return;
     }
 
-    vkutil::transition_image(
-        cmd,
-        _shadowDepthImage.image,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    if (renderDirectional) {
+        vkutil::transition_image(
+            cmd,
+            _shadowDepthImage.image,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
 
     VkRenderingAttachmentInfo depthAttachment = vkinit::depth_attachment_info(
         _shadowDepthImage.imageView,
@@ -593,9 +759,237 @@ void ShadowPass::execute(ShadowPassContext& ctx)
 
     vkCmdEndRendering(cmd);
 
+        vkutil::transition_image(
+            cmd,
+            _shadowDepthImage.image,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    }
+
+    struct PunctualFaceRender {
+        GPUSceneData sceneData{};
+        uint32_t tileIndex{0};
+    };
+
+    _punctualShadowData = {};
+    _lastPunctualShadowCount = 0;
+    _lastPunctualFaceCount = 0;
+    _lastPunctualCasterDraws = 0;
+    std::vector<PunctualFaceRender> punctualFaces;
+    punctualFaces.reserve(MAX_PUNCTUAL_SHADOW_TILES);
+
+    if (_punctualEnabled) {
+        for (const GPULight& light : ctx.lightSystem.lights()) {
+            const int lightType = static_cast<int>(light.directionType.w);
+            const bool pointLight = lightType == static_cast<int>(LightType::Point);
+            const bool spotLight = lightType == static_cast<int>(LightType::Spot);
+            if ((!pointLight && !spotLight)
+                || light.params.z < 0.f
+                || light.params.w <= 0.f) {
+                continue;
+            }
+
+            const int shadowIndex = static_cast<int>(light.params.z + 0.5f);
+            if (shadowIndex < 0
+                || shadowIndex >= static_cast<int>(MAX_PUNCTUAL_SHADOWS)) {
+                continue;
+            }
+
+            const uint32_t faceCount = pointLight ? MAX_PUNCTUAL_SHADOW_FACES : 1u;
+            if (punctualFaces.size() + faceCount > MAX_PUNCTUAL_SHADOW_TILES) {
+                break;
+            }
+
+            GPUPunctualShadow& shadow = _punctualShadowData.shadows[shadowIndex];
+            shadow.positionRange = light.positionRange;
+            shadow.params = glm::vec4(
+                static_cast<float>(faceCount),
+                _punctualNormalBias,
+                _punctualStrength,
+                1.f);
+
+            for (uint32_t faceIndex = 0; faceIndex < faceCount; faceIndex++) {
+                const uint32_t tileIndex = static_cast<uint32_t>(punctualFaces.size());
+                const VkRect2D tileRect = punctual_atlas_rect(
+                    _punctualShadowExtent,
+                    _punctualTileResolution,
+                    tileIndex);
+                GPUSceneData punctualSceneData = make_punctual_shadow_scene_data(
+                    ctx.sceneData,
+                    light,
+                    faceIndex);
+
+                shadow.lightViewProj[faceIndex] = punctualSceneData.viewproj;
+                shadow.atlasScaleOffset[faceIndex] = glm::vec4(
+                    static_cast<float>(tileRect.extent.width)
+                        / static_cast<float>(_punctualShadowExtent.width),
+                    static_cast<float>(tileRect.extent.height)
+                        / static_cast<float>(_punctualShadowExtent.height),
+                    static_cast<float>(tileRect.offset.x)
+                        / static_cast<float>(_punctualShadowExtent.width),
+                    static_cast<float>(tileRect.offset.y)
+                        / static_cast<float>(_punctualShadowExtent.height));
+
+                std::memcpy(
+                    static_cast<std::byte*>(shadowFrame.punctualSceneBuffer.info.pMappedData)
+                        + tileIndex * _punctualSceneStride,
+                    &punctualSceneData,
+                    sizeof(GPUSceneData));
+                punctualFaces.push_back(PunctualFaceRender{punctualSceneData, tileIndex});
+            }
+
+            _lastPunctualShadowCount = std::max(
+                _lastPunctualShadowCount,
+                static_cast<uint32_t>(shadowIndex + 1));
+        }
+    }
+
+    _lastPunctualFaceCount = static_cast<uint32_t>(punctualFaces.size());
+    _punctualShadowData.meta = glm::uvec4(
+        _lastPunctualShadowCount,
+        _punctualTileResolution,
+        _punctualShadowExtent.width,
+        _punctualShadowExtent.height);
+    if (!punctualFaces.empty()) {
+        VK_CHECK(vmaFlushAllocation(
+            engine._allocator,
+            shadowFrame.punctualSceneBuffer.allocation,
+            0,
+            punctualFaces.size() * _punctualSceneStride));
+    }
+    std::memcpy(
+        shadowFrame.punctualShadowDataBuffer.info.pMappedData,
+        &_punctualShadowData,
+        sizeof(GPUPunctualShadowData));
+    VK_CHECK(vmaFlushAllocation(
+        engine._allocator,
+        shadowFrame.punctualShadowDataBuffer.allocation,
+        0,
+        sizeof(GPUPunctualShadowData)));
+
+    // Clear the atlas every frame even when no punctual light currently owns a
+    // tile. This keeps the image in the descriptor-declared read-only layout.
     vkutil::transition_image(
         cmd,
-        _shadowDepthImage.image,
+        _punctualShadowDepthImage.image,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+
+    VkRenderingAttachmentInfo punctualDepthAttachment = vkinit::depth_attachment_info(
+        _punctualShadowDepthImage.imageView,
+        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    VkRenderingInfo punctualRenderInfo{};
+    punctualRenderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    punctualRenderInfo.renderArea = VkRect2D{{0, 0}, _punctualShadowExtent};
+    punctualRenderInfo.layerCount = 1;
+    punctualRenderInfo.colorAttachmentCount = 0;
+    punctualRenderInfo.pDepthAttachment = &punctualDepthAttachment;
+    vkCmdBeginRendering(cmd, &punctualRenderInfo);
+
+    for (const PunctualFaceRender& face : punctualFaces) {
+        std::vector<uint32_t> opaqueDraws;
+        opaqueDraws.reserve(drawContext.OpaqueSurfaces.size());
+        for (uint32_t drawIndex = 0; drawIndex < drawContext.OpaqueSurfaces.size(); drawIndex++) {
+            const RenderObject& renderObject = drawContext.OpaqueSurfaces[drawIndex];
+            if (!renderObject.material
+                || !renderObject.material->castsShadow
+                || renderObject.material->surface == MaterialSurface::Transparent) {
+                continue;
+            }
+            if (util::is_visible(renderObject, face.sceneData.viewproj)) {
+                opaqueDraws.push_back(drawIndex);
+            }
+        }
+
+        std::sort(opaqueDraws.begin(), opaqueDraws.end(), [&](uint32_t iA, uint32_t iB) {
+            const RenderObject& a = drawContext.OpaqueSurfaces[iA];
+            const RenderObject& b = drawContext.OpaqueSurfaces[iB];
+            return a.material == b.material
+                ? a.indexBuffer < b.indexBuffer
+                : a.material < b.material;
+        });
+
+        const VkRect2D tileRect = punctual_atlas_rect(
+            _punctualShadowExtent,
+            _punctualTileResolution,
+            face.tileIndex);
+        VkViewport viewport{};
+        viewport.x = static_cast<float>(tileRect.offset.x);
+        viewport.y = static_cast<float>(tileRect.offset.y);
+        viewport.width = static_cast<float>(tileRect.extent.width);
+        viewport.height = static_cast<float>(tileRect.extent.height);
+        viewport.minDepth = 0.f;
+        viewport.maxDepth = 1.f;
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &tileRect);
+        vkCmdSetDepthBias(
+            cmd,
+            -_punctualRasterConstantBias,
+            0.f,
+            -_punctualRasterSlopeBias);
+
+        MaterialPipeline* lastPipeline = nullptr;
+        VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
+        for (uint32_t drawIndex : opaqueDraws) {
+            const RenderObject& renderObject = drawContext.OpaqueSurfaces[drawIndex];
+            MaterialPipeline* pipeline = engine.pipelineRegistry.get_material_pipeline(
+                RenderPassType::ShadowDepth,
+                *renderObject.material);
+            if (!pipeline) {
+                if (renderObject.material->surface != MaterialSurface::Opaque) {
+                    continue;
+                }
+                pipeline = _opaquePipeline;
+            }
+            if (!pipeline) {
+                continue;
+            }
+
+            if (pipeline != lastPipeline) {
+                lastPipeline = pipeline;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
+                VkDescriptorSet descriptorSets[] = {
+                    shadowFrame.punctualSceneDescriptors[face.tileIndex],
+                    engine._bindlessDescriptorSet,
+                };
+                vkCmdBindDescriptorSets(
+                    cmd,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    pipeline->layout,
+                    0,
+                    2,
+                    descriptorSets,
+                    0,
+                    nullptr);
+            }
+
+            if (renderObject.indexBuffer != lastIndexBuffer) {
+                lastIndexBuffer = renderObject.indexBuffer;
+                vkCmdBindIndexBuffer(cmd, renderObject.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            }
+
+            GPUDrawPushConstants pushConstants{};
+            pushConstants.worldMatrix = renderObject.transform;
+            pushConstants.vertexBuffer = renderObject.vertexBufferAddress;
+            pushConstants.materialID = renderObject.material->materialID;
+            vkCmdPushConstants(
+                cmd,
+                pipeline->layout,
+                VK_SHADER_STAGE_VERTEX_BIT,
+                0,
+                sizeof(GPUDrawPushConstants),
+                &pushConstants);
+            vkCmdDrawIndexed(cmd, renderObject.indexCount, 1, renderObject.firstIndex, 0, 0);
+            passStats.drawcall_count++;
+            passStats.triangle_count += renderObject.indexCount / 3;
+            _lastPunctualCasterDraws++;
+        }
+    }
+
+    vkCmdEndRendering(cmd);
+    vkutil::transition_image(
+        cmd,
+        _punctualShadowDepthImage.image,
         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 
@@ -632,6 +1026,23 @@ void ShadowPass::draw_debug_ui()
         ImGui::SliderInt("PCF radius", &_pcfKernelRadii[cascadeIndex], 0, 3);
         ImGui::PopID();
     }
+
+    ImGui::SeparatorText("Punctual Shadows");
+    ImGui::Checkbox("Punctual enabled", &_punctualEnabled);
+    ImGui::SliderFloat("Punctual normal bias", &_punctualNormalBias, 0.f, 0.2f, "%.4f");
+    ImGui::SliderFloat("Punctual raster constant bias", &_punctualRasterConstantBias, 0.f, 5.f, "%.2f");
+    ImGui::SliderFloat("Punctual raster slope bias", &_punctualRasterSlopeBias, 0.f, 5.f, "%.2f");
+    ImGui::SliderFloat("Punctual strength", &_punctualStrength, 0.f, 1.f, "%.2f");
+    ImGui::Text(
+        "Atlas: %ux%u, tile %u, shadows %u/%u, faces %u/%u",
+        _punctualShadowExtent.width,
+        _punctualShadowExtent.height,
+        _punctualTileResolution,
+        _lastPunctualShadowCount,
+        MAX_PUNCTUAL_SHADOWS,
+        _lastPunctualFaceCount,
+        MAX_PUNCTUAL_SHADOW_TILES);
+    ImGui::Text("Punctual caster draws: %u", _lastPunctualCasterDraws);
 
     ImGui::End();
 }

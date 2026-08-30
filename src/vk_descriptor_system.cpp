@@ -21,6 +21,7 @@ void DescriptorSystem::init(VkDevice device, uint32_t frameOverlap)
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16},
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
     };
     _persistentAllocator.init(_device, 64, persistentSizes);
 
@@ -121,6 +122,25 @@ void DescriptorSystem::write_image_array(
     writer.update_set(_device, set);
 }
 
+void DescriptorSystem::write_acceleration_structure(
+    VkDescriptorSet set,
+    uint32_t binding,
+    VkAccelerationStructureKHR accelerationStructure)
+{
+    VkWriteDescriptorSetAccelerationStructureKHR accelerationStructureInfo{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    accelerationStructureInfo.accelerationStructureCount = 1;
+    accelerationStructureInfo.pAccelerationStructures = &accelerationStructure;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.pNext = &accelerationStructureInfo;
+    write.dstSet = set;
+    write.dstBinding = binding;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    vkUpdateDescriptorSets(_device, 1, &write, 0, nullptr);
+}
+
 void DescriptorSystem::create_layouts()
 {
     {
@@ -155,13 +175,17 @@ void DescriptorSystem::create_layouts()
         builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         _layouts[layout_index(DescriptorLayoutID::LightData)] =
-            builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT);
+            builder.build(
+                _device,
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
     }
 
     {
         DescriptorLayoutBuilder builder;
         builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        builder.add_binding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         _layouts[layout_index(DescriptorLayoutID::ShadowInput)] =
             builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT);
     }
@@ -177,6 +201,19 @@ void DescriptorSystem::create_layouts()
 
     {
         DescriptorLayoutBuilder builder;
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        builder.add_binding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        _layouts[layout_index(DescriptorLayoutID::DDGIProbeBlendRTXGI)] =
+            builder.build(_device, VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    {
+        DescriptorLayoutBuilder builder;
         builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         _layouts[layout_index(DescriptorLayoutID::ContactShadowInput)] =
             builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -184,10 +221,33 @@ void DescriptorSystem::create_layouts()
 
     {
         DescriptorLayoutBuilder builder;
-        builder.add_binding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+        builder.add_binding(1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        builder.add_binding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        builder.add_binding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        builder.add_binding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        _layouts[layout_index(DescriptorLayoutID::DDGIProbeTrace)] =
+            builder.build(_device, VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    {
+        DescriptorLayoutBuilder builder;
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        builder.add_binding(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        builder.add_binding(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        _layouts[layout_index(DescriptorLayoutID::DDGIProbeBlend)] =
+            builder.build(_device, VK_SHADER_STAGE_COMPUTE_BIT);
+    }
+
+    {
+        DescriptorLayoutBuilder builder;
+        builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-        builder.add_binding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         _layouts[layout_index(DescriptorLayoutID::GIInput)] =
             builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
     }

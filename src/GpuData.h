@@ -8,6 +8,9 @@
 
 constexpr uint32_t MAX_GPU_LIGHTS = 256;
 constexpr uint32_t SHADOW_CASCADE_COUNT = 4;
+constexpr uint32_t MAX_PUNCTUAL_SHADOWS = 16;
+constexpr uint32_t MAX_PUNCTUAL_SHADOW_FACES = 6;
+constexpr uint32_t MAX_PUNCTUAL_SHADOW_TILES = 64;
 
 struct GPUSceneData {
     glm::mat4 view;
@@ -54,6 +57,19 @@ struct GPUShadowData {
     glm::vec4 params; // bias in shadow texels, strength, texelSize, enabled
 };
 
+struct GPUPunctualShadow {
+    glm::mat4 lightViewProj[MAX_PUNCTUAL_SHADOW_FACES];
+    glm::vec4 atlasScaleOffset[MAX_PUNCTUAL_SHADOW_FACES];
+    glm::vec4 positionRange;
+    glm::vec4 params; // x = face count, y = normal bias, z = strength, w = enabled
+};
+
+struct GPUPunctualShadowData {
+    // x = active shadow count, y = tile resolution, z/w = atlas width/height.
+    glm::uvec4 meta{};
+    GPUPunctualShadow shadows[MAX_PUNCTUAL_SHADOWS]{};
+};
+
 struct GPULightData {
     uint32_t lightCount{0};
     uint32_t directionalLightCount{0};
@@ -71,3 +87,5 @@ static_assert(offsetof(GPULight, areaRight) == 64);
 static_assert(offsetof(GPULight, areaUp) == 80);
 static_assert(sizeof(GPULightData) == 48);
 static_assert(offsetof(GPULightData, ambientColor) == 32);
+static_assert(sizeof(GPUPunctualShadow) == 512);
+static_assert(offsetof(GPUPunctualShadowData, shadows) == 16);

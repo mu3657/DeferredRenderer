@@ -59,6 +59,7 @@ private:
     // Sub-panel drawing helpers
     void draw_outliner(VulkanEngine& engine);
     void draw_properties(VulkanEngine& engine);
+    void draw_light_gizmo(VulkanEngine& engine);
     void draw_gizmo(VulkanEngine& engine);
 
     // Recursive builder helper

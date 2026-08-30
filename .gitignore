@@ -67,7 +67,9 @@ Thumbs.db
 # Project specific
 /assets/
 /assets/brickadia
-third_party/
+third_party/*
+!third_party/rtxgi-ddgi/
+!third_party/rtxgi-ddgi/**
 *.rdc
 *.resolved
 DESCRIPTOR_SYSTEM.md

@@ -22,6 +22,12 @@
 #include "vk_scene.h"
 #include "vk_outliner.h"
 #include "Renderpasses/shadow_pass.h"
+#include "GlobalilluminationStructure/ray_tracing_scene.h"
+#include "GlobalilluminationStructure/ddgi_volume.h"
+#include "Renderpasses/ddgi_probe_trace_pass.h"
+#include "Renderpasses/ddgi_probe_blend_pass.h"
+#include "Renderpasses/ddgi_probe_debug_pass.h"
+#include "Renderpasses/tone_map_pass.h"
 
 #if defined(_WIN32)
 	#define WIN32_LEAN_AND_MEAN
@@ -146,6 +152,11 @@ struct GLTFMetallic_Roughness {
 		// 调整 padding 以保证正确的字节对齐 (比如满足 256 字节)
 		glm::vec4 extra[12];
 	};
+	static_assert(sizeof(MaterialConstants) == 272);
+	static_assert(offsetof(MaterialConstants, colorFactors) == 0);
+	static_assert(offsetof(MaterialConstants, colorTexID) == 48);
+	static_assert(offsetof(MaterialConstants, emissiveTexID) == 64);
+	static_assert(offsetof(MaterialConstants, extra) == 80);
 
 	struct MaterialResources {
 		AllocatedImage colorImage;
@@ -228,6 +239,12 @@ public:
 	DescriptorSystem _descriptorSystem;
 	PipelineRegistry pipelineRegistry;
 	LightSystem lightSystem;
+	RayTracingScene rayTracingScene;
+	DDGIVolume ddgiVolume;
+	DDGIProbeTracePass ddgiProbeTracePass;
+	DDGIProbeBlendPass ddgiProbeBlendPass;
+	DDGIProbeDebugPass ddgiProbeDebugPass;
+	ToneMapPass toneMapPass;
 	GeometryPass geometryPass;
     ShadowPass shadowPass;
     ContactShadowPass contactShadowPass;
@@ -343,6 +360,13 @@ public:
 	bool load_scene_from_path(const std::string& path);
 	void set_active_scene(const std::string& sceneName);
 private:
+	std::unordered_map<const MeshAsset*, uint32_t> _rayTracingBLASIndices;
+	std::vector<RayTracingInstanceDesc> _lastRayTracingInstances;
+	bool _rayTracingBuildCompletionLogged{false};
+	bool _frameFenceTimeoutWarningPrinted{false};
+
+	void rebuild_ray_tracing_scene(const LoadedScene& scene);
+	void sync_ray_tracing_instances();
 	void init_vulkan();
 	void draw_imgui(VkCommandBuffer cmd, VkImageView targetImageView);
 	void draw_scene_browser();

@@ -1,0 +1,739 @@
+#version 460
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform DDGIProbeTracePushConstants {
+    uint traceMode;
+    uint materialCount;
+    uint flags;
+    float multiBounceStrength;
+} pushConstants;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT sceneAccelerationStructure;
+
+layout(std140, set = 0, binding = 1) uniform DDGIVolumeConstants {
+    vec4 originMaxRayDistance;
+    vec4 spacingHysteresis;
+    uvec4 probeCountsRaysPerProbe;
+    vec4 biasAndEncoding;
+    vec4 blendThresholds;
+    uvec4 texelsAndUpdate;
+    ivec4 scrollOffsets;
+    vec4 rayRotation;
+    uvec4 frameAndFlags;
+} volume;
+
+layout(rgba32f, set = 0, binding = 2) uniform writeonly image2DArray rayData;
+layout(set = 0, binding = 5) uniform sampler2DArray irradianceAtlas;
+layout(set = 0, binding = 6) uniform sampler2DArray distanceAtlas;
+layout(std430, set = 0, binding = 7) buffer DDGITraceDiagnostics {
+    uint rayCount;
+    uint nonZeroRadianceRays;
+    uint frontFaceHits;
+    uint backFaceHits;
+    uint missCount;
+    uint nonFiniteRays;
+    uint maxRadianceBits;
+    uint irradianceTexelCount;
+    uint nonZeroIrradianceTexels;
+    uint nonFiniteIrradianceTexels;
+    uint maxIrradianceBits;
+    uint reserved0;
+    uvec4 reserved1;
+} diagnostics;
+
+struct Vertex {
+    vec3 position;
+    float uv_x;
+    vec3 normal;
+    float uv_y;
+    vec4 color;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer VertexBuffer {
+    Vertex vertices[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer IndexBuffer {
+    uint indices[];
+};
+
+struct RayTracingGeometry {
+    VertexBuffer vertexBuffer;
+    IndexBuffer indexBuffer;
+    uint firstIndex;
+    uint indexCount;
+    uint vertexStride;
+    uint materialID;
+    uint flags;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer GeometryMetadata {
+    RayTracingGeometry geometries[];
+};
+
+struct RayTracingInstance {
+    uint geometryMetadataOffset;
+    uint instanceID;
+    uint flags;
+    uint padding;
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer InstanceMetadata {
+    RayTracingInstance instances[];
+};
+
+struct MaterialData {
+    vec4 colorFactors;
+    vec4 metal_rough_factors;
+    vec4 emissive_factors;
+    uint colorTexID;
+    uint metalRoughTexID;
+    uint normalTexID;
+    uint occlusionTexID;
+    uint emissiveTexID;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    vec4 extra[12];
+};
+
+layout(std430, set = 1, binding = 0) readonly buffer MaterialStorage {
+    MaterialData materials[];
+};
+layout(set = 1, binding = 1) uniform sampler2D globalTextures[];
+
+struct GPULight {
+    vec4 positionRange;
+    vec4 directionType;
+    vec4 colorIntensity;
+    vec4 params;
+    vec4 areaRight;
+    vec4 areaUp;
+};
+
+layout(std140, set = 2, binding = 0) uniform LightData {
+    uint lightCount;
+    uint directionalLightCount;
+    uint pointLightCount;
+    uint spotLightCount;
+    uint rectAreaLightCount;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+    vec4 ambientColor;
+} lightData;
+
+layout(std430, set = 2, binding = 1) readonly buffer LightStorage {
+    GPULight lights[];
+};
+
+const uint GEOMETRY_ALPHA_TESTED = 1u << 0;
+const uint LIGHT_TYPE_POINT = 0u;
+const uint LIGHT_TYPE_DIRECTIONAL = 1u;
+const uint LIGHT_TYPE_SPOT = 2u;
+const uint LIGHT_TYPE_RECT_AREA = 3u;
+const uint TRACE_FLAG_MULTI_BOUNCE = 1u << 0;
+const uint TRACE_FLAG_SIGNED_BACKFACE_DISTANCE = 1u << 1;
+const float PI = 3.14159265358979323846;
+const float GOLDEN_ANGLE = 2.39996322972865332;
+
+struct TriangleSample {
+    vec3 position0;
+    vec3 position1;
+    vec3 position2;
+    vec3 normal;
+    vec2 uv;
+    uint materialID;
+};
+
+TriangleSample load_triangle_sample(
+    uint instanceCustomIndex,
+    uint geometryIndex,
+    uint primitiveIndex,
+    vec2 barycentrics)
+{
+    RayTracingInstance instance = instances[instanceCustomIndex];
+    RayTracingGeometry geometry =
+        geometries[instance.geometryMetadataOffset + geometryIndex];
+    uint indexOffset = geometry.firstIndex + primitiveIndex * 3u;
+    uvec3 triangleIndices = uvec3(
+        geometry.indexBuffer.indices[indexOffset + 0u],
+        geometry.indexBuffer.indices[indexOffset + 1u],
+        geometry.indexBuffer.indices[indexOffset + 2u]);
+    Vertex v0 = geometry.vertexBuffer.vertices[triangleIndices.x];
+    Vertex v1 = geometry.vertexBuffer.vertices[triangleIndices.y];
+    Vertex v2 = geometry.vertexBuffer.vertices[triangleIndices.z];
+
+    vec3 bary = vec3(
+        1.0 - barycentrics.x - barycentrics.y,
+        barycentrics.x,
+        barycentrics.y);
+
+    TriangleSample result;
+    result.position0 = v0.position;
+    result.position1 = v1.position;
+    result.position2 = v2.position;
+    result.normal = normalize(v0.normal * bary.x + v1.normal * bary.y + v2.normal * bary.z);
+    result.uv = vec2(v0.uv_x, v0.uv_y) * bary.x
+        + vec2(v1.uv_x, v1.uv_y) * bary.y
+        + vec2(v2.uv_x, v2.uv_y) * bary.z;
+    result.materialID = geometry.materialID;
+    return result;
+}
+
+bool candidate_passes_alpha_test(
+    uint instanceIndex,
+    uint geometryIndex,
+    uint primitiveIndex,
+    vec2 barycentrics)
+{
+    RayTracingInstance instance = instances[instanceIndex];
+    RayTracingGeometry geometry =
+        geometries[instance.geometryMetadataOffset + geometryIndex];
+    if ((geometry.flags & GEOMETRY_ALPHA_TESTED) == 0u) {
+        return true;
+    }
+
+    TriangleSample hit = load_triangle_sample(
+        instanceIndex,
+        geometryIndex,
+        primitiveIndex,
+        barycentrics);
+    if (hit.materialID >= pushConstants.materialCount) {
+        return true;
+    }
+    MaterialData material = materials[hit.materialID];
+    float alpha = textureLod(
+        globalTextures[nonuniformEXT(material.colorTexID)], hit.uv, 0.0).a
+        * material.colorFactors.a;
+    return alpha >= clamp(material.emissive_factors.w, 0.0, 1.0);
+}
+
+vec3 rotate_by_quaternion(vec3 direction, vec4 quaternion)
+{
+    vec3 q = quaternion.xyz;
+    return direction + 2.0 * cross(q, cross(q, direction) + quaternion.w * direction);
+}
+
+vec3 fibonacci_direction(uint rayIndex, uint rayCount)
+{
+    float index = float(rayIndex) + 0.5;
+    float z = 1.0 - 2.0 * index / float(rayCount);
+    float radius = sqrt(max(0.0, 1.0 - z * z));
+    float phi = GOLDEN_ANGLE * index;
+    return vec3(cos(phi) * radius, sin(phi) * radius, z);
+}
+
+uvec3 probe_coordinates(uint probeIndex)
+{
+    uvec3 counts = volume.probeCountsRaysPerProbe.xyz;
+    uint planeSize = counts.x * counts.y;
+    return uvec3(
+        probeIndex % counts.x,
+        (probeIndex / counts.x) % counts.y,
+        probeIndex / planeSize);
+}
+
+vec3 probe_world_position(uint probeIndex)
+{
+    ivec3 coordinates = ivec3(probe_coordinates(probeIndex)) + volume.scrollOffsets.xyz;
+    return volume.originMaxRayDistance.xyz
+        + vec3(coordinates) * volume.spacingHysteresis.xyz;
+}
+
+vec3 probe_world_position(uvec3 coordinates)
+{
+    ivec3 scrolledCoordinates = ivec3(coordinates) + volume.scrollOffsets.xyz;
+    return volume.originMaxRayDistance.xyz
+        + vec3(scrolledCoordinates) * volume.spacingHysteresis.xyz;
+}
+
+uint probe_index(uvec3 coordinates)
+{
+    uvec3 counts = volume.probeCountsRaysPerProbe.xyz;
+    return coordinates.x
+        + coordinates.y * counts.x
+        + coordinates.z * counts.x * counts.y;
+}
+
+vec2 sign_not_zero(vec2 value)
+{
+    return vec2(
+        value.x >= 0.0 ? 1.0 : -1.0,
+        value.y >= 0.0 ? 1.0 : -1.0);
+}
+
+vec2 octahedral_encode(vec3 direction)
+{
+    direction /= max(
+        abs(direction.x) + abs(direction.y) + abs(direction.z),
+        1e-6);
+    vec2 encoded = direction.xy;
+    if (direction.z < 0.0) {
+        encoded = (vec2(1.0) - abs(encoded.yx))
+            * sign_not_zero(encoded);
+    }
+    return encoded;
+}
+
+uvec3 probe_texture_coordinates(uint probeIndex)
+{
+    uvec3 coordinates = probe_coordinates(probeIndex);
+    return uvec3(coordinates.x, coordinates.z, coordinates.y);
+}
+
+ivec3 ray_data_texel(uint rayIndex, uint probeIndex)
+{
+    uvec3 coordinates = probe_texture_coordinates(probeIndex);
+    uint row = coordinates.x
+        + coordinates.y * volume.probeCountsRaysPerProbe.x;
+    return ivec3(int(rayIndex), int(row), int(coordinates.z));
+}
+
+vec3 atlas_uv(
+    uint probeIndex,
+    vec3 direction,
+    uint interiorTexels,
+    ivec3 atlasSize)
+{
+    uint tileTexels = interiorTexels + 2u;
+    uvec3 textureCoordinates = probe_texture_coordinates(probeIndex);
+    uvec2 tileCoordinates = textureCoordinates.xy;
+    vec2 octahedral = octahedral_encode(normalize(direction));
+    vec2 atlasTexel = vec2(tileCoordinates * tileTexels)
+        + vec2(1.0)
+        + (octahedral * 0.5 + 0.5) * float(interiorTexels);
+    return vec3(atlasTexel / vec2(atlasSize.xy), float(textureCoordinates.z));
+}
+
+vec3 sample_probe_irradiance(uint probeIndex, vec3 normal)
+{
+    vec3 uv = atlas_uv(
+        probeIndex,
+        normal,
+        volume.texelsAndUpdate.x,
+        textureSize(irradianceAtlas, 0));
+    vec3 encoded = max(textureLod(irradianceAtlas, uv, 0.0).rgb, vec3(0.0));
+    float encodingGamma = max(volume.biasAndEncoding.z, 1e-3);
+    return pow(encoded, vec3(encodingGamma * 0.5));
+}
+
+vec2 sample_probe_visibility(
+    uint probeIndex,
+    vec3 probePosition,
+    vec3 surfacePosition)
+{
+    vec3 probeToSurface = surfacePosition - probePosition;
+    float surfaceDistance = length(probeToSurface);
+    if (surfaceDistance <= 1e-5) {
+        return vec2(1.0);
+    }
+
+    vec3 uv = atlas_uv(
+        probeIndex,
+        probeToSurface,
+        volume.texelsAndUpdate.y,
+        textureSize(distanceAtlas, 0));
+    vec2 moments = 2.0 * textureLod(distanceAtlas, uv, 0.0).rg;
+    if (moments.x <= 0.0 || any(isnan(moments)) || any(isinf(moments))) {
+        return vec2(0.0);
+    }
+    if (surfaceDistance <= moments.x) {
+        return vec2(1.0);
+    }
+
+    float variance = max(moments.y - moments.x * moments.x, 1e-5);
+    float delta = surfaceDistance - moments.x;
+    float chebyshev = variance / (variance + delta * delta);
+    return vec2(pow(clamp(chebyshev, 0.0, 1.0), 3.0), 1.0);
+}
+
+// xyz is irradiance from the previous atlas update, w is the fraction of
+// trilinear support backed by valid distance history.
+vec4 sample_previous_ddgi(
+    vec3 worldPosition,
+    vec3 normal,
+    vec3 directionToProbe)
+{
+    vec3 biasedPosition = worldPosition
+        + normal * volume.biasAndEncoding.x
+        + directionToProbe * volume.biasAndEncoding.y;
+    vec3 coordinates =
+        (biasedPosition - volume.originMaxRayDistance.xyz)
+        / volume.spacingHysteresis.xyz
+        - vec3(volume.scrollOffsets.xyz);
+    vec3 maximumCoordinates = vec3(
+        volume.probeCountsRaysPerProbe.xyz - uvec3(1u));
+    if (any(lessThan(coordinates, vec3(-0.5)))
+        || any(greaterThan(coordinates, maximumCoordinates + vec3(0.5)))) {
+        return vec4(0.0);
+    }
+
+    coordinates = clamp(coordinates, vec3(0.0), maximumCoordinates);
+    ivec3 baseCoordinates = ivec3(floor(coordinates));
+    vec3 alpha = fract(coordinates);
+    vec3 irradiance = vec3(0.0);
+    float irradianceWeight = 0.0;
+    float validWeight = 0.0;
+    float trilinearWeightSum = 0.0;
+
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        ivec3 offset = ivec3(
+            int(corner & 1u),
+            int((corner >> 1u) & 1u),
+            int((corner >> 2u) & 1u));
+        ivec3 cornerCoordinates = clamp(
+            baseCoordinates + offset,
+            ivec3(0),
+            ivec3(volume.probeCountsRaysPerProbe.xyz) - ivec3(1));
+
+        vec3 cornerWeight = max(
+            vec3(0.001),
+            mix(vec3(1.0) - alpha, alpha, vec3(offset)));
+        float trilinearWeight =
+            cornerWeight.x * cornerWeight.y * cornerWeight.z;
+
+        uvec3 coordinatesU = uvec3(cornerCoordinates);
+        uint probeIndex = probe_index(coordinatesU);
+        vec3 probePosition = probe_world_position(coordinatesU);
+        vec2 visibilityAndValidity = sample_probe_visibility(
+            probeIndex,
+            probePosition,
+            biasedPosition);
+        vec3 worldPositionToProbe = normalize(probePosition - worldPosition);
+        float wrapShading = (dot(worldPositionToProbe, normal) + 1.0) * 0.5;
+        float sampleWeight = (wrapShading * wrapShading) + 0.2;
+        sampleWeight *= max(0.05, visibilityAndValidity.x);
+        sampleWeight = max(sampleWeight, 1e-6);
+        if (sampleWeight < 0.2) {
+            sampleWeight *= sampleWeight * sampleWeight * 25.0;
+        }
+        sampleWeight *= trilinearWeight;
+        irradiance += sample_probe_irradiance(probeIndex, normal) * sampleWeight;
+        irradianceWeight += sampleWeight;
+        validWeight += trilinearWeight * visibilityAndValidity.y;
+        trilinearWeightSum += trilinearWeight;
+    }
+
+    if (irradianceWeight > 1e-5) {
+        irradiance /= irradianceWeight;
+        irradiance *= irradiance;
+        irradiance *= 2.0 * PI;
+    }
+    if (any(isnan(irradiance)) || any(isinf(irradiance))) {
+        irradiance = vec3(0.0);
+    }
+    float confidence = validWeight / max(trilinearWeightSum, 1e-5);
+    return vec4(max(irradiance, vec3(0.0)), clamp(confidence, 0.0, 1.0));
+}
+
+bool trace_visibility(vec3 origin, vec3 direction, float maxDistance)
+{
+    if (maxDistance <= 0.002) {
+        return true;
+    }
+
+    rayQueryEXT shadowQuery;
+    rayQueryInitializeEXT(
+        shadowQuery,
+        sceneAccelerationStructure,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        0xff,
+        origin,
+        0.001,
+        direction,
+        maxDistance);
+    while (rayQueryProceedEXT(shadowQuery)) {
+        if (rayQueryGetIntersectionTypeEXT(shadowQuery, false)
+            == gl_RayQueryCandidateIntersectionTriangleEXT
+            && candidate_passes_alpha_test(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(shadowQuery, false),
+                rayQueryGetIntersectionGeometryIndexEXT(shadowQuery, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(shadowQuery, false),
+                rayQueryGetIntersectionBarycentricsEXT(shadowQuery, false))) {
+            rayQueryConfirmIntersectionEXT(shadowQuery);
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(shadowQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+vec3 evaluate_direct_diffuse(
+    vec3 worldPosition,
+    vec3 worldNormal,
+    vec3 albedo,
+    float metallic,
+    uint randomSeed,
+    bool traceShadow)
+{
+    uint availableLightCount = lightData.lightCount;
+    if (availableLightCount == 0u) {
+        return vec3(0.0);
+    }
+
+    // PCG hash. Selecting one light keeps visibility cost at one secondary ray
+    // per probe ray; multiplying by the selection domain preserves expectation.
+    uint state = randomSeed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    uint hashed = (word >> 22u) ^ word;
+    uint lightIndex = hashed % availableLightCount;
+
+    GPULight light = lights[lightIndex];
+    uint lightType = uint(light.directionType.w + 0.5);
+    vec3 directionToLight;
+    vec3 incidentRadiance = light.colorIntensity.rgb * light.colorIntensity.w;
+    float shadowDistance = volume.originMaxRayDistance.w;
+
+    if (lightType == LIGHT_TYPE_DIRECTIONAL) {
+        directionToLight = normalize(-light.directionType.xyz);
+    } else {
+        vec3 lightPosition = light.positionRange.xyz;
+        if (lightType == LIGHT_TYPE_RECT_AREA) {
+            uint areaHash = hashed * 1664525u + 1013904223u;
+            vec2 areaSample = vec2(
+                float(areaHash & 0xffffu),
+                float(areaHash >> 16u)) / 65535.0;
+            lightPosition += light.areaRight.xyz * light.areaRight.w
+                    * (areaSample.x * 2.0 - 1.0)
+                + light.areaUp.xyz * light.areaUp.w
+                    * (areaSample.y * 2.0 - 1.0);
+        }
+
+        vec3 toLight = lightPosition - worldPosition;
+        float distanceToLight = length(toLight);
+        float range = max(light.positionRange.w, 0.001);
+        if (distanceToLight <= 0.001 || distanceToLight >= range) {
+            return vec3(0.0);
+        }
+        directionToLight = toLight / distanceToLight;
+        shadowDistance = max(distanceToLight - 0.002, 0.001);
+        float normalizedDistance = distanceToLight / range;
+        float rangeFalloff = clamp(1.0 - pow(normalizedDistance, 4.0), 0.0, 1.0);
+        incidentRadiance *= rangeFalloff * rangeFalloff
+            / max(distanceToLight * distanceToLight, 0.01);
+
+        if (lightType == LIGHT_TYPE_SPOT) {
+            float coneCosine = dot(normalize(light.directionType.xyz), -directionToLight);
+            incidentRadiance *= smoothstep(light.params.y, light.params.x, coneCosine);
+        } else if (lightType == LIGHT_TYPE_RECT_AREA) {
+            incidentRadiance *= max(
+                4.0 * light.areaRight.w * light.areaUp.w, 0.001);
+        }
+    }
+
+    float nDotL = max(dot(worldNormal, directionToLight), 0.0);
+    if (nDotL <= 0.0) {
+        return vec3(0.0);
+    }
+    if (traceShadow) {
+        vec3 shadowOrigin = worldPosition
+            + worldNormal * max(volume.biasAndEncoding.x, 0.002);
+        if (!trace_visibility(shadowOrigin, directionToLight, shadowDistance)) {
+            return vec3(0.0);
+        }
+    }
+
+    float lightSelectionWeight = float(availableLightCount);
+    return albedo * (1.0 - metallic) * incidentRadiance
+        * (nDotL / PI) * lightSelectionWeight;
+}
+
+void main()
+{
+    uint rayIndex = gl_GlobalInvocationID.x;
+    uint updateIndex = gl_GlobalInvocationID.y;
+    uint raysPerProbe = volume.probeCountsRaysPerProbe.w;
+    uint probesToUpdate = volume.texelsAndUpdate.w;
+    if (rayIndex >= raysPerProbe || updateIndex >= probesToUpdate) {
+        return;
+    }
+
+    uint probeIndex = volume.texelsAndUpdate.z + updateIndex;
+    vec3 rayOrigin = probe_world_position(probeIndex);
+    vec3 rayDirection = normalize(rotate_by_quaternion(
+        fibonacci_direction(rayIndex, raysPerProbe), volume.rayRotation));
+    float maxRayDistance = volume.originMaxRayDistance.w;
+
+    rayQueryEXT query;
+    rayQueryInitializeEXT(
+        query,
+        sceneAccelerationStructure,
+        gl_RayFlagsSkipClosestHitShaderEXT,
+        0xff,
+        rayOrigin,
+        0.01,
+        rayDirection,
+        maxRayDistance);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false)
+            == gl_RayQueryCandidateIntersectionTriangleEXT
+            && candidate_passes_alpha_test(
+                rayQueryGetIntersectionInstanceCustomIndexEXT(query, false),
+                rayQueryGetIntersectionGeometryIndexEXT(query, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
+                rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+            rayQueryConfirmIntersectionEXT(query);
+        }
+    }
+
+    bool materialDiagnostic = pushConstants.traceMode >= 6u
+        && pushConstants.traceMode <= 10u;
+    // Material diagnostics only visualize committed front-face hits. Keeping
+    // misses and back faces black prevents environment lighting from being
+    // mistaken for data read from the material buffer.
+    vec3 radiance = materialDiagnostic
+        ? vec3(0.0)
+        : lightData.ambientColor.rgb;
+    float signedDistance = maxRayDistance;
+    bool hasHit = rayQueryGetIntersectionTypeEXT(query, true)
+        == gl_RayQueryCommittedIntersectionTriangleEXT;
+    bool frontFace = false;
+    if (hasHit) {
+        float hitDistance = rayQueryGetIntersectionTEXT(query, true);
+        frontFace = rayQueryGetIntersectionFrontFaceEXT(query, true);
+        // RTXGI's official irradiance blend rejects the entire probe once the
+        // number of negative distances reaches its backface threshold. Until
+        // relocation/classification is active this can leave dense indoor
+        // scenes permanently black, because rejected probes never establish
+        // history. Backface radiance remains zero below; keep distance positive
+        // by default so valid front-face and miss samples can still initialize
+        // the probe. Signed distances remain available as an explicit debug
+        // option and for the future relocation/classification path.
+        bool preserveBackfaceSign =
+            (pushConstants.flags & TRACE_FLAG_SIGNED_BACKFACE_DISTANCE) != 0u;
+        signedDistance = frontFace || !preserveBackfaceSign
+            ? hitDistance
+            : -hitDistance;
+
+        if (pushConstants.traceMode == 4u) {
+            // Bypass hit shading entirely to validate ray-data, blend, atlas,
+            // and deferred sampling as one continuous path.
+            radiance = vec3(1.0);
+        } else if (pushConstants.traceMode == 5u) {
+            // Green front faces and red back faces expose winding and probe
+            // placement problems without depending on materials or lights.
+            radiance = frontFace ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        } else if (frontFace && pushConstants.traceMode > 0u) {
+            uint instanceIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+            uint geometryIndex = rayQueryGetIntersectionGeometryIndexEXT(query, true);
+            TriangleSample hit = load_triangle_sample(
+                instanceIndex,
+                geometryIndex,
+                rayQueryGetIntersectionPrimitiveIndexEXT(query, true),
+                rayQueryGetIntersectionBarycentricsEXT(query, true));
+
+            mat4x3 objectToWorld = rayQueryGetIntersectionObjectToWorldEXT(query, true);
+            vec3 worldP0 = objectToWorld * vec4(hit.position0, 1.0);
+            vec3 worldP1 = objectToWorld * vec4(hit.position1, 1.0);
+            vec3 worldP2 = objectToWorld * vec4(hit.position2, 1.0);
+            mat4x3 worldToObject = rayQueryGetIntersectionWorldToObjectEXT(query, true);
+            vec3 transformedNormal = transpose(mat3(worldToObject)) * hit.normal;
+            vec3 worldNormal = dot(transformedNormal, transformedNormal) > 1e-8
+                ? normalize(transformedNormal)
+                : normalize(cross(worldP1 - worldP0, worldP2 - worldP0));
+            if (dot(worldNormal, rayDirection) > 0.0) {
+                worldNormal = -worldNormal;
+            }
+            vec3 worldPosition = rayOrigin + rayDirection * hitDistance;
+
+            uint materialIndex = pushConstants.traceMode == 10u ? 0u : hit.materialID;
+            if (materialIndex >= pushConstants.materialCount) {
+                // Invalid RT geometry metadata is made unmistakable and, more
+                // importantly, never indexes outside the material buffer.
+                radiance = vec3(1.0, 0.0, 1.0);
+            } else {
+            MaterialData material = materials[materialIndex];
+            vec4 baseColorTexture = textureLod(
+                globalTextures[nonuniformEXT(material.colorTexID)], hit.uv, 0.0);
+            vec4 baseColor = baseColorTexture * material.colorFactors;
+            float metallic = clamp(
+                textureLod(
+                    globalTextures[nonuniformEXT(material.metalRoughTexID)],
+                    hit.uv,
+                    0.0).b * material.metal_rough_factors.x,
+                0.0,
+                1.0);
+            vec3 emissiveTexture = textureLod(
+                globalTextures[nonuniformEXT(material.emissiveTexID)], hit.uv, 0.0).rgb;
+            vec3 emissive = emissiveTexture * material.emissive_factors.rgb;
+            if (pushConstants.traceMode == 6u) {
+                radiance = max(material.colorFactors.rgb, vec3(0.0));
+            } else if (pushConstants.traceMode == 10u) {
+                radiance = max(material.colorFactors.rgb, vec3(0.0));
+            } else if (pushConstants.traceMode == 7u) {
+                radiance = max(baseColorTexture.rgb, vec3(0.0));
+            } else if (pushConstants.traceMode == 8u) {
+                radiance = max(emissiveTexture, vec3(0.0));
+            } else if (pushConstants.traceMode == 9u) {
+                radiance = max(textureLod(
+                    globalTextures[nonuniformEXT(material.normalTexID)], hit.uv, 0.0).rgb,
+                    vec3(0.0));
+            } else {
+                radiance = emissive + baseColor.rgb * lightData.ambientColor.rgb;
+            }
+            if (pushConstants.traceMode == 2u || pushConstants.traceMode == 3u) {
+                uint randomSeed = probeIndex * 9781u
+                    + rayIndex * 6271u
+                    + volume.frameAndFlags.x * 13007u;
+                radiance += evaluate_direct_diffuse(
+                    worldPosition,
+                    worldNormal,
+                    baseColor.rgb,
+                    metallic,
+                    randomSeed,
+                    pushConstants.traceMode == 3u);
+            }
+            if (pushConstants.traceMode == 3u
+                && (pushConstants.flags & TRACE_FLAG_MULTI_BOUNCE) != 0u) {
+                vec4 previousGI = sample_previous_ddgi(
+                    worldPosition,
+                    worldNormal,
+                    -rayDirection);
+                radiance += previousGI.rgb
+                    * baseColor.rgb
+                    * (1.0 - metallic)
+                    * (previousGI.a * clamp(pushConstants.multiBounceStrength, 0.0, 1.0) / PI);
+            }
+            }
+        } else {
+            // Negative distance is consumed by probe relocation/classification.
+            radiance = vec3(0.0);
+        }
+    } else if (pushConstants.traceMode == 4u) {
+        radiance = vec3(1.0);
+    } else if (pushConstants.traceMode == 5u) {
+        radiance = vec3(0.0, 0.2, 1.0);
+    }
+
+    bool nonFiniteRadiance = any(isnan(radiance)) || any(isinf(radiance));
+    vec3 storedRadiance = nonFiniteRadiance
+        ? vec3(0.0)
+        : max(radiance, vec3(0.0));
+    atomicAdd(diagnostics.rayCount, 1u);
+    if (any(greaterThan(storedRadiance, vec3(1e-6)))) {
+        atomicAdd(diagnostics.nonZeroRadianceRays, 1u);
+    }
+    if (nonFiniteRadiance) {
+        atomicAdd(diagnostics.nonFiniteRays, 1u);
+    }
+    if (!hasHit) {
+        atomicAdd(diagnostics.missCount, 1u);
+    } else if (frontFace) {
+        atomicAdd(diagnostics.frontFaceHits, 1u);
+    } else {
+        atomicAdd(diagnostics.backFaceHits, 1u);
+    }
+    atomicMax(
+        diagnostics.maxRadianceBits,
+        floatBitsToUint(max(storedRadiance.r, max(storedRadiance.g, storedRadiance.b))));
+
+    imageStore(rayData, ray_data_texel(rayIndex, probeIndex),
+        vec4(storedRadiance, signedDistance));
+}

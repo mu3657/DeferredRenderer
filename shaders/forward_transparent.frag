@@ -15,6 +15,7 @@ layout (location = 4) flat in uint inMaterialID;
 layout (location = 0) out vec4 outFragColor;
 
 layout(set = 3, binding = 0) uniform sampler2D shadowMap;
+layout(set = 3, binding = 2) uniform sampler2D punctualShadowMap;
 
 const int SHADOW_CASCADE_COUNT = 4;
 const float PI = 3.14159265359;
@@ -29,6 +30,21 @@ layout(set = 3, binding = 1) uniform ShadowDataBuffer {
     vec4 lightDir;
     vec4 params;
 } shadowData;
+
+const int MAX_PUNCTUAL_SHADOWS = 16;
+const int MAX_PUNCTUAL_SHADOW_FACES = 6;
+
+struct PunctualShadow {
+    mat4 lightViewProj[MAX_PUNCTUAL_SHADOW_FACES];
+    vec4 atlasScaleOffset[MAX_PUNCTUAL_SHADOW_FACES];
+    vec4 positionRange;
+    vec4 params;
+};
+
+layout(std140, set = 3, binding = 3) uniform PunctualShadowDataBuffer {
+    uvec4 meta;
+    PunctualShadow shadows[MAX_PUNCTUAL_SHADOWS];
+} punctualShadowData;
 
 struct ShadowCascadeSelection {
     int primary;
@@ -122,6 +138,77 @@ float sampleDirectionalShadow(vec3 worldPos, vec3 N, vec3 L)
         visibility = mix(visibility, nextVisibility, selection.blend);
     }
     return visibility;
+}
+
+int selectPointShadowFace(vec3 lightToSurface)
+{
+    vec3 axis = abs(lightToSurface);
+    if (axis.x >= axis.y && axis.x >= axis.z) {
+        return lightToSurface.x >= 0.0 ? 0 : 1;
+    }
+    if (axis.y >= axis.z) {
+        return lightToSurface.y >= 0.0 ? 2 : 3;
+    }
+    return lightToSurface.z >= 0.0 ? 4 : 5;
+}
+
+float samplePunctualShadow(GPULight light, uint type, vec3 worldPos, vec3 N, vec3 L)
+{
+    if (light.params.z < 0.0 || light.params.w <= 0.0) {
+        return 1.0;
+    }
+
+    int shadowIndex = int(light.params.z);
+    if (shadowIndex < 0 || shadowIndex >= int(punctualShadowData.meta.x)) {
+        return 1.0;
+    }
+
+    PunctualShadow shadow = punctualShadowData.shadows[shadowIndex];
+    if (shadow.params.w <= 0.0) {
+        return 1.0;
+    }
+
+    vec3 lightToSurface = worldPos - light.positionRange.xyz;
+    float lightDistance = length(lightToSurface);
+    if (lightDistance >= shadow.positionRange.w || lightDistance <= 1e-5) {
+        return 1.0;
+    }
+
+    int faceIndex = type == LIGHT_TYPE_POINT
+        ? selectPointShadowFace(lightToSurface)
+        : 0;
+    float ndotl = max(dot(N, L), 0.0);
+    vec3 biasedWorldPos = worldPos
+        + N * shadow.params.y * mix(2.0, 1.0, ndotl);
+    vec4 lightClip = shadow.lightViewProj[faceIndex] * vec4(biasedWorldPos, 1.0);
+    vec3 lightNdc = lightClip.xyz / lightClip.w;
+    vec2 localUV = lightNdc.xy * 0.5 + 0.5;
+    float receiverDepth = lightNdc.z;
+    if (lightClip.w <= 0.0
+        || any(lessThan(localUV, vec2(0.0)))
+        || any(greaterThan(localUV, vec2(1.0)))
+        || receiverDepth < 0.0
+        || receiverDepth > 1.0) {
+        return 1.0;
+    }
+
+    float localTexelSize = 1.0 / max(float(punctualShadowData.meta.y), 1.0);
+    vec4 atlasTransform = shadow.atlasScaleOffset[faceIndex];
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 sampleLocalUV = clamp(
+                localUV + vec2(x, y) * localTexelSize,
+                vec2(localTexelSize * 0.5),
+                vec2(1.0 - localTexelSize * 0.5));
+            vec2 atlasUV = atlasTransform.zw + sampleLocalUV * atlasTransform.xy;
+            float closestDepth = texture(punctualShadowMap, atlasUV).r;
+            visibility += receiverDepth < closestDepth ? 0.0 : 1.0;
+        }
+    }
+
+    float pcfVisibility = visibility / 9.0;
+    return mix(1.0, pcfVisibility, clamp(shadow.params.z, 0.0, 1.0));
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0)
@@ -255,6 +342,7 @@ void main()
                     1.0);
                 attenuation *= spotAttenuation * spotAttenuation;
             }
+            visibility = samplePunctualShadow(light, type, inWorldPos, N, L);
             radiance *= attenuation;
         }
 

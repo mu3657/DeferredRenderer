@@ -15,6 +15,9 @@ enum class DescriptorLayoutID : uint8_t {
     ShadowInput,
     ContactShadowCompute,
     ContactShadowInput,
+    DDGIProbeTrace,
+    DDGIProbeBlend,
+    DDGIProbeBlendRTXGI,
     GIInput,
     Count
 };
@@ -53,6 +56,11 @@ public:
         VkSampler sampler,
         VkImageLayout imageLayout,
         VkDescriptorType type);
+
+    void write_acceleration_structure(
+        VkDescriptorSet set,
+        uint32_t binding,
+        VkAccelerationStructureKHR accelerationStructure);
 
 private:
     static constexpr size_t LayoutCount = static_cast<size_t>(DescriptorLayoutID::Count);

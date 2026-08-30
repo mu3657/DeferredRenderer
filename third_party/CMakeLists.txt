@@ -13,6 +13,17 @@ add_subdirectory(fastgltf)
 add_subdirectory(fmt EXCLUDE_FROM_ALL)
 add_subdirectory(SDL EXCLUDE_FROM_ALL)
 
+# RTXGI-DDGI remains an isolated NVIDIA-licensed dependency. The renderer owns
+# the Vulkan resources and descriptors; the SDK supplies the canonical host
+# data packing, indexing, and DDGI update shaders.
+set(RTXGI_STATIC_LIB ON CACHE BOOL "" FORCE)
+set(RTXGI_API_D3D12_ENABLE OFF CACHE BOOL "" FORCE)
+set(RTXGI_API_VULKAN_ENABLE ON CACHE BOOL "" FORCE)
+set(RTXGI_COORDINATE_SYSTEM "Right Hand, Y-Up" CACHE STRING "" FORCE)
+set(RTXGI_DDGI_RESOURCE_MANAGEMENT OFF CACHE BOOL "" FORCE)
+set(RTXGI_DDGI_USE_SHADER_CONFIG_FILE OFF CACHE BOOL "" FORCE)
+add_subdirectory(rtxgi-ddgi/rtxgi-sdk EXCLUDE_FROM_ALL)
+
 target_sources(vkbootstrap PRIVATE 
   vkbootstrap/VkBootstrap.h
   vkbootstrap/VkBootstrap.cpp

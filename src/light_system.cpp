@@ -84,6 +84,9 @@ void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneDat
     _lightData = {};
     _lightData.ambientColor = sceneData.ambientColor;
 
+    uint32_t punctualShadowCount = 0;
+    uint32_t punctualShadowTileCount = 0;
+
     if (scene) {
         for (const std::weak_ptr<LightNode>& weakLight : scene->lightNodes) {
             if (_cpuLights.size() >= MAX_GPU_LIGHTS) {
@@ -107,11 +110,25 @@ void LightSystem::collect(const LoadedScene* scene, const GPUSceneData& sceneDat
             gpuLight.positionRange = glm::vec4(worldPosition, range);
             gpuLight.directionType = glm::vec4(forward, static_cast<float>(light_type_to_uint(src.type)));
             gpuLight.colorIntensity = glm::vec4(src.color, src.intensity);
+            const float outerHalfAngle = glm::radians(glm::clamp(src.spotSizeDegrees, 1.f, 179.f) * 0.5f);
+            const float innerHalfAngle = outerHalfAngle * (1.f - glm::clamp(src.spotBlend, 0.f, 1.f));
             gpuLight.params = glm::vec4(
-                std::cos(glm::radians(15.f)),
-                std::cos(glm::radians(30.f)),
+                std::cos(innerHalfAngle),
+                std::cos(outerHalfAngle),
                 -1.f,
-                1.f);
+                src.castsShadow ? 1.f : 0.f);
+
+            const bool punctual = src.type == LightType::Point || src.type == LightType::Spot;
+            const uint32_t requiredShadowTiles = src.type == LightType::Point ? 6u : 1u;
+            if (punctual
+                && src.castsShadow
+                && src.intensity > 0.f
+                && range > 0.f
+                && punctualShadowCount < MAX_PUNCTUAL_SHADOWS
+                && punctualShadowTileCount + requiredShadowTiles <= MAX_PUNCTUAL_SHADOW_TILES) {
+                gpuLight.params.z = static_cast<float>(punctualShadowCount++);
+                punctualShadowTileCount += requiredShadowTiles;
+            }
             gpuLight.areaRight = glm::vec4(right, std::max(src.width * 0.5f, 0.005f));
             gpuLight.areaUp = glm::vec4(up, std::max(src.height * 0.5f, 0.005f));
 
@@ -150,10 +167,20 @@ void LightSystem::upload_frame(FrameData& frame)
     }
 
     memcpy(frame.lightDataBuffer.info.pMappedData, &_lightData, sizeof(GPULightData));
+    VK_CHECK(vmaFlushAllocation(
+        _engine->_allocator,
+        frame.lightDataBuffer.allocation,
+        0,
+        sizeof(GPULightData)));
 
     if (!_cpuLights.empty()) {
         const size_t copySize = std::min(_cpuLights.size(), static_cast<size_t>(MAX_GPU_LIGHTS)) * sizeof(GPULight);
         memcpy(frame.lightBuffer.info.pMappedData, _cpuLights.data(), copySize);
+        VK_CHECK(vmaFlushAllocation(
+            _engine->_allocator,
+            frame.lightBuffer.allocation,
+            0,
+            copySize));
     }
 }
 

@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <unordered_map>
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/constants.hpp>
 #include <glm/gtx/matrix_decompose.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/euler_angles.hpp>
@@ -76,6 +78,72 @@ static bool name_matches_filter(const std::string& name, const char* filter) {
 static bool has_children(const std::vector<SceneNodeEntry>& entries, int index) {
     return index + 1 < static_cast<int>(entries.size()) &&
            entries[index + 1].depth > entries[index].depth;
+}
+
+static glm::vec3 normalized_or(glm::vec3 value, glm::vec3 fallback) {
+    const float lengthSquared = glm::dot(value, value);
+    if (lengthSquared < 0.000001f) {
+        return fallback;
+    }
+    return value / std::sqrt(lengthSquared);
+}
+
+static bool project_to_screen(
+    const glm::vec3& worldPosition,
+    const glm::mat4& viewProjection,
+    const ImVec2& displaySize,
+    ImVec2& screenPosition)
+{
+    const glm::vec4 clip = viewProjection * glm::vec4(worldPosition, 1.f);
+    if (clip.w <= 0.001f) {
+        return false;
+    }
+
+    const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+    screenPosition.x = (ndc.x * 0.5f + 0.5f) * displaySize.x;
+    screenPosition.y = (0.5f - ndc.y * 0.5f) * displaySize.y;
+    return true;
+}
+
+static void draw_projected_segment(
+    ImDrawList* drawList,
+    const glm::vec3& from,
+    const glm::vec3& to,
+    const glm::mat4& viewProjection,
+    const ImVec2& displaySize,
+    ImU32 color,
+    float thickness)
+{
+    ImVec2 screenFrom;
+    ImVec2 screenTo;
+    if (project_to_screen(from, viewProjection, displaySize, screenFrom)
+        && project_to_screen(to, viewProjection, displaySize, screenTo)) {
+        drawList->AddLine(screenFrom, screenTo, color, thickness);
+    }
+}
+
+static void draw_projected_dashed_segment(
+    ImDrawList* drawList,
+    const glm::vec3& from,
+    const glm::vec3& to,
+    const glm::mat4& viewProjection,
+    const ImVec2& displaySize,
+    ImU32 color,
+    float thickness)
+{
+    constexpr int dashCount = 12;
+    for (int dash = 0; dash < dashCount; dash += 2) {
+        const float begin = static_cast<float>(dash) / static_cast<float>(dashCount);
+        const float end = static_cast<float>(dash + 1) / static_cast<float>(dashCount);
+        draw_projected_segment(
+            drawList,
+            glm::mix(from, to, begin),
+            glm::mix(from, to, end),
+            viewProjection,
+            displaySize,
+            color,
+            thickness);
+    }
 }
 
 static bool has_collapsed_ancestor(const std::vector<SceneNodeEntry>& entries, int index) {
@@ -323,6 +391,7 @@ void SceneOutliner::draw(VulkanEngine& engine) {
 
     draw_outliner(engine);
     draw_properties(engine);
+    draw_light_gizmo(engine);
     draw_gizmo(engine);
 }
 
@@ -562,14 +631,161 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
             ImGui::DragFloat("Range", &ln->light.range, 0.5f, 0.f, 10000.f);
             ImGui::EndDisabled();
 
+            if (ln->light.type == LightType::Point || ln->light.type == LightType::Spot) {
+                ImGui::Checkbox("Cast Shadows", &ln->light.castsShadow);
+            }
+
             if (ln->light.type == LightType::RectArea) {
                 ImGui::DragFloat("Width", &ln->light.width, 0.05f, 0.01f, 10000.f);
                 ImGui::DragFloat("Height", &ln->light.height, 0.05f, 0.01f, 10000.f);
+            }
+
+            if (ln->light.type == LightType::Spot) {
+                ImGui::SeparatorText("Spot Shape");
+                ImGui::SliderFloat("Size", &ln->light.spotSizeDegrees, 1.f, 179.f, "%.1f deg");
+                ImGui::SliderFloat("Blend", &ln->light.spotBlend, 0.f, 1.f, "%.2f");
+                ImGui::TextDisabled("-Z axis is the emission direction");
             }
         }
     }
 
     ImGui::End();
+}
+
+// Draw a Blender-style spotlight overlay in the viewport. This is editor-only:
+// it visualizes the same transform, range, size, and blend consumed by LightSystem.
+void SceneOutliner::draw_light_gizmo(VulkanEngine& engine) {
+    auto node = get_selected_node();
+    auto* lightNode = node ? dynamic_cast<LightNode*>(node.get()) : nullptr;
+    if (!lightNode || lightNode->light.type != LightType::Spot) {
+        return;
+    }
+
+    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+    if (displaySize.x <= 0.f || displaySize.y <= 0.f) {
+        return;
+    }
+
+    const float aspect = displaySize.x / displaySize.y;
+    const glm::mat4 view = engine.mainCamera.getViewMatrix();
+    const glm::mat4 projection = glm::perspective(glm::radians(70.f), aspect, 0.1f, 10000.f);
+    const glm::mat4 viewProjection = projection * view;
+
+    const glm::mat4 world = node->worldTransform;
+    const glm::vec3 position = glm::vec3(world[3]);
+    const glm::vec3 forward = normalized_or(glm::mat3(world) * glm::vec3(0.f, 0.f, -1.f), glm::vec3(0.f, -1.f, 0.f));
+    glm::vec3 right = glm::mat3(world) * glm::vec3(1.f, 0.f, 0.f);
+    right = normalized_or(right - forward * glm::dot(right, forward), glm::vec3(1.f, 0.f, 0.f));
+    const glm::vec3 up = normalized_or(glm::cross(right, forward), glm::vec3(0.f, 1.f, 0.f));
+
+    const float range = std::max(lightNode->light.range, 0.05f);
+    const float outerHalfAngle = glm::radians(glm::clamp(lightNode->light.spotSizeDegrees, 1.f, 179.f) * 0.5f);
+    const float innerHalfAngle = outerHalfAngle * (1.f - glm::clamp(lightNode->light.spotBlend, 0.f, 1.f));
+    const float outerRadius = std::tan(outerHalfAngle) * range;
+    const float innerRadius = std::tan(innerHalfAngle) * range;
+    const glm::vec3 endCenter = position + forward * range;
+
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    const ImU32 outerColor = IM_COL32(255, 170, 45, 235);
+    const ImU32 innerColor = IM_COL32(255, 205, 105, 150);
+    const ImU32 axisColor = IM_COL32(255, 235, 180, 255);
+    constexpr int ringSegments = 32;
+
+    for (int segment = 0; segment < ringSegments; ++segment) {
+        const float angle0 = glm::two_pi<float>() * static_cast<float>(segment) / static_cast<float>(ringSegments);
+        const float angle1 = glm::two_pi<float>() * static_cast<float>(segment + 1) / static_cast<float>(ringSegments);
+        const glm::vec3 radial0 = right * std::cos(angle0) + up * std::sin(angle0);
+        const glm::vec3 radial1 = right * std::cos(angle1) + up * std::sin(angle1);
+
+        draw_projected_segment(
+            drawList,
+            endCenter + radial0 * outerRadius,
+            endCenter + radial1 * outerRadius,
+            viewProjection,
+            displaySize,
+            outerColor,
+            1.8f);
+
+        if (innerRadius > 0.001f && (segment % 2) == 0) {
+            draw_projected_segment(
+                drawList,
+                endCenter + radial0 * innerRadius,
+                endCenter + radial1 * innerRadius,
+                viewProjection,
+                displaySize,
+                innerColor,
+                1.2f);
+        }
+    }
+
+    const glm::vec3 outerCardinals[] = {
+        endCenter + right * outerRadius,
+        endCenter - right * outerRadius,
+        endCenter + up * outerRadius,
+        endCenter - up * outerRadius,
+    };
+    const glm::vec3 innerCardinals[] = {
+        endCenter + right * innerRadius,
+        endCenter - right * innerRadius,
+        endCenter + up * innerRadius,
+        endCenter - up * innerRadius,
+    };
+
+    for (int side = 0; side < 4; ++side) {
+        draw_projected_segment(
+            drawList,
+            position,
+            outerCardinals[side],
+            viewProjection,
+            displaySize,
+            outerColor,
+            1.8f);
+        if (innerRadius > 0.001f) {
+            draw_projected_dashed_segment(
+                drawList,
+                position,
+                innerCardinals[side],
+                viewProjection,
+                displaySize,
+                innerColor,
+                1.2f);
+        }
+    }
+
+    draw_projected_segment(
+        drawList,
+        position,
+        endCenter,
+        viewProjection,
+        displaySize,
+        axisColor,
+        2.5f);
+
+    ImVec2 sourceScreen;
+    ImVec2 endScreen;
+    if (project_to_screen(position, viewProjection, displaySize, sourceScreen)) {
+        drawList->AddCircleFilled(sourceScreen, 5.f, IM_COL32(25, 20, 10, 230), 16);
+        drawList->AddCircle(sourceScreen, 7.f, outerColor, 16, 2.f);
+        drawList->AddLine(ImVec2(sourceScreen.x - 10.f, sourceScreen.y), ImVec2(sourceScreen.x + 10.f, sourceScreen.y), axisColor, 1.5f);
+        drawList->AddLine(ImVec2(sourceScreen.x, sourceScreen.y - 10.f), ImVec2(sourceScreen.x, sourceScreen.y + 10.f), axisColor, 1.5f);
+    }
+
+    if (project_to_screen(position, viewProjection, displaySize, sourceScreen)
+        && project_to_screen(endCenter, viewProjection, displaySize, endScreen)) {
+        const ImVec2 delta(endScreen.x - sourceScreen.x, endScreen.y - sourceScreen.y);
+        const float length = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+        if (length > 20.f) {
+            const ImVec2 direction(delta.x / length, delta.y / length);
+            const ImVec2 perpendicular(-direction.y, direction.x);
+            const ImVec2 tip(sourceScreen.x + delta.x * 0.42f, sourceScreen.y + delta.y * 0.42f);
+            const ImVec2 base(tip.x - direction.x * 11.f, tip.y - direction.y * 11.f);
+            drawList->AddTriangleFilled(
+                tip,
+                ImVec2(base.x + perpendicular.x * 5.f, base.y + perpendicular.y * 5.f),
+                ImVec2(base.x - perpendicular.x * 5.f, base.y - perpendicular.y * 5.f),
+                axisColor);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

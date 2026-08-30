@@ -54,6 +54,23 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
     }
 
     uint32_t indexCount = meshInfo.indexBuferSize / meshInfo.indexSize;
+    if (meshInfo.indexSize != sizeof(uint32_t)
+        || (meshInfo.indexBuferSize % sizeof(uint32_t)) != 0) {
+        throw std::runtime_error(
+            fmt::format("Mesh {} does not contain tightly packed uint32 indices", path));
+    }
+
+    const auto* meshIndices = reinterpret_cast<const uint32_t*>(indexBuffer.data());
+    for (uint32_t index = 0; index < indexCount; ++index) {
+        if (meshIndices[index] >= vertexCount) {
+            throw std::out_of_range(fmt::format(
+                "Mesh {} index {} references vertex {}, but vertexCount is {}",
+                path,
+                index,
+                meshIndices[index],
+                vertexCount));
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 格式转换：baker 存的是 Vertex_f32_PNCV (44 bytes, P/N/Color3/UV 顺序)，
@@ -120,7 +137,10 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
     auto& engine = *_engine;
     newMesh->meshBuffers.vertexBuffer = engine.create_buffer(
         uploadVertexSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+            | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VMA_MEMORY_USAGE_GPU_ONLY);
 
     VkBufferDeviceAddressInfo deviceAddressInfo{ .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = newMesh->meshBuffers.vertexBuffer.buffer };
@@ -128,8 +148,16 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
 
     newMesh->meshBuffers.indexBuffer = engine.create_buffer(
         indexBufferSize,
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+            | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+            | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
         VMA_MEMORY_USAGE_GPU_ONLY);
+
+    deviceAddressInfo.buffer = newMesh->meshBuffers.indexBuffer.buffer;
+    newMesh->meshBuffers.indexBufferAddress = vkGetBufferDeviceAddress(engine._device, &deviceAddressInfo);
+    newMesh->meshBuffers.vertexCount = static_cast<uint32_t>(engineVertices.size());
+    newMesh->meshBuffers.indexCount = indexCount;
 
     AllocatedBuffer staging = engine.create_buffer(
         uploadVertexSize + indexBufferSize,
@@ -318,26 +346,26 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     std::filesystem::path exportRoot = matFolder.parent_path();
 
 
-    auto get_texture = [&](const std::string& name, AllocatedImage fallback) -> AllocatedImage {
+    auto get_texture = [&](const std::string& name, AllocatedImage fallback, bool srgb) -> AllocatedImage {
         auto it = matInfo.textures.find(name);
         if (it != matInfo.textures.end()) {
             std::string texPath = (exportRoot / it->second).lexically_normal().generic_string();
-            return load_texture(texPath);
+            return load_texture(texPath, srgb);
         }
         return fallback;
     };
 
     GLTFMetallic_Roughness::MaterialResources resources;
-    resources.colorImage        = get_texture("baseColor", _engine->_whiteImage);
+    resources.colorImage        = get_texture("baseColor", _engine->_whiteImage, true);
     resources.colorSampler      = _engine->_defaultSamplerLinear;
     // glTF factors are multiplied by the texture, so a missing texture must be neutral.
-    resources.metalRoughImage   = get_texture("metallicRoughness", _engine->_whiteImage);
+    resources.metalRoughImage   = get_texture("metallicRoughness", _engine->_whiteImage, false);
     resources.metalRoughSampler = _engine->_defaultSamplerLinear;
-    resources.normalImage       = get_texture("normals", _engine->_defaultNormalImage);
+    resources.normalImage       = get_texture("normals", _engine->_defaultNormalImage, false);
     resources.normalSampler     = _engine->_defaultSamplerLinear;
-    resources.occlusionImage    = get_texture("occlusion", _engine->_whiteImage);
+    resources.occlusionImage    = get_texture("occlusion", _engine->_whiteImage, false);
     resources.occlusionSampler  = _engine->_defaultSamplerLinear;
-    resources.emissiveImage     = get_texture("emissive", _engine->_blackImage);
+    resources.emissiveImage     = get_texture("emissive", _engine->_blackImage, true);
     resources.emissiveSampler   = _engine->_defaultSamplerLinear;
 
     // Parse Factors
@@ -355,7 +383,9 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     float roughness = parse_float(matInfo.customProperties["roughnessFactor"], 1.0f);
     constants.metal_rough_factors = glm::vec4(metallic, roughness, 0.0f, 0.0f);
 
-    constants.emissive_factors = glm::vec4(parse_vec3(matInfo.customProperties["emissiveFactor"], glm::vec3(0.0f)), 1.0f);
+    constants.emissive_factors = glm::vec4(
+        parse_vec3(matInfo.customProperties["emissiveFactor"], glm::vec3(0.0f)),
+        parse_float(matInfo.customProperties["alphaCutoff"], 0.5f));
 
     // Pass constants struct directly to write_material for SSBO inclusion
     resources.data = constants;
@@ -370,8 +400,9 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     return newMat;
 }
 
-AllocatedImage AssetManager::load_texture(const std::string& path) {
-    auto it = _textures.find(path);
+AllocatedImage AssetManager::load_texture(const std::string& path, bool srgb) {
+    const std::string cacheKey = path + (srgb ? "#srgb" : "#linear");
+    auto it = _textures.find(cacheKey);
     if (it != _textures.end()) {
         return it->second;
     }
@@ -404,9 +435,17 @@ AllocatedImage AssetManager::load_texture(const std::string& path) {
     extents.height = txInfo.pages[0].height;
     extents.depth = 1;
 
-    AllocatedImage newImage = _engine->create_image((void*)rawImagePixels.data(), extents, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT, true);
+    const VkFormat imageFormat = srgb
+        ? VK_FORMAT_R8G8B8A8_SRGB
+        : VK_FORMAT_R8G8B8A8_UNORM;
+    AllocatedImage newImage = _engine->create_image(
+        rawImagePixels.data(),
+        extents,
+        imageFormat,
+        VK_IMAGE_USAGE_SAMPLED_BIT,
+        true);
     
-    _textures[path] = newImage;
+    _textures[cacheKey] = newImage;
 
     _engine->_mainDeletionQueue.push_function([=, engine = _engine]() {
             _engine->destroy_image(newImage);

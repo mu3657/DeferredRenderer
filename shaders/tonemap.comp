@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, set = 0, binding = 0) uniform image2D hdrTarget;
+
+layout(push_constant) uniform ToneMapPushConstants {
+    vec4 params; // x exposure, yzw reserved
+} toneMap;
+
+vec3 aces_fitted(vec3 color)
+{
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp(
+        (color * (a * color + b)) / (color * (c * color + d) + e),
+        vec3(0.0),
+        vec3(1.0));
+}
+
+vec3 linear_to_srgb(vec3 color)
+{
+    vec3 low = color * 12.92;
+    vec3 high = 1.055 * pow(max(color, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, lessThanEqual(color, vec3(0.0031308)));
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(hdrTarget);
+    if (any(greaterThanEqual(pixel, size))) {
+        return;
+    }
+
+    vec4 source = imageLoad(hdrTarget, pixel);
+    vec3 hdr = max(source.rgb, vec3(0.0)) * max(toneMap.params.x, 0.0);
+    vec3 displayColor = linear_to_srgb(aces_fitted(hdr));
+    imageStore(hdrTarget, pixel, vec4(displayColor, source.a));
+}

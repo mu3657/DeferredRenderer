@@ -65,6 +65,9 @@ struct GPUMeshBuffers {
     AllocatedBuffer indexBuffer;
     AllocatedBuffer vertexBuffer;
     VkDeviceAddress vertexBufferAddress;
+    VkDeviceAddress indexBufferAddress;
+    uint32_t vertexCount;
+    uint32_t indexCount;
 };
 
 // push constants for our mesh object draws
@@ -181,6 +184,9 @@ struct GpuLight {
     float      range{10.f};    // 0 = unbounded
     float      width{1.f};     // full rectangle width for RectArea
     float      height{1.f};    // full rectangle height for RectArea
+    float      spotSizeDegrees{60.f}; // full outer cone angle, Blender-style
+    float      spotBlend{0.5f};       // 0 = hard edge, 1 = fully soft cone
+    bool       castsShadow{true};
     glm::vec3  worldPosition{0.f}; // filled in during Draw() traversal
     float      _pad{};
 };
@@ -201,6 +207,8 @@ struct RenderObject {
     uint32_t indexCount;
     uint32_t firstIndex;
     VkBuffer indexBuffer;
+    VkDeviceAddress indexBufferAddress;
+    uint32_t vertexCount;
 
     MaterialInstance* material;
     Bounds bounds;
@@ -208,7 +216,17 @@ struct RenderObject {
     VkDeviceAddress vertexBufferAddress;
 };
 
+// One scene-node instance for ray tracing. A mesh may contain multiple raster
+// RenderObjects (one per surface), but it must appear only once in the TLAS.
+struct RayTracingRenderInstance {
+    MeshAsset* mesh{nullptr};
+    glm::mat4 transform{1.f};
+    uint32_t instanceID{0};
+    uint32_t mask{0xff};
+};
+
 struct DrawContext {
     std::vector<RenderObject> OpaqueSurfaces;
     std::vector<RenderObject> TransparentSurfaces;
+    std::vector<RayTracingRenderInstance> RayTracingInstances;
 };
