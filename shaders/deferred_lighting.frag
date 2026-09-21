@@ -13,13 +13,15 @@ layout(set = 1, binding = 0) uniform sampler2D gAlbedo;
 layout(set = 1, binding = 1) uniform sampler2D gNormal;
 layout(set = 1, binding = 2) uniform sampler2D gMaterial;
 layout(set = 1, binding = 3) uniform sampler2D gDepth;
+layout(set = 1, binding = 4) uniform sampler2D gEmissive;
 layout(set = 3, binding = 0) uniform sampler2D shadowMap;
 layout(set = 3, binding = 2) uniform sampler2D punctualShadowMap;
 layout(set = 4, binding = 0) uniform sampler2D contactShadowTexture;
 
 layout(push_constant) uniform DeferredLightingPushConstants {
     vec4 ddgiParams;      // x history valid, y intensity, z debug mode, w composite enabled
-    vec4 ddgiDebugParams; // x heatmap exposure, yzw unused
+    vec4 ddgiDebugParams; // x DDGI heatmap exposure, y PBR debug mode, zw unused
+    uvec4 lightGridParams; // xy tile counts, z tile size, w flags
 } lightingPushConstants;
 
 layout(std140, set = 5, binding = 0) uniform DDGIVolumeConstants {
@@ -36,6 +38,9 @@ layout(std140, set = 5, binding = 0) uniform DDGIVolumeConstants {
 
 layout(set = 5, binding = 1) uniform sampler2DArray ddgiIrradianceAtlas;
 layout(set = 5, binding = 2) uniform sampler2DArray ddgiDistanceAtlas;
+layout(set = 5, binding = 3) uniform sampler2DArray ddgiProbeData;
+
+const uint DDGI_VOLUME_FLAG_RELOCATION = 1u << 1;
 
 const int SHADOW_CASCADE_COUNT = 4;
 
@@ -64,9 +69,6 @@ layout(std140, set = 3, binding = 3) uniform PunctualShadowDataBuffer {
     uvec4 meta; // x shadow count, y tile resolution, z/w atlas extent
     PunctualShadow shadows[MAX_PUNCTUAL_SHADOWS];
 } punctualShadowData;
-
-// Basic PBR Lighting functions (simplified for minimalism)
-const float PI = 3.14159265359;
 
 struct ShadowCascadeSelection {
     int primary;
@@ -238,68 +240,7 @@ float samplePunctualShadow(GPULight light, uint type, vec3 worldPos, vec3 N, vec
     return mix(1.0, pcfVisibility, clamp(shadow.params.z, 0.0, 1.0));
 }
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-float DistributionGGX(vec3 N, vec3 H, float roughness) {
-    float a = roughness*roughness;
-    float a2 = a*a;
-    float NdotH = max(dot(N, H), 0.0);
-    float NdotH2 = NdotH*NdotH;
-
-    float nom   = a2;
-    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
-    denom = PI * denom * denom;
-
-    return nom / denom;
-}
-
-float GeometrySchlickGGX(float NdotV, float roughness) {
-    float r = (roughness + 1.0);
-    float k = (r*r) / 8.0;
-
-    float nom   = NdotV;
-    float denom = NdotV * (1.0 - k) + k;
-
-    return nom / denom;
-}
-
-float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    float NdotV = max(dot(N, V), 0.0);
-    float NdotL = max(dot(N, L), 0.0);
-    float ggx2 = GeometrySchlickGGX(NdotV, roughness);
-    float ggx1 = GeometrySchlickGGX(NdotL, roughness);
-
-    return ggx1 * ggx2;
-}
-
-vec3 evaluatePBRDirect(vec3 albedo, float metallic, float roughness, vec3 N, vec3 V, vec3 L, vec3 radiance) {
-    vec3 H = normalize(V + L);
-    float NdotL = max(dot(N, L), 0.0);
-
-    if (NdotL <= 0.0) {
-        return vec3(0.0);
-    }
-
-    vec3 F0 = vec3(0.04);
-    F0 = mix(F0, albedo, metallic);
-
-    float NDF = DistributionGGX(N, H, roughness);
-    float G = GeometrySmith(N, V, L, roughness);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-
-    vec3 numerator = NDF * G * F;
-    float denominator = 4.0 * max(dot(N, V), 0.0) * NdotL + 0.0001;
-    vec3 specular = numerator / denominator;
-
-    vec3 kS = F;
-    vec3 kD = vec3(1.0) - kS;
-    kD *= 1.0 - metallic;
-
-    return (kD * albedo / PI + specular) * radiance * NdotL;
-}
-
+#include "pbr.glsl"
 #include "area_light.glsl"
 
 // Reconstruct world position from depth
@@ -350,8 +291,15 @@ uint ddgiProbeIndex(uvec3 coordinates)
 vec3 ddgiProbeWorldPosition(uvec3 coordinates)
 {
     ivec3 scrolledCoordinates = ivec3(coordinates) + ddgiVolume.scrollOffsets.xyz;
-    return ddgiVolume.originMaxRayDistance.xyz
+    vec3 position = ddgiVolume.originMaxRayDistance.xyz
         + vec3(scrolledCoordinates) * ddgiVolume.spacingHysteresis.xyz;
+    if ((ddgiVolume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u) {
+        position += texelFetch(
+            ddgiProbeData,
+            ivec3(coordinates.x, coordinates.z, coordinates.y),
+            0).xyz;
+    }
+    return position;
 }
 
 uvec3 ddgiProbeTextureCoordinates(uint probeIndex)
@@ -500,12 +448,86 @@ DDGISample sampleDDGI(vec3 worldPosition, vec3 normal, vec3 viewDirection)
     return result;
 }
 
+void accumulateDirectLight(
+    uint lightIndex,
+    vec3 albedo,
+    float metallic,
+    float roughness,
+    vec3 N,
+    vec3 V,
+    vec3 worldPos,
+    vec2 screenUV,
+    inout vec3 Lo,
+    inout uint directionalSeen)
+{
+    float visibility = 1.0;
+    GPULight light = lights[lightIndex];
+    uint type = uint(light.directionType.w + 0.5);
+
+    if (type == LIGHT_TYPE_RECT_AREA) {
+        Lo += evaluateRectAreaLight(albedo, metallic, roughness, N, V, worldPos, light);
+        return;
+    }
+
+    vec3 L = vec3(0.0);
+    vec3 radiance = light.colorIntensity.rgb * light.colorIntensity.w;
+
+    if (type == LIGHT_TYPE_DIRECTIONAL) {
+        // directionType.xyz is the light emission direction. Shading uses the surface-to-light vector.
+        L = normalize(-light.directionType.xyz);
+        if (directionalSeen == 0u) {
+            visibility = sampleDirectionalShadow(worldPos, N, L);
+            visibility = min(visibility, texture(contactShadowTexture, screenUV).r);
+        }
+        directionalSeen++;
+    } else {
+        vec3 toLight = light.positionRange.xyz - worldPos;
+        float distanceToLight = length(toLight);
+        L = toLight / max(distanceToLight, 0.0001);
+
+        float attenuation = 1.0 / max(distanceToLight * distanceToLight, 1.0);
+        float range = light.positionRange.w;
+        if (range > 0.0) {
+            float rangeFade = clamp(1.0 - distanceToLight / range, 0.0, 1.0);
+            attenuation *= rangeFade * rangeFade;
+        }
+
+        if (type == LIGHT_TYPE_SPOT) {
+            vec3 lightToSurface = normalize(worldPos - light.positionRange.xyz);
+            float spotCos = dot(lightToSurface, normalize(light.directionType.xyz));
+            float innerCos = light.params.x;
+            float outerCos = light.params.y;
+            float spotAttenuation = clamp(
+                (spotCos - outerCos) / max(innerCos - outerCos, 0.0001),
+                0.0,
+                1.0);
+            attenuation *= spotAttenuation * spotAttenuation;
+        }
+
+        visibility = samplePunctualShadow(light, type, worldPos, N, L);
+        radiance *= attenuation;
+    }
+
+    Lo += evaluatePBRDirect(
+        albedo, metallic, roughness, N, V, L, radiance * visibility);
+}
+
+vec3 lightCountHeatmap(float normalizedCount)
+{
+    float value = clamp(normalizedCount, 0.0, 1.0);
+    return vec3(
+        clamp(1.5 - abs(4.0 * value - 3.0), 0.0, 1.0),
+        clamp(1.5 - abs(4.0 * value - 2.0), 0.0, 1.0),
+        clamp(1.5 - abs(4.0 * value - 1.0), 0.0, 1.0));
+}
+
 void main()
 {
     // 1. Sample G-Buffer
     vec4 albedoSample   = texture(gAlbedo, inUV);
     vec4 normalSample   = texture(gNormal, inUV); // Normal encoded as 0..1, a=metallic
     vec4 materialSample = texture(gMaterial, inUV); // r=roughness, g=ao
+    vec3 emissive       = max(texture(gEmissive, inUV).rgb, vec3(0.0));
     float depth         = texture(gDepth, inUV).r;
 
     // Reverse-Z depth clears the background to 0. Discard keeps the pre-drawn background.
@@ -527,78 +549,83 @@ void main()
     // Camera position (can be extracted from inverse view matrix)
     vec3 camPos = inverse(sceneData.view)[3].xyz;
     vec3 V = normalize(camPos - worldPos);
+    float NdotV = max(dot(N, V), 0.0);
 
     vec3 Lo = vec3(0.0);
 
     uint directionalSeen = 0;
+    uint evaluatedLightCount = 0;
     // --- Direct Lighting ---
-    for (uint i = 0; i < lightData.lightCount; i++) {
-        float visibility = 1.0;
+    bool tiledLightingEnabled = (lightingPushConstants.lightGridParams.w & 1u) != 0u;
+    if (tiledLightingEnabled) {
+        uint tileSize = max(lightingPushConstants.lightGridParams.z, 1u);
+        uvec2 tile = uvec2(gl_FragCoord.xy) / tileSize;
+        tile = min(tile, lightingPushConstants.lightGridParams.xy - uvec2(1u));
+        uint tileIndex = tile.y * lightingPushConstants.lightGridParams.x + tile.x;
 
-        GPULight light = lights[i];
-        uint type = uint(light.directionType.w + 0.5);
-
-        if (type == LIGHT_TYPE_RECT_AREA) {
-            Lo += evaluateRectAreaLight(albedo, metallic, roughness, N, V, worldPos, light);
-            continue;
+        for (uint wordIndex = 0u; wordIndex < 8u; ++wordIndex) {
+            uint mask = tileLightMasks[tileIndex * 8u + wordIndex];
+            evaluatedLightCount += bitCount(mask);
+            while (mask != 0u) {
+                uint bitIndex = uint(findLSB(mask));
+                uint lightIndex = wordIndex * 32u + bitIndex;
+                if (lightIndex < lightData.lightCount) {
+                    accumulateDirectLight(
+                        lightIndex,
+                        albedo,
+                        metallic,
+                        roughness,
+                        N,
+                        V,
+                        worldPos,
+                        inUV,
+                        Lo,
+                        directionalSeen);
+                }
+                mask &= mask - 1u;
+            }
         }
-
-        vec3 L = vec3(0.0);
-        vec3 radiance = light.colorIntensity.rgb * light.colorIntensity.w;
-
-        if (type == LIGHT_TYPE_DIRECTIONAL) {
-            // directionType.xyz is the light emission direction. Shading uses the surface-to-light vector.
-            L = normalize(-light.directionType.xyz);
-            if (directionalSeen == 0u) {
-                visibility = sampleDirectionalShadow(worldPos, N, L);
-                visibility = min(visibility, texture(contactShadowTexture, inUV).r);
-            }
-            directionalSeen++;
-        } else {
-            vec3 toLight = light.positionRange.xyz - worldPos;
-            float distanceToLight = length(toLight);
-            L = toLight / max(distanceToLight, 0.0001);
-
-            float attenuation = 1.0 / max(distanceToLight * distanceToLight, 1.0);
-            float range = light.positionRange.w;
-            if (range > 0.0) {
-                float rangeFade = clamp(1.0 - distanceToLight / range, 0.0, 1.0);
-                attenuation *= rangeFade * rangeFade;
-            }
-
-            if (type == LIGHT_TYPE_SPOT) {
-                vec3 lightToSurface = normalize(worldPos - light.positionRange.xyz);
-                float spotCos = dot(lightToSurface, normalize(light.directionType.xyz));
-                float innerCos = light.params.x;
-                float outerCos = light.params.y;
-                float spotAttenuation = clamp((spotCos - outerCos) / max(innerCos - outerCos, 0.0001), 0.0, 1.0);
-                attenuation *= spotAttenuation * spotAttenuation;
-            }
-
-            visibility = samplePunctualShadow(light, type, worldPos, N, L);
-            radiance *= attenuation;
+    } else {
+        evaluatedLightCount = lightData.lightCount;
+        for (uint lightIndex = 0u; lightIndex < lightData.lightCount; ++lightIndex) {
+            accumulateDirectLight(
+                lightIndex,
+                albedo,
+                metallic,
+                roughness,
+                N,
+                V,
+                worldPos,
+                inUV,
+                Lo,
+                directionalSeen);
         }
-
-        Lo += evaluatePBRDirect(albedo, metallic, roughness, N, V, L, radiance*visibility);
     }
 
     // --- Ambient and DDGI diffuse indirect lighting ---
-    vec3 legacyAmbient = lightData.ambientColor.rgb * albedo * ao;
+    vec3 diffuseEnergy = pbrDiffuseEnergy(albedo, metallic, roughness, NdotV);
+    vec3 legacyAmbient = lightData.ambientColor.rgb * albedo * diffuseEnergy * ao;
     DDGISample ddgi = DDGISample(vec3(0.0), 0.0, 0.0);
     vec3 indirectDiffuse = vec3(0.0);
     if (lightingPushConstants.ddgiParams.x > 0.5) {
         ddgi = sampleDDGI(worldPos, N, V);
-        indirectDiffuse = ddgi.irradiance
-            * albedo
-            * (1.0 - metallic)
+        indirectDiffuse = evaluatePBRDiffuseIrradiance(
+            ddgi.irradiance,
+            albedo,
+            metallic,
+            roughness,
+            NdotV)
             * ao
-            * (lightingPushConstants.ddgiParams.y / PI);
+            * lightingPushConstants.ddgiParams.y;
     }
     vec3 ambient = lightingPushConstants.ddgiParams.w > 0.5
         ? mix(legacyAmbient, indirectDiffuse, ddgi.confidence)
         : legacyAmbient;
 
-    vec3 color = ambient + Lo;
+    vec3 emissiveContribution = lightingPushConstants.ddgiDebugParams.z > 0.5
+        ? emissive
+        : vec3(0.0);
+    vec3 color = emissiveContribution + ambient + Lo;
 
     int ddgiDebugMode = int(lightingPushConstants.ddgiParams.z + 0.5);
     if (ddgiDebugMode == 1) {
@@ -615,6 +642,32 @@ void main()
         color = ddgiHeatmap(
             dot(indirectDiffuse, vec3(0.2126, 0.7152, 0.0722)),
             lightingPushConstants.ddgiDebugParams.x);
+    }
+
+    if ((lightingPushConstants.lightGridParams.w & 2u) != 0u) {
+        float normalizedLightCount = float(evaluatedLightCount)
+            / max(float(lightData.lightCount), 1.0);
+        color = lightCountHeatmap(normalizedLightCount);
+    }
+
+    int pbrDebugMode = int(lightingPushConstants.ddgiDebugParams.y + 0.5);
+    if (pbrDebugMode == 1) {
+        color = albedo;
+    } else if (pbrDebugMode == 2) {
+        color = N * 0.5 + 0.5;
+    } else if (pbrDebugMode == 3) {
+        color = vec3(metallic);
+    } else if (pbrDebugMode == 4) {
+        color = vec3(roughness);
+    } else if (pbrDebugMode == 5) {
+        color = vec3(ao);
+    } else if (pbrDebugMode == 6) {
+        color = emissive / (emissive + vec3(1.0));
+    } else if (pbrDebugMode == 7) {
+        // Red marks normals rejected by the direct BRDF's view hemisphere.
+        color = dot(N, V) <= 0.0 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+    } else if (pbrDebugMode == 8) {
+        color = Lo;
     }
 
     // --- HDR & Gamma Correction (if not using sRGB output target) ---

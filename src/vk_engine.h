@@ -16,6 +16,7 @@
 #include "pipeline_registry.h"
 #include "render_pass.h"
 #include "Renderpasses/geometry_pass.h"
+#include "Renderpasses/light_binning_pass.h"
 #include "Renderpasses/ContactShadow_pass.h"
 #include "Renderpasses/transparent_pass.h"
 #include "VkBootstrap.h"
@@ -82,6 +83,7 @@ struct FrameData {
 	// Lighting resources owned by the engine frame, filled by LightSystem.
 	AllocatedBuffer lightDataBuffer;
 	AllocatedBuffer lightBuffer;
+	AllocatedBuffer tileLightMaskBuffer{};
 	VkDescriptorSet lightDescriptor{ VK_NULL_HANDLE };
 };
 
@@ -113,6 +115,7 @@ struct EngineStats {
 	float mesh_draw_time{0.f};
 	RenderPassStats shadow;
 	RenderPassStats geometry;
+	RenderPassStats lightBinning;
 	RenderPassStats lighting;
 	RenderPassStats transparent;
 
@@ -123,6 +126,7 @@ struct EngineStats {
 		mesh_draw_time = 0.f;
 		shadow = {};
 		geometry = {};
+		lightBinning = {};
 		lighting = {};
 		transparent = {};
 	}
@@ -135,6 +139,7 @@ struct GLTFMetallic_Roughness {
 
 	struct MaterialConstants {
 		glm::vec4 colorFactors;
+		// x metallic, y perceptual roughness, z normal scale, w occlusion strength
 		glm::vec4 metal_rough_factors;
 		//padding, we need it anyway for uniform buffers
 		glm::vec4 emissive_factors; // 发光因子 (rgb), w可存 emissive strength 或 alpha cutoff
@@ -145,7 +150,7 @@ struct GLTFMetallic_Roughness {
 		uint32_t occlusionTexID;
 
 		uint32_t emissiveTexID;
-		uint32_t pad0;
+		MaterialFlags materialFlags;
 		uint32_t pad1;
 		uint32_t pad2;
 
@@ -221,9 +226,10 @@ public:
 	AllocatedImage _drawImage;
 	AllocatedImage _depthImage;
 	AllocatedImage _contactShadowImage;
-	AllocatedImage _gAlbedo; // 漫反射 (RGB) + 材质遮罩 (A)
-	AllocatedImage _gNormal; // 世界空间法线 (RGB)
-	AllocatedImage _gORM;    // AO (R), 粗糙度 (G), 金属度 (B)
+	AllocatedImage _gAlbedo;   // linear base color
+	AllocatedImage _gNormal;   // encoded world normal + metallic
+	AllocatedImage _gORM;      // roughness + ambient occlusion
+	AllocatedImage _gEmissive; // linear HDR emissive
 
 	VkExtent2D _drawExtent;
 	float renderScale{1.f};
@@ -246,6 +252,9 @@ public:
 	DDGIProbeDebugPass ddgiProbeDebugPass;
 	ToneMapPass toneMapPass;
 	GeometryPass geometryPass;
+	int pbrDebugMode{0};
+	bool pbrEmissiveEnabled{true};
+    LightBinningPass lightBinningPass;
     ShadowPass shadowPass;
     ContactShadowPass contactShadowPass;
     TransparentPass transparentPass;

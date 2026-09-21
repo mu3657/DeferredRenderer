@@ -1,0 +1,55 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform DDGIProbeRelocationDiagnosticPushConstants {
+    uint probeCount;
+    uint probeCountX;
+    uint probeCountY;
+    uint reserved;
+} pushConstants;
+
+layout(rgba32f, set = 0, binding = 3) uniform readonly image2DArray probeData;
+layout(std430, set = 0, binding = 6) buffer DDGIProbeRelocationDiagnostics {
+    uint rayCount;
+    uint nonZeroRadianceRays;
+    uint frontFaceHits;
+    uint backFaceHits;
+    uint missCount;
+    uint nonFiniteRays;
+    uint maxRadianceBits;
+    uint irradianceTexelCount;
+    uint nonZeroIrradianceTexels;
+    uint nonFiniteIrradianceTexels;
+    uint maxIrradianceBits;
+    uint relocatedProbeCount;
+    uint nonFiniteProbeOffsets;
+    uint maxProbeOffsetBits;
+    uint reserved0;
+    uint reserved1;
+} diagnostics;
+
+void main()
+{
+    uint probeIndex = gl_GlobalInvocationID.x;
+    if (probeIndex >= pushConstants.probeCount) {
+        return;
+    }
+
+    uint probeX = probeIndex % pushConstants.probeCountX;
+    uint probeY = (probeIndex / pushConstants.probeCountX)
+        % pushConstants.probeCountY;
+    uint probeZ = probeIndex
+        / (pushConstants.probeCountX * pushConstants.probeCountY);
+    vec3 offset = imageLoad(
+        probeData, ivec3(int(probeX), int(probeZ), int(probeY))).xyz;
+    bool nonFinite = any(isnan(offset)) || any(isinf(offset));
+    float offsetLength = nonFinite ? 0.0 : length(offset);
+
+    if (nonFinite) {
+        atomicAdd(diagnostics.nonFiniteProbeOffsets, 1u);
+    } else if (offsetLength > 1e-5) {
+        atomicAdd(diagnostics.relocatedProbeCount, 1u);
+    }
+    atomicMax(diagnostics.maxProbeOffsetBits, floatBitsToUint(offsetLength));
+}

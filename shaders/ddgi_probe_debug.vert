@@ -27,6 +27,8 @@ layout(std140, set = 1, binding = 0) uniform DDGIVolumeConstants {
     uvec4 frameAndFlags;
 } volume;
 
+layout(set = 1, binding = 3) uniform sampler2DArray probeData;
+
 layout(push_constant) uniform DDGIProbeDebugPushConstants {
     vec4 originRadius;
     vec4 spacingIntensity;
@@ -41,6 +43,8 @@ const vec2 QUAD_CORNERS[6] = vec2[6](
     vec2(-1.0, -1.0),
     vec2( 1.0,  1.0),
     vec2(-1.0,  1.0));
+
+const uint DDGI_VOLUME_FLAG_RELOCATION = 1u << 1;
 
 uvec3 probeCoordinates(uint probeIndex)
 {
@@ -80,6 +84,12 @@ void main()
         uvec3 coordinates = probeCoordinates(probeIndex);
         probePosition = pushConstants.originRadius.xyz
             + vec3(coordinates) * pushConstants.spacingIntensity.xyz;
+        if ((volume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u) {
+            probePosition += texelFetch(
+                probeData,
+                ivec3(coordinates.x, coordinates.z, coordinates.y),
+                0).xyz;
+        }
     }
     vec3 worldPosition = probePosition
         + (cameraRight * corner.x + cameraUp * corner.y) * pushConstants.originRadius.w;

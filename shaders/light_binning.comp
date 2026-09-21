@@ -1,0 +1,148 @@
+#version 450
+
+const uint TILE_SIZE = 16u;
+const uint MAX_GPU_LIGHTS = 256u;
+const uint LIGHT_MASK_WORD_COUNT = 8u;
+
+const uint LIGHT_TYPE_POINT = 0u;
+const uint LIGHT_TYPE_DIRECTIONAL = 1u;
+const uint LIGHT_TYPE_SPOT = 2u;
+const uint LIGHT_TYPE_RECT_AREA = 3u;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform SceneData {
+    mat4 view;
+    mat4 proj;
+    mat4 viewproj;
+    vec4 ambientColor;
+    vec4 sunlightDirection;
+    vec4 sunlightColor;
+} sceneData;
+
+layout(set = 1, binding = 0) uniform LightData {
+    uint lightCount;
+    uint directionalLightCount;
+    uint pointLightCount;
+    uint spotLightCount;
+    uint rectAreaLightCount;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+    vec4 ambientColor;
+} lightData;
+
+struct GPULight {
+    vec4 positionRange;
+    vec4 directionType;
+    vec4 colorIntensity;
+    vec4 params;
+    vec4 areaRight;
+    vec4 areaUp;
+};
+
+layout(std430, set = 1, binding = 1) readonly buffer LightStorage {
+    GPULight lights[];
+};
+
+layout(std430, set = 1, binding = 2) writeonly buffer TileLightMaskStorage {
+    uint tileLightMasks[];
+};
+
+layout(push_constant) uniform LightBinningPushConstants {
+    uvec4 grid; // xy = render extent, zw = tile counts
+} pushConstants;
+
+shared uint sharedLightMask[LIGHT_MASK_WORD_COUNT];
+
+vec4 matrixRow(mat4 matrixValue, uint rowIndex)
+{
+    return vec4(
+        matrixValue[0][rowIndex],
+        matrixValue[1][rowIndex],
+        matrixValue[2][rowIndex],
+        matrixValue[3][rowIndex]);
+}
+
+bool sphereInsidePlane(vec3 center, float radius, vec4 plane)
+{
+    float normalLength = length(plane.xyz);
+    return dot(plane, vec4(center, 1.0)) >= -radius * normalLength;
+}
+
+bool lightIntersectsTile(GPULight light, vec2 tileMinimumNdc, vec2 tileMaximumNdc)
+{
+    if (light.colorIntensity.w <= 0.0) {
+        return false;
+    }
+
+    uint type = uint(light.directionType.w + 0.5);
+    if (type == LIGHT_TYPE_DIRECTIONAL) {
+        return true;
+    }
+
+    float radius = light.positionRange.w;
+    if (type == LIGHT_TYPE_RECT_AREA && radius > 0.0) {
+        radius += length(vec2(light.areaRight.w, light.areaUp.w));
+    }
+
+    // A zero range means unbounded in the existing lighting shaders.
+    if (radius <= 0.0) {
+        return true;
+    }
+
+    vec3 viewPosition = (sceneData.view * vec4(light.positionRange.xyz, 1.0)).xyz;
+    float viewDepth = -viewPosition.z;
+    if (viewDepth + radius <= 0.0) {
+        return false;
+    }
+
+    // Each tile side is a homogeneous clip-space plane transformed into view
+    // space. Sphere-plane testing stays conservative even for off-axis lights
+    // and lights crossing the camera near plane.
+    vec4 rowX = matrixRow(sceneData.proj, 0u);
+    vec4 rowY = matrixRow(sceneData.proj, 1u);
+    vec4 rowW = matrixRow(sceneData.proj, 3u);
+    vec4 leftPlane = rowX - tileMinimumNdc.x * rowW;
+    vec4 rightPlane = tileMaximumNdc.x * rowW - rowX;
+    vec4 bottomPlane = rowY - tileMinimumNdc.y * rowW;
+    vec4 topPlane = tileMaximumNdc.y * rowW - rowY;
+
+    return sphereInsidePlane(viewPosition, radius, leftPlane)
+        && sphereInsidePlane(viewPosition, radius, rightPlane)
+        && sphereInsidePlane(viewPosition, radius, bottomPlane)
+        && sphereInsidePlane(viewPosition, radius, topPlane);
+}
+
+void main()
+{
+    uint localIndex = gl_LocalInvocationIndex;
+    if (localIndex < LIGHT_MASK_WORD_COUNT) {
+        sharedLightMask[localIndex] = 0u;
+    }
+    barrier();
+
+    uvec2 tile = gl_WorkGroupID.xy;
+    uvec2 pixelMinimum = tile * TILE_SIZE;
+    uvec2 pixelMaximum = min(pixelMinimum + uvec2(TILE_SIZE), pushConstants.grid.xy);
+    vec2 renderExtent = vec2(pushConstants.grid.xy);
+    vec2 tileMinimumNdc = vec2(pixelMinimum) / renderExtent * 2.0 - 1.0;
+    vec2 tileMaximumNdc = vec2(pixelMaximum) / renderExtent * 2.0 - 1.0;
+
+    for (uint lightIndex = localIndex;
+         lightIndex < min(lightData.lightCount, MAX_GPU_LIGHTS);
+         lightIndex += gl_WorkGroupSize.x) {
+        if (lightIntersectsTile(lights[lightIndex], tileMinimumNdc, tileMaximumNdc)) {
+            atomicOr(
+                sharedLightMask[lightIndex >> 5u],
+                1u << (lightIndex & 31u));
+        }
+    }
+    barrier();
+
+    if (localIndex < LIGHT_MASK_WORD_COUNT) {
+        uint tileIndex = tile.y * pushConstants.grid.z + tile.x;
+        tileLightMasks[tileIndex * LIGHT_MASK_WORD_COUNT + localIndex]
+            = sharedLightMask[localIndex];
+    }
+}

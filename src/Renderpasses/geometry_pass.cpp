@@ -47,16 +47,23 @@ void GeometryPass::execute(GeometryPassContext& ctx)
         engine._gNormal.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ormAttachment = vkinit::attachment_info(
         engine._gORM.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo emissiveAttachment = vkinit::attachment_info(
+        engine._gEmissive.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo depthAttachment = vkinit::depth_attachment_info(
         engine._depthImage.imageView, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
 
-    VkRenderingAttachmentInfo colorAttachments[] = {albedoAttachment, normalAttachment, ormAttachment};
+    VkRenderingAttachmentInfo colorAttachments[] = {
+        albedoAttachment,
+        normalAttachment,
+        ormAttachment,
+        emissiveAttachment,
+    };
 
     VkRenderingInfo renderInfo = {};
     renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     renderInfo.renderArea = VkRect2D{{0, 0}, ctx.drawExtent};
     renderInfo.layerCount = 1;
-    renderInfo.colorAttachmentCount = 3;
+    renderInfo.colorAttachmentCount = 4;
     renderInfo.pColorAttachments = colorAttachments;
     renderInfo.pDepthAttachment = &depthAttachment;
 

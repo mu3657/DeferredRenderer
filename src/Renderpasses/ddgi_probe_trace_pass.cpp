@@ -124,6 +124,70 @@ void transition_probe_history_for_trace(
     vkCmdPipelineBarrier2(cmd, &dependencyInfo);
 }
 
+void transition_probe_data_for_trace(
+    VkCommandBuffer cmd,
+    DDGIImageResource& probeData,
+    bool clear)
+{
+    VkImageMemoryBarrier2 transition{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    transition.srcStageMask = probeData.layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_PIPELINE_STAGE_2_NONE
+        : (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+            | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+            | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+    transition.srcAccessMask = probeData.layout == VK_IMAGE_LAYOUT_UNDEFINED
+        ? VK_ACCESS_2_NONE
+        : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    transition.dstStageMask = clear
+        ? VK_PIPELINE_STAGE_2_TRANSFER_BIT
+        : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    transition.dstAccessMask = clear
+        ? VK_ACCESS_2_TRANSFER_WRITE_BIT
+        : VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    transition.oldLayout = probeData.layout;
+    transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    transition.image = probeData.image.image;
+    transition.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    transition.subresourceRange.levelCount = 1;
+    transition.subresourceRange.layerCount = probeData.arrayLayers;
+
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &transition;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+    probeData.layout = VK_IMAGE_LAYOUT_GENERAL;
+    if (!clear) {
+        return;
+    }
+
+    VkClearColorValue clearValue{};
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.levelCount = 1;
+    range.layerCount = probeData.arrayLayers;
+    vkCmdClearColorImage(
+        cmd,
+        probeData.image.image,
+        VK_IMAGE_LAYOUT_GENERAL,
+        &clearValue,
+        1,
+        &range);
+
+    VkImageMemoryBarrier2 clearBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    clearBarrier.image = probeData.image.image;
+    clearBarrier.subresourceRange = range;
+    dependency.pImageMemoryBarriers = &clearBarrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
 void make_ray_data_visible_to_compute(
     VkCommandBuffer cmd,
     VkImage image,
@@ -208,6 +272,7 @@ void DDGIProbeTracePass::cleanup()
     _pipelineLayout = VK_NULL_HANDLE;
     _pendingFrameStats.clear();
     _stats = {};
+    _lastProbeDataResetSerial = 0;
     _dispatchInFlight = false;
     _engine = nullptr;
 }
@@ -254,6 +319,15 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
         ctx.cmd,
         ctx.volume.resources().irradiance,
         ctx.volume.resources().distance);
+    const uint64_t historySerial = ctx.volume.history_clear_serial();
+    const bool clearProbeData = historySerial != _lastProbeDataResetSerial;
+    transition_probe_data_for_trace(
+        ctx.cmd,
+        ctx.volume.resources().probeData,
+        clearProbeData);
+    if (clearProbeData) {
+        _lastProbeDataResetSerial = historySerial;
+    }
     transition_ray_data_for_trace(
         ctx.cmd, ctx.volume.resources().rayData);
 
@@ -288,7 +362,7 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
         pushConstants.flags |= DDGIProbeTraceFlagMultiBounce;
         pushConstants.multiBounceStrength = _multiBounceStrength;
     }
-    if (_wholeProbeBackfaceRejection) {
+    if (_wholeProbeBackfaceRejection || ctx.volume.probe_relocation_enabled()) {
         pushConstants.flags |= DDGIProbeTraceFlagSignedBackfaceDistance;
     }
     vkCmdPushConstants(
@@ -358,6 +432,7 @@ void DDGIProbeTracePass::notify_frame_completed(uint32_t frameIndex)
             sizeof(diagnostics));
         float maxRadiance = 0.f;
         float maxIrradiance = 0.f;
+        float maxProbeOffset = 0.f;
         std::memcpy(
             &maxRadiance,
             &diagnostics.maxRadianceBits,
@@ -366,8 +441,12 @@ void DDGIProbeTracePass::notify_frame_completed(uint32_t frameIndex)
             &maxIrradiance,
             &diagnostics.maxIrradianceBits,
             sizeof(maxIrradiance));
+        std::memcpy(
+            &maxProbeOffset,
+            &diagnostics.maxProbeOffsetBits,
+            sizeof(maxProbeOffset));
         fmt::println(
-            "DDGI GPU diagnostic: ray radiance nonzero {}/{}, max {:.6f}, hits front/back/miss {}/{}/{}, nonfinite {}; irradiance texels nonzero {}/{}, max {:.6f}, nonfinite {}",
+            "DDGI GPU diagnostic: ray radiance nonzero {}/{}, max {:.6f}, hits front/back/miss {}/{}/{}, nonfinite {}; irradiance texels nonzero {}/{}, max {:.6f}, nonfinite {}; relocation moved {}/{}, max offset {:.4f}, nonfinite {}",
             diagnostics.nonZeroRadianceRays,
             diagnostics.rayCount,
             maxRadiance,
@@ -378,7 +457,11 @@ void DDGIProbeTracePass::notify_frame_completed(uint32_t frameIndex)
             diagnostics.nonZeroIrradianceTexels,
             diagnostics.irradianceTexelCount,
             maxIrradiance,
-            diagnostics.nonFiniteIrradianceTexels);
+            diagnostics.nonFiniteIrradianceTexels,
+            diagnostics.relocatedProbeCount,
+            _engine->ddgiVolume.total_probe_count(),
+            maxProbeOffset,
+            diagnostics.nonFiniteProbeOffsets);
         std::fflush(stdout);
     }
 }
@@ -443,7 +526,10 @@ void DDGIProbeTracePass::draw_debug_ui()
         _engine->ddgiVolume.request_history_reset();
     }
     ImGui::TextDisabled(
-        _wholeProbeBackfaceRejection
+        _engine && _engine->ddgiVolume.initialized()
+                && _engine->ddgiVolume.probe_relocation_enabled()
+            ? "Signed backface distances are required by probe relocation"
+            : _wholeProbeBackfaceRejection
             ? "Signed backface distances can reject an entire probe update"
             : "Backface radiance is discarded without rejecting the entire probe");
     if (_engine && _engine->ddgiVolume.initialized()) {

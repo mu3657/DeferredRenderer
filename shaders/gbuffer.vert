@@ -10,6 +10,7 @@ layout (location = 1) out vec3 outNormal;
 layout (location = 2) out vec2 outUV;
 layout (location = 3) out vec4 outColor;
 layout (location = 4) flat out uint outMaterialID;
+layout (location = 5) out vec4 outTangent;
 
 struct Vertex {
     vec3 position;
@@ -17,6 +18,7 @@ struct Vertex {
     vec3 normal;
     float uv_y;
     vec4 color;
+    vec4 tangent;
 };
 
 layout(buffer_reference, std430) readonly buffer VertexBuffer{
@@ -41,6 +43,20 @@ void main()
     outWorldPos = worldPos.xyz;
     mat3 normalMatrix = transpose(inverse(mat3(PushConstants.render_matrix)));
     outNormal = normalize(normalMatrix * v.normal);
+    mat3 objectToWorld = mat3(PushConstants.render_matrix);
+    vec3 worldTangent = objectToWorld * v.tangent.xyz;
+    worldTangent -= outNormal * dot(outNormal, worldTangent);
+    float tangentLengthSquared = dot(worldTangent, worldTangent);
+    if (tangentLengthSquared <= 1e-8) {
+        vec3 fallbackAxis = abs(outNormal.z) < 0.999
+            ? vec3(0.0, 0.0, 1.0)
+            : vec3(0.0, 1.0, 0.0);
+        worldTangent = normalize(cross(fallbackAxis, outNormal));
+    } else {
+        worldTangent *= inversesqrt(tangentLengthSquared);
+    }
+    float transformHandedness = determinant(objectToWorld) < 0.0 ? -1.0 : 1.0;
+    outTangent = vec4(worldTangent, v.tangent.w * transformHandedness);
     outUV = vec2(v.uv_x, v.uv_y);
     outColor = v.color;
     outMaterialID = PushConstants.materialID;

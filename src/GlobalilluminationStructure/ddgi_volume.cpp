@@ -204,6 +204,11 @@ void DDGIVolume::init(const DDGIVolumeInitContext& ctx, const DDGIVolumeDesc& de
         || desc.probeSpacing.z <= 0.f) {
         throw std::invalid_argument("DDGIVolumeDesc contains invalid trace dimensions");
     }
+    if ((desc.flags & (DDGIVolumeFlagRelocation | DDGIVolumeFlagClassification)) != 0
+        && desc.raysPerProbe < 32u) {
+        throw std::invalid_argument(
+            "DDGI probe management requires at least 32 fixed rays per probe");
+    }
 
     const uint32_t probeCount = checked_probe_count(desc.probeCounts);
     _irradianceLayout = make_atlas_layout(desc.probeCounts, desc.irradianceInteriorTexels);
@@ -331,6 +336,13 @@ void DDGIVolume::init(const DDGIVolumeInitContext& ctx, const DDGIVolumeDesc& de
                 frame.diagnosticsBuffer.buffer,
                 sizeof(DDGIDiagnosticsGPU),
                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            _descriptors->write_image(
+                frame.traceDescriptor,
+                8,
+                _resources.probeData.image.imageView,
+                VK_NULL_HANDLE,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
             frame.updateDescriptor =
                 _descriptors->allocate_persistent(DescriptorLayoutID::DDGIProbeBlend);
@@ -433,6 +445,13 @@ void DDGIVolume::init(const DDGIVolumeInitContext& ctx, const DDGIVolumeDesc& de
                 frame.samplingDescriptor,
                 2,
                 _resources.distance.image.imageView,
+                _resources.bilinearSampler,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            _descriptors->write_image(
+                frame.samplingDescriptor,
+                3,
+                _resources.probeData.image.imageView,
                 _resources.bilinearSampler,
                 VK_IMAGE_LAYOUT_GENERAL,
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
@@ -682,6 +701,47 @@ void DDGIVolume::set_random_ray_backface_threshold(float threshold)
     if (_desc.randomRayBackfaceThreshold != threshold) {
         _desc.randomRayBackfaceThreshold = threshold;
         _gpuData.blendThresholds.x = threshold;
+        request_history_reset();
+    }
+}
+
+void DDGIVolume::set_probe_relocation_enabled(bool enabled)
+{
+    if (enabled && _desc.raysPerProbe < 32u) {
+        throw std::logic_error("DDGI probe relocation requires at least 32 rays per probe");
+    }
+    const bool wasEnabled = probe_relocation_enabled();
+    if (wasEnabled == enabled) {
+        return;
+    }
+    if (enabled) {
+        _desc.flags |= DDGIVolumeFlagRelocation;
+    } else {
+        _desc.flags &= ~DDGIVolumeFlagRelocation;
+    }
+    request_history_reset();
+}
+
+void DDGIVolume::set_fixed_ray_backface_threshold(float threshold)
+{
+    if (threshold < 0.f || threshold > 1.f) {
+        throw std::invalid_argument(
+            "DDGI fixed-ray backface threshold must be in [0, 1]");
+    }
+    if (_desc.fixedRayBackfaceThreshold != threshold) {
+        _desc.fixedRayBackfaceThreshold = threshold;
+        request_history_reset();
+    }
+}
+
+void DDGIVolume::set_min_frontface_distance(float distance)
+{
+    if (distance < 0.f) {
+        throw std::invalid_argument(
+            "DDGI minimum frontface distance must be non-negative");
+    }
+    if (_desc.minFrontfaceDistance != distance) {
+        _desc.minFrontfaceDistance = distance;
         request_history_reset();
     }
 }

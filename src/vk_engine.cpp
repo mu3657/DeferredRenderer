@@ -60,9 +60,10 @@ float elapsed_ms(std::chrono::steady_clock::time_point start)
 struct alignas(16) DeferredLightingPushConstants {
     glm::vec4 ddgiParams{};
     glm::vec4 ddgiDebugParams{};
+    glm::uvec4 lightGridParams{}; // xy = tile counts, z = tile size, w = flags
 };
 
-static_assert(sizeof(DeferredLightingPushConstants) == 32);
+static_assert(sizeof(DeferredLightingPushConstants) == 48);
 
 std::optional<RayTracingMeshDesc> make_ray_tracing_mesh_desc(
     const MeshAsset& mesh,
@@ -105,6 +106,9 @@ std::optional<RayTracingMeshDesc> make_ray_tracing_mesh_desc(
         geometry.firstIndex = surface.startIndex;
         geometry.indexCount = surface.count;
         geometry.materialID = surface.material->data.materialID;
+        // Legacy baked scenes, including Bistro, contain visible surfaces whose
+        // winding does not match a strict single-sided convention. Raster uses
+        // two-sided geometry, so Ray Query must keep the same compatibility rule.
         geometry.shaderFlags = RayTracingGeometryFlagDoubleSided;
 
         if (surface.material->data.surface == MaterialSurface::Masked) {
@@ -186,6 +190,7 @@ void VulkanEngine::init()
     // Keep the first integration comfortably below the Windows TDR budget.
     // Irradiance history will amortize a full volume update over multiple frames.
     ddgiVolumeDesc.probesUpdatedPerFrame = 8;
+    ddgiVolumeDesc.flags |= DDGIVolumeFlagRelocation;
     ddgiVolume.init(
         DDGIVolumeInitContext{
             _chosenGPU,
@@ -211,6 +216,7 @@ void VulkanEngine::init()
     };
     geometryPass.init(passInitContext);
     shadowPass.init(passInitContext);
+    lightBinningPass.init(passInitContext);
     contactShadowPass.init(passInitContext);
     ddgiProbeTracePass.init(passInitContext);
     ddgiProbeBlendPass.init(passInitContext);
@@ -225,6 +231,7 @@ void VulkanEngine::init()
         ddgiProbeTracePass.cleanup();
         ddgiVolume.cleanup();
         contactShadowPass.cleanup();
+        lightBinningPass.cleanup();
         shadowPass.cleanup();
         geometryPass.cleanup();
     });
@@ -283,9 +290,7 @@ void VulkanEngine::init_renderdoc() {
 }
 void VulkanEngine::init_imgui()
 {
-	// 1: create descriptor pool for IMGUI
-	//  the size of the pool is very oversize, but it's copied from imgui demo
-	//  itself.
+
 	VkDescriptorPoolSize pool_sizes[] = { { VK_DESCRIPTOR_TYPE_SAMPLER, 1000 },
 		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000 },
 		{ VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000 },
@@ -619,6 +624,7 @@ void VulkanEngine::draw()
     vkutil::transition_image(cmd, _gAlbedo.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    vkutil::transition_image(cmd, _gEmissive.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
 	ShadowPassContext shadowContext{ passContext, sceneData, mainDrawContext, lightSystem };
 	const auto shadowPassStart = std::chrono::steady_clock::now();
@@ -636,8 +642,17 @@ void VulkanEngine::draw()
 	vkutil::transition_image(cmd, _gAlbedo.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	vkutil::transition_image(cmd, _gEmissive.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _contactShadowImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+    // Upload lights before the compute binning pass. Deferred and transparent
+    // lighting consume the same frame-local buffers later in the command stream.
+    lightSystem.upload_frame(passContext.frame);
+    const auto lightBinningStart = std::chrono::steady_clock::now();
+    lightBinningPass.execute(passContext);
+    stats.lightBinning.cpu_time_ms = elapsed_ms(lightBinningStart);
+    TracyPlot("LightBinningPass CPU ms", stats.lightBinning.cpu_time_ms);
 
     ContactShadowPassContext contactShadowContext{passContext, sceneData, lightSystem};
     contactShadowPass.execute(contactShadowContext);
@@ -867,6 +882,25 @@ void VulkanEngine::run()
 
         draw_scene_browser();
         lightSystem.draw_debug_ui();
+        if (ImGui::Begin("PBR Material Debug", nullptr, ImGuiWindowFlags_NoCollapse)) {
+            const char* pbrDebugModes[] = {
+                "Final lighting",
+                "Base color",
+                "World normal",
+                "Metallic",
+                "Perceptual roughness",
+                "Ambient occlusion",
+                "HDR emissive",
+                "Normal faces camera (green=yes, red=no)",
+                "Direct lighting only",
+            };
+            ImGui::Combo("Output", &pbrDebugMode, pbrDebugModes, IM_ARRAYSIZE(pbrDebugModes));
+            ImGui::Checkbox("Emissive contribution", &pbrEmissiveEnabled);
+            ImGui::TextDisabled(
+                "Reads the same GBuffer channels consumed by deferred lighting");
+        }
+        ImGui::End();
+        lightBinningPass.draw_debug_ui();
         shadowPass.draw_debug_ui();
         contactShadowPass.draw_debug_ui();
         ddgiProbeTracePass.draw_debug_ui();
@@ -1478,9 +1512,9 @@ void VulkanEngine::init_pipelines()
     materialResources.emissiveSampler   = _defaultSamplerLinear;
 
     GLTFMetallic_Roughness::MaterialConstants constants{};
-    constants.colorFactors        = glm::vec4{1, 1, 1, 1};
-    constants.metal_rough_factors = glm::vec4{0, 0.5f, 0, 0};
-    constants.emissive_factors    = glm::vec4{0, 0, 0, 0};
+	constants.colorFactors        = glm::vec4{1, 1, 1, 1};
+	constants.metal_rough_factors = glm::vec4{0, 0.5f, 1, 1};
+	constants.emissive_factors    = glm::vec4{0, 0, 0, 0.5f};
 
     materialResources.data = constants;
 
@@ -1721,7 +1755,6 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 	vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,_deferredLightingPipeline);
 	//vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout, 0, 1, &_gBufferDescriptorSet, 0, nullptr);
 	FrameData& currentFrame = ctx.frame;
-    ctx.lightSystem.upload_frame(currentFrame);
 
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							0, 1, &currentFrame.globalDescriptor, 0, nullptr); // 绑定 Set 0 (SceneData)
@@ -1747,7 +1780,18 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
         static_cast<float>(ddgiProbeBlendPass.lighting_debug_mode()),
         ddgiLightingEnabled ? 1.f : 0.f);
     lightingPushConstants.ddgiDebugParams = glm::vec4(
-        ddgiProbeBlendPass.heatmap_exposure(), 0.f, 0.f, 0.f);
+        ddgiProbeBlendPass.heatmap_exposure(),
+        static_cast<float>(pbrDebugMode),
+        pbrEmissiveEnabled ? 1.f : 0.f,
+        0.f);
+    uint32_t lightGridFlags = 0;
+    lightGridFlags |= lightBinningPass.enabled() ? 1u : 0u;
+    lightGridFlags |= lightBinningPass.enabled() && lightBinningPass.debug_heatmap() ? 2u : 0u;
+    lightingPushConstants.lightGridParams = glm::uvec4(
+        lightBinningPass.tile_count_x(ctx.drawExtent),
+        lightBinningPass.tile_count_y(ctx.drawExtent),
+        LightBinningPass::TileSize,
+        lightGridFlags);
     vkCmdPushConstants(
         cmd,
         _deferredLightingPipelineLayout,
@@ -1950,7 +1994,8 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
     std::vector<VkFormat> gbufferFormats = { 
         VK_FORMAT_R8G8B8A8_UNORM,       // Albedo matches _gAlbedo format
         VK_FORMAT_R16G16B16A16_SFLOAT,  // Normal matches _gNormal format
-        VK_FORMAT_R8G8B8A8_UNORM        // ORM matches _gORM format
+        VK_FORMAT_R8G8B8A8_UNORM,       // Material matches _gORM format
+        VK_FORMAT_R16G16B16A16_SFLOAT   // HDR emissive matches _gEmissive format
     };
 	pipelineBuilder.set_color_attachment_formats(gbufferFormats);
 	pipelineBuilder.set_depth_format(engine->_depthImage.imageFormat);
@@ -1965,6 +2010,14 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
             PipelineVariant::GBuffer_MetallicRoughness,
             ShadingModel::MetallicRoughness,
             MaterialSurface::Opaque,
+        },
+        pipelineBuilder);
+    engine->pipelineRegistry.create_material_pipeline(
+        PipelineKey{
+            RenderPassType::GBuffer,
+            PipelineVariant::GBuffer_MetallicRoughness,
+            ShadingModel::MetallicRoughness,
+            MaterialSurface::Masked,
         },
         pipelineBuilder);
 
@@ -2085,6 +2138,10 @@ MaterialInstance GLTFMetallic_Roughness::write_material(VkDevice device, Materia
     localMat.normalTexID = normalID;
     localMat.occlusionTexID = occlusionID;
     localMat.emissiveTexID = emissiveID;
+    if (surface == MaterialSurface::Masked) {
+        localMat.materialFlags |= MaterialFlagAlphaMask;
+    }
+    matData.doubleSided = (localMat.materialFlags & MaterialFlagDoubleSided) != 0;
 
     // 2. Upload material to global SSBO and get materialID
     matData.materialID = engine.upload_bindless_material(localMat);
@@ -2331,6 +2388,25 @@ void VulkanEngine::init_gbuffer() {
         VK_FORMAT_R8G8B8A8_UNORM, _gORM.image, VK_IMAGE_ASPECT_COLOR_BIT);
     vkCreateImageView(_device, &ormViewInfo, nullptr, &_gORM.imageView);
 
+    // 4. Emissive remains HDR and must not be quantized into the material buffer.
+    VkImageCreateInfo emissiveInfo = vkinit::image_create_info(
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        gbufferExtent);
+    vmaCreateImage(
+        _allocator,
+        &emissiveInfo,
+        &vmaallocInfo,
+        &_gEmissive.image,
+        &_gEmissive.allocation,
+        nullptr);
+
+    VkImageViewCreateInfo emissiveViewInfo = vkinit::imageview_create_info(
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        _gEmissive.image,
+        VK_IMAGE_ASPECT_COLOR_BIT);
+    vkCreateImageView(_device, &emissiveViewInfo, nullptr, &_gEmissive.imageView);
+
     // 把它们加进删除队列
     _mainDeletionQueue.push_function([=, this]() {
         vkDestroyImageView(_device, _gAlbedo.imageView, nullptr);
@@ -2341,6 +2417,9 @@ void VulkanEngine::init_gbuffer() {
 
         vkDestroyImageView(_device, _gORM.imageView, nullptr);
         vmaDestroyImage(_allocator, _gORM.image, _gORM.allocation);
+
+        vkDestroyImageView(_device, _gEmissive.imageView, nullptr);
+        vmaDestroyImage(_allocator, _gEmissive.image, _gEmissive.allocation);
     });
 
     _gBufferDescriptorLayout = _descriptorSystem.layout(DescriptorLayoutID::GBufferInput);
@@ -2353,6 +2432,7 @@ void VulkanEngine::init_gbuffer() {
     _descriptorSystem.write_image(_gBufferDescriptorSet, 1, _gNormal.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     _descriptorSystem.write_image(_gBufferDescriptorSet, 2, _gORM.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     _descriptorSystem.write_image(_gBufferDescriptorSet, 3, _depthImage.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    _descriptorSystem.write_image(_gBufferDescriptorSet, 4, _gEmissive.imageView, _defaultSamplerNearest, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 }
 
 void VulkanEngine::destroy_swapchain()

@@ -44,6 +44,12 @@ file(GLOB_RECURSE HLSL_SOURCE_FILES CONFIGURE_DEPENDS
         "${SHADER_SEARCH_PATH}/*.comp.hlsl"
 )
 
+# Shared material layouts and BRDF includes must invalidate their consumers.
+# Track all GLSL headers conservatively, including nested includes.
+file(GLOB_RECURSE GLSL_INCLUDE_FILES CONFIGURE_DEPENDS
+    "${SHADER_SEARCH_PATH}/*.glsl"
+)
+
 # 3. 检查是否找到了文件
 list(LENGTH GLSL_SOURCE_FILES SHADER_COUNT)
 message(STATUS "Found ${SHADER_COUNT} shader files.")
@@ -62,7 +68,7 @@ foreach(GLSL ${GLSL_SOURCE_FILES})
     add_custom_command(
             OUTPUT ${SPIRV}
             COMMAND ${GLSL_VALIDATOR} -V "${GLSL}" -o "${SPIRV}"
-            DEPENDS ${GLSL}
+            DEPENDS ${GLSL} ${GLSL_INCLUDE_FILES}
             COMMENT "Compiling ${FILE_NAME}"
             VERBATIM
     )

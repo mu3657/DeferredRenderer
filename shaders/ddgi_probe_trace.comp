@@ -30,6 +30,7 @@ layout(std140, set = 0, binding = 1) uniform DDGIVolumeConstants {
 layout(rgba32f, set = 0, binding = 2) uniform writeonly image2DArray rayData;
 layout(set = 0, binding = 5) uniform sampler2DArray irradianceAtlas;
 layout(set = 0, binding = 6) uniform sampler2DArray distanceAtlas;
+layout(rgba32f, set = 0, binding = 8) uniform readonly image2DArray probeData;
 layout(std430, set = 0, binding = 7) buffer DDGITraceDiagnostics {
     uint rayCount;
     uint nonZeroRadianceRays;
@@ -42,8 +43,11 @@ layout(std430, set = 0, binding = 7) buffer DDGITraceDiagnostics {
     uint nonZeroIrradianceTexels;
     uint nonFiniteIrradianceTexels;
     uint maxIrradianceBits;
+    uint relocatedProbeCount;
+    uint nonFiniteProbeOffsets;
+    uint maxProbeOffsetBits;
     uint reserved0;
-    uvec4 reserved1;
+    uint reserved1;
 } diagnostics;
 
 struct Vertex {
@@ -52,6 +56,7 @@ struct Vertex {
     vec3 normal;
     float uv_y;
     vec4 color;
+    vec4 tangent;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer VertexBuffer {
@@ -99,7 +104,7 @@ struct MaterialData {
     uint normalTexID;
     uint occlusionTexID;
     uint emissiveTexID;
-    uint pad0;
+    uint materialFlags;
     uint pad1;
     uint pad2;
     vec4 extra[12];
@@ -136,14 +141,18 @@ layout(std430, set = 2, binding = 1) readonly buffer LightStorage {
 };
 
 const uint GEOMETRY_ALPHA_TESTED = 1u << 0;
+const uint GEOMETRY_DOUBLE_SIDED = 1u << 1;
+const uint MATERIAL_FLAG_TANGENT_SPACE_READY = 1u << 2;
 const uint LIGHT_TYPE_POINT = 0u;
 const uint LIGHT_TYPE_DIRECTIONAL = 1u;
 const uint LIGHT_TYPE_SPOT = 2u;
 const uint LIGHT_TYPE_RECT_AREA = 3u;
 const uint TRACE_FLAG_MULTI_BOUNCE = 1u << 0;
 const uint TRACE_FLAG_SIGNED_BACKFACE_DISTANCE = 1u << 1;
+const uint DDGI_VOLUME_FLAG_RELOCATION = 1u << 1;
 const float PI = 3.14159265358979323846;
-const float GOLDEN_ANGLE = 2.39996322972865332;
+const float GOLDEN_RATIO_CONJUGATE = 0.6180339887498948482;
+const uint RTXGI_FIXED_RAY_COUNT = 32u;
 
 struct TriangleSample {
     vec3 position0;
@@ -151,6 +160,7 @@ struct TriangleSample {
     vec3 position2;
     vec3 normal;
     vec2 uv;
+    vec4 tangent;
     uint materialID;
 };
 
@@ -185,6 +195,13 @@ TriangleSample load_triangle_sample(
     result.uv = vec2(v0.uv_x, v0.uv_y) * bary.x
         + vec2(v1.uv_x, v1.uv_y) * bary.y
         + vec2(v2.uv_x, v2.uv_y) * bary.z;
+    vec3 tangent = v0.tangent.xyz * bary.x
+        + v1.tangent.xyz * bary.y
+        + v2.tangent.xyz * bary.z;
+    float tangentSign = v0.tangent.w * bary.x
+        + v1.tangent.w * bary.y
+        + v2.tangent.w * bary.z;
+    result.tangent = vec4(tangent, tangentSign < 0.0 ? -1.0 : 1.0);
     result.materialID = geometry.materialID;
     return result;
 }
@@ -193,11 +210,15 @@ bool candidate_passes_alpha_test(
     uint instanceIndex,
     uint geometryIndex,
     uint primitiveIndex,
-    vec2 barycentrics)
+    vec2 barycentrics,
+    bool frontFace)
 {
     RayTracingInstance instance = instances[instanceIndex];
     RayTracingGeometry geometry =
         geometries[instance.geometryMetadataOffset + geometryIndex];
+    if (!frontFace && (geometry.flags & GEOMETRY_DOUBLE_SIDED) == 0u) {
+        return false;
+    }
     if ((geometry.flags & GEOMETRY_ALPHA_TESTED) == 0u) {
         return true;
     }
@@ -225,11 +246,28 @@ vec3 rotate_by_quaternion(vec3 direction, vec4 quaternion)
 
 vec3 fibonacci_direction(uint rayIndex, uint rayCount)
 {
-    float index = float(rayIndex) + 0.5;
-    float z = 1.0 - 2.0 * index / float(rayCount);
+    float sampleIndex = float(rayIndex);
+    float z = 1.0 - (2.0 * sampleIndex + 1.0) / float(rayCount);
     float radius = sqrt(max(0.0, 1.0 - z * z));
-    float phi = GOLDEN_ANGLE * index;
+    float phi = 2.0 * PI * fract(sampleIndex * GOLDEN_RATIO_CONJUGATE);
     return vec3(cos(phi) * radius, sin(phi) * radius, z);
+}
+
+vec3 probe_ray_direction(uint rayIndex, uint rayCount)
+{
+    bool relocationEnabled =
+        (volume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u;
+    bool fixedRay = relocationEnabled && rayIndex < RTXGI_FIXED_RAY_COUNT;
+    uint sampleIndex = fixedRay ? rayIndex : rayIndex - (relocationEnabled ? RTXGI_FIXED_RAY_COUNT : 0u);
+    uint sampleCount = fixedRay
+        ? RTXGI_FIXED_RAY_COUNT
+        : rayCount - (relocationEnabled ? RTXGI_FIXED_RAY_COUNT : 0u);
+    vec3 direction = fibonacci_direction(sampleIndex, sampleCount);
+    if (fixedRay) {
+        return normalize(direction);
+    }
+    vec4 conjugateRotation = vec4(-volume.rayRotation.xyz, volume.rayRotation.w);
+    return normalize(rotate_by_quaternion(direction, conjugateRotation));
 }
 
 uvec3 probe_coordinates(uint probeIndex)
@@ -245,15 +283,27 @@ uvec3 probe_coordinates(uint probeIndex)
 vec3 probe_world_position(uint probeIndex)
 {
     ivec3 coordinates = ivec3(probe_coordinates(probeIndex)) + volume.scrollOffsets.xyz;
-    return volume.originMaxRayDistance.xyz
+    vec3 position = volume.originMaxRayDistance.xyz
         + vec3(coordinates) * volume.spacingHysteresis.xyz;
+    if ((volume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u) {
+        uvec3 probeCoordinates = probe_coordinates(probeIndex);
+        position += imageLoad(
+            probeData,
+            ivec3(probeCoordinates.x, probeCoordinates.z, probeCoordinates.y)).xyz;
+    }
+    return position;
 }
 
 vec3 probe_world_position(uvec3 coordinates)
 {
     ivec3 scrolledCoordinates = ivec3(coordinates) + volume.scrollOffsets.xyz;
-    return volume.originMaxRayDistance.xyz
+    vec3 position = volume.originMaxRayDistance.xyz
         + vec3(scrolledCoordinates) * volume.spacingHysteresis.xyz;
+    if ((volume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u) {
+        position += imageLoad(
+            probeData, ivec3(coordinates.x, coordinates.z, coordinates.y)).xyz;
+    }
+    return position;
 }
 
 uint probe_index(uvec3 coordinates)
@@ -458,7 +508,8 @@ bool trace_visibility(vec3 origin, vec3 direction, float maxDistance)
                 rayQueryGetIntersectionInstanceCustomIndexEXT(shadowQuery, false),
                 rayQueryGetIntersectionGeometryIndexEXT(shadowQuery, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(shadowQuery, false),
-                rayQueryGetIntersectionBarycentricsEXT(shadowQuery, false))) {
+                rayQueryGetIntersectionBarycentricsEXT(shadowQuery, false),
+                rayQueryGetIntersectionFrontFaceEXT(shadowQuery, false))) {
             rayQueryConfirmIntersectionEXT(shadowQuery);
         }
     }
@@ -557,8 +608,7 @@ void main()
 
     uint probeIndex = volume.texelsAndUpdate.z + updateIndex;
     vec3 rayOrigin = probe_world_position(probeIndex);
-    vec3 rayDirection = normalize(rotate_by_quaternion(
-        fibonacci_direction(rayIndex, raysPerProbe), volume.rayRotation));
+    vec3 rayDirection = probe_ray_direction(rayIndex, raysPerProbe);
     float maxRayDistance = volume.originMaxRayDistance.w;
 
     rayQueryEXT query;
@@ -578,7 +628,8 @@ void main()
                 rayQueryGetIntersectionInstanceCustomIndexEXT(query, false),
                 rayQueryGetIntersectionGeometryIndexEXT(query, false),
                 rayQueryGetIntersectionPrimitiveIndexEXT(query, false),
-                rayQueryGetIntersectionBarycentricsEXT(query, false))) {
+                rayQueryGetIntersectionBarycentricsEXT(query, false),
+                rayQueryGetIntersectionFrontFaceEXT(query, false))) {
             rayQueryConfirmIntersectionEXT(query);
         }
     }
@@ -608,9 +659,12 @@ void main()
         // option and for the future relocation/classification path.
         bool preserveBackfaceSign =
             (pushConstants.flags & TRACE_FLAG_SIGNED_BACKFACE_DISTANCE) != 0u;
+        // RTXGI stores backface distances at one fifth magnitude. The official
+        // relocation kernel multiplies negative distances by five before using
+        // them, so this scale is part of the ray-data ABI rather than tuning.
         signedDistance = frontFace || !preserveBackfaceSign
             ? hitDistance
-            : -hitDistance;
+            : -hitDistance * 0.2;
 
         if (pushConstants.traceMode == 4u) {
             // Bypass hit shading entirely to validate ray-data, blend, atlas,
@@ -620,7 +674,7 @@ void main()
             // Green front faces and red back faces expose winding and probe
             // placement problems without depending on materials or lights.
             radiance = frontFace ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-        } else if (frontFace && pushConstants.traceMode > 0u) {
+        } else if (pushConstants.traceMode > 0u) {
             uint instanceIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
             uint geometryIndex = rayQueryGetIntersectionGeometryIndexEXT(query, true);
             TriangleSample hit = load_triangle_sample(
@@ -638,6 +692,8 @@ void main()
             vec3 worldNormal = dot(transformedNormal, transformedNormal) > 1e-8
                 ? normalize(transformedNormal)
                 : normalize(cross(worldP1 - worldP0, worldP2 - worldP0));
+            mat3 objectToWorldLinear = mat3(objectToWorld);
+            vec3 worldTangent = objectToWorldLinear * hit.tangent.xyz;
             if (dot(worldNormal, rayDirection) > 0.0) {
                 worldNormal = -worldNormal;
             }
@@ -653,6 +709,33 @@ void main()
             vec4 baseColorTexture = textureLod(
                 globalTextures[nonuniformEXT(material.colorTexID)], hit.uv, 0.0);
             vec4 baseColor = baseColorTexture * material.colorFactors;
+            if ((material.materialFlags & MATERIAL_FLAG_TANGENT_SPACE_READY) != 0u) {
+                worldTangent -= worldNormal * dot(worldNormal, worldTangent);
+                float tangentLengthSquared = dot(worldTangent, worldTangent);
+                if (tangentLengthSquared <= 1e-8) {
+                    vec3 fallbackAxis = abs(worldNormal.z) < 0.999
+                        ? vec3(0.0, 0.0, 1.0)
+                        : vec3(0.0, 1.0, 0.0);
+                    worldTangent = normalize(cross(fallbackAxis, worldNormal));
+                } else {
+                    worldTangent *= inversesqrt(tangentLengthSquared);
+                }
+                float transformHandedness = determinant(objectToWorldLinear) < 0.0
+                    ? -1.0
+                    : 1.0;
+                vec3 worldBitangent = normalize(cross(worldNormal, worldTangent))
+                    * hit.tangent.w
+                    * transformHandedness;
+                vec3 tangentNormal = textureLod(
+                    globalTextures[nonuniformEXT(material.normalTexID)],
+                    hit.uv,
+                    0.0).xyz * 2.0 - 1.0;
+                tangentNormal.xy *= material.metal_rough_factors.z;
+                worldNormal = normalize(mat3(
+                    worldTangent,
+                    worldBitangent,
+                    worldNormal) * tangentNormal);
+            }
             float metallic = clamp(
                 textureLod(
                     globalTextures[nonuniformEXT(material.metalRoughTexID)],

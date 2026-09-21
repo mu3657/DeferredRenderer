@@ -51,6 +51,7 @@ private:
     VkPipeline _pipeline{VK_NULL_HANDLE};
     std::vector<DDGIProbeTraceDispatchStats> _pendingFrameStats;
     DDGIProbeTraceDispatchStats _stats{};
+    uint64_t _lastProbeDataResetSerial{0};
     bool _enabled{true};
     bool _dispatchInFlight{false};
     bool _multiBounceEnabled{true};

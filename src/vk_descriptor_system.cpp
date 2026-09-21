@@ -166,6 +166,7 @@ void DescriptorSystem::create_layouts()
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         _layouts[layout_index(DescriptorLayoutID::GBufferInput)] =
             builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT);
     }
@@ -174,6 +175,7 @@ void DescriptorSystem::create_layouts()
         DescriptorLayoutBuilder builder;
         builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        builder.add_binding(2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         _layouts[layout_index(DescriptorLayoutID::LightData)] =
             builder.build(
                 _device,
@@ -229,6 +231,7 @@ void DescriptorSystem::create_layouts()
         builder.add_binding(5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        builder.add_binding(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         _layouts[layout_index(DescriptorLayoutID::DDGIProbeTrace)] =
             builder.build(_device, VK_SHADER_STAGE_COMPUTE_BIT);
     }
@@ -248,7 +251,12 @@ void DescriptorSystem::create_layouts()
         builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
         builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         builder.add_binding(2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+        builder.add_binding(3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         _layouts[layout_index(DescriptorLayoutID::GIInput)] =
-            builder.build(_device, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+            builder.build(
+                _device,
+                VK_SHADER_STAGE_VERTEX_BIT
+                    | VK_SHADER_STAGE_FRAGMENT_BIT
+                    | VK_SHADER_STAGE_COMPUTE_BIT);
     }
 }

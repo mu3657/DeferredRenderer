@@ -33,12 +33,16 @@ struct MaterialData {
     uint occlusionTexID;
 
     uint emissiveTexID;
-    uint pad0;
+    uint materialFlags;
     uint pad1;
     uint pad2;
 
     vec4 extra[12];
 };
+
+const uint MATERIAL_FLAG_ALPHA_MASK = 1u << 0;
+const uint MATERIAL_FLAG_DOUBLE_SIDED = 1u << 1;
+const uint MATERIAL_FLAG_TANGENT_SPACE_READY = 1u << 2;
 
 #ifndef LIGHTING_PASS
 layout(set = 1, binding = 0) readonly buffer MaterialStorage {
@@ -77,5 +81,9 @@ layout(set = 2, binding = 0) uniform LightData {
 
 layout(set = 2, binding = 1) readonly buffer LightStorage {
     GPULight lights[];
+};
+
+layout(std430, set = 2, binding = 2) readonly buffer TileLightMaskStorage {
+    uint tileLightMasks[];
 };
 #endif

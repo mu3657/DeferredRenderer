@@ -37,6 +37,8 @@ add_executable (engine
         render_pass.h
         Renderpasses/geometry_pass.h
         Renderpasses/geometry_pass.cpp
+        Renderpasses/light_binning_pass.h
+        Renderpasses/light_binning_pass.cpp
         Renderpasses/shadow_pass.cpp
         Renderpasses/transparent_pass.h
         Renderpasses/transparent_pass.cpp

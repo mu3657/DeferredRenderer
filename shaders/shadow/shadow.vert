@@ -11,6 +11,7 @@ struct Vertex {
     vec3 normal;
     float uv_y;
     vec4 color;
+    vec4 tangent;
 };
 
 layout(buffer_reference, std430) readonly buffer VertexBuffer {
@@ -23,10 +24,15 @@ layout(push_constant) uniform constants {
     uint materialID;
 } PushConstants;
 
+layout(location = 0) out vec2 outUV;
+layout(location = 1) flat out uint outMaterialID;
+
 void main()
 {
     Vertex v = PushConstants.vertexBuffer.vertices[gl_VertexIndex];
 
     vec4 worldPos = PushConstants.render_matrix * vec4(v.position, 1.0);
     gl_Position = sceneData.viewproj * worldPos;
+    outUV = vec2(v.uv_x, v.uv_y);
+    outMaterialID = PushConstants.materialID;
 }

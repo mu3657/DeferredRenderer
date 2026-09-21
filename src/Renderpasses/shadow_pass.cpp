@@ -342,6 +342,18 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
         fmt::println("Error when building the shadow vertex shader module");
         return;
     }
+    VkShaderModule maskedFragmentShader = VK_NULL_HANDLE;
+    if (!vkutil::load_shader_module(
+            "../cmake-build-debug/shaders/shadow_masked.frag.spv",
+            _engine->_device,
+            &maskedFragmentShader)
+        && !vkutil::load_shader_module(
+            "../cmake-build-debug-mingw/shaders/shadow_masked.frag.spv",
+            _engine->_device,
+            &maskedFragmentShader)) {
+        vkDestroyShaderModule(_engine->_device, meshVertexShader, nullptr);
+        throw std::runtime_error("Failed to load shadow_masked.frag.spv");
+    }
     //  TODO： 修改piplinebuilder 支持无frag build
     PipelineBuilder pipelineBuilder;
     pipelineBuilder.set_shaders(meshVertexShader, VK_NULL_HANDLE);
@@ -364,7 +376,19 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
         },
         pipelineBuilder);
 
+    PipelineBuilder maskedPipelineBuilder = pipelineBuilder;
+    maskedPipelineBuilder.set_shaders(meshVertexShader, maskedFragmentShader);
+    _maskedPipeline = _engine->pipelineRegistry.create_material_pipeline(
+        PipelineKey{
+            RenderPassType::ShadowDepth,
+            PipelineVariant::ShadowDepth_AlphaCutout,
+            ShadingModel::MetallicRoughness,
+            MaterialSurface::Masked,
+        },
+        maskedPipelineBuilder);
+
     vkDestroyShaderModule(_engine->_device, meshVertexShader, nullptr);
+    vkDestroyShaderModule(_engine->_device, maskedFragmentShader, nullptr);
 
 
 

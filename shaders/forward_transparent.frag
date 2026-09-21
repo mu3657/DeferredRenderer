@@ -18,7 +18,6 @@ layout(set = 3, binding = 0) uniform sampler2D shadowMap;
 layout(set = 3, binding = 2) uniform sampler2D punctualShadowMap;
 
 const int SHADOW_CASCADE_COUNT = 4;
-const float PI = 3.14159265359;
 
 layout(set = 3, binding = 1) uniform ShadowDataBuffer {
     mat4 lightViewProj[SHADOW_CASCADE_COUNT];
@@ -211,59 +210,7 @@ float samplePunctualShadow(GPULight light, uint type, vec3 worldPos, vec3 N, vec
     return mix(1.0, pcfVisibility, clamp(shadow.params.z, 0.0, 1.0));
 }
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0)
-{
-    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-float distributionGGX(vec3 N, vec3 H, float roughness)
-{
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float NdotH = max(dot(N, H), 0.0);
-    float denominator = NdotH * NdotH * (a2 - 1.0) + 1.0;
-    return a2 / max(PI * denominator * denominator, 0.0001);
-}
-
-float geometrySchlickGGX(float NdotV, float roughness)
-{
-    float r = roughness + 1.0;
-    float k = (r * r) / 8.0;
-    return NdotV / max(NdotV * (1.0 - k) + k, 0.0001);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness)
-{
-    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness)
-        * geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
-}
-
-vec3 evaluatePBRDirect(
-    vec3 albedo,
-    float metallic,
-    float roughness,
-    vec3 N,
-    vec3 V,
-    vec3 L,
-    vec3 radiance)
-{
-    float NdotL = max(dot(N, L), 0.0);
-    if (NdotL <= 0.0) {
-        return vec3(0.0);
-    }
-
-    vec3 H = normalize(V + L);
-    vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-    float D = distributionGGX(N, H, roughness);
-    float G = geometrySmith(N, V, L, roughness);
-    vec3 specular = (D * G * F)
-        / max(4.0 * max(dot(N, V), 0.0) * NdotL, 0.0001);
-
-    vec3 diffuseWeight = (vec3(1.0) - F) * (1.0 - metallic);
-    return (diffuseWeight * albedo / PI + specular) * radiance * NdotL;
-}
-
+#include "pbr.glsl"
 #include "area_light.glsl"
 
 void main()
@@ -281,12 +228,27 @@ void main()
         inUV);
     float metallic = clamp(metalRoughSample.b * mat.metal_rough_factors.x, 0.0, 1.0);
     float roughness = clamp(metalRoughSample.g * mat.metal_rough_factors.y, 0.04, 1.0);
-    float ao = clamp(texture(globalTextures[nonuniformEXT(mat.occlusionTexID)], inUV).r, 0.0, 1.0);
+    float occlusionSample = clamp(
+        texture(globalTextures[nonuniformEXT(mat.occlusionTexID)], inUV).r,
+        0.0,
+        1.0);
+    float ao = mix(1.0, occlusionSample, clamp(mat.metal_rough_factors.w, 0.0, 1.0));
+    vec3 emissive = texture(
+        globalTextures[nonuniformEXT(mat.emissiveTexID)], inUV).rgb
+        * mat.emissive_factors.rgb;
 
     vec3 N = normalize(inNormal);
-    if (!gl_FrontFacing) {
-        N = -N;
-    }
+    // Match the legacy GBuffer authored-normal convention; raster winding
+    // alone is not a reliable shading-side contract for these baked meshes.
+    vec3 normalDx = dFdx(N);
+    vec3 normalDy = dFdy(N);
+    float normalVariance = 0.5 * (
+        dot(normalDx, normalDx) + dot(normalDy, normalDy));
+    float kernelRoughnessSquared = min(2.0 * normalVariance, 0.18);
+    roughness = sqrt(clamp(
+        roughness * roughness + kernelRoughnessSquared,
+        0.0016,
+        1.0));
 
     vec3 cameraPosition = inverse(sceneData.view)[3].xyz;
     vec3 V = normalize(cameraPosition - inWorldPos);
@@ -356,6 +318,10 @@ void main()
             radiance * visibility);
     }
 
-    lighting += lightData.ambientColor.rgb * baseColor.rgb * ao;
+    lighting += lightData.ambientColor.rgb
+        * baseColor.rgb
+        * pbrDiffuseEnergy(baseColor.rgb, metallic, roughness, max(dot(N, V), 0.0))
+        * ao;
+    lighting += max(emissive, vec3(0.0));
     outFragColor = vec4(lighting, alpha);
 }

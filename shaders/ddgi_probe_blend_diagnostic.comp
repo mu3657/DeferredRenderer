@@ -22,8 +22,11 @@ layout(std430, set = 0, binding = 6) buffer DDGIBlendDiagnostics {
     uint nonZeroIrradianceTexels;
     uint nonFiniteIrradianceTexels;
     uint maxIrradianceBits;
+    uint relocatedProbeCount;
+    uint nonFiniteProbeOffsets;
+    uint maxProbeOffsetBits;
     uint reserved0;
-    uvec4 reserved1;
+    uint reserved1;
 } diagnostics;
 
 void main()

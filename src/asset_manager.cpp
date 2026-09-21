@@ -9,6 +9,7 @@
 #include <texture_asset.h>
 #include <vk_loader.h>
 #include <algorithm>
+#include <cmath>
 void AssetManager::init(VulkanEngine* engine) {
     _engine = engine;
     // Build a default material wrapping the engine's pre-allocated defaultData
@@ -46,6 +47,13 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
     // 计算顶点数量
     uint32_t vertexCount = 0;
     if (meshInfo.vertexFormat == assets::VertexFormat::Dynamic) {
+        if (meshInfo.vertexStride == 0
+            || (meshInfo.vertexBuferSize % meshInfo.vertexStride) != 0) {
+            throw std::runtime_error(fmt::format(
+                "Mesh {} has an invalid Dynamic vertex stride {}",
+                path,
+                meshInfo.vertexStride));
+        }
         vertexCount = meshInfo.vertexBuferSize / meshInfo.vertexStride;
     } else if (meshInfo.vertexFormat == assets::VertexFormat::PNCV_F32) {
         vertexCount = meshInfo.vertexBuferSize / sizeof(assets::Vertex_f32_PNCV);
@@ -53,12 +61,12 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
         vertexCount = meshInfo.vertexBuferSize / sizeof(assets::Vertex_P32N8C8V16);
     }
 
-    uint32_t indexCount = meshInfo.indexBuferSize / meshInfo.indexSize;
     if (meshInfo.indexSize != sizeof(uint32_t)
         || (meshInfo.indexBuferSize % sizeof(uint32_t)) != 0) {
         throw std::runtime_error(
             fmt::format("Mesh {} does not contain tightly packed uint32 indices", path));
     }
+    uint32_t indexCount = meshInfo.indexBuferSize / meshInfo.indexSize;
 
     const auto* meshIndices = reinterpret_cast<const uint32_t*>(indexBuffer.data());
     for (uint32_t index = 0; index < indexCount; ++index) {
@@ -74,8 +82,9 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
 
     // -----------------------------------------------------------------------
     // 格式转换：baker 存的是 Vertex_f32_PNCV (44 bytes, P/N/Color3/UV 顺序)，
-    // 而 gbuffer.vert 通过 buffer_reference std430 期望 engine::Vertex (48 bytes,
-    // position/uv_x/normal/uv_y/color4 交叉格式)。
+    // 而 gbuffer.vert 通过 buffer_reference std430 期望 engine::Vertex (64 bytes,
+    // position/uv_x/normal/uv_y/color4/tangent4 交叉格式)。旧 Dynamic 资产只含
+    // 前 48 bytes；下方逐顶点复制该前缀并统一重建 tangent。
     // VertexIndex > 0 时 stride 不同会导致 shader 从错误偏移读 position，
     // 使 gl_Position 全部错误。在上传 GPU 前先在 CPU 侧做显式转换。
     // -----------------------------------------------------------------------
@@ -108,11 +117,89 @@ std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {
             engineVertices[i].uv_x = src[i].uv[0];
             engineVertices[i].uv_y = src[i].uv[1];
         }
+    } else if (meshInfo.vertexFormat == assets::VertexFormat::Dynamic) {
+        // Legacy Dynamic assets store the pre-tangent engine vertex prefix.
+        // Copy per vertex so changing the destination stride cannot interleave
+        // adjacent source vertices. Tangents are regenerated below.
+        constexpr size_t EngineVertexPrefixSize = offsetof(Vertex, tangent);
+        const size_t copySize = std::min<size_t>(
+            meshInfo.vertexStride,
+            EngineVertexPrefixSize);
+        for (uint32_t vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+            std::memcpy(
+                &engineVertices[vertexIndex],
+                vertexBuffer.data()
+                    + static_cast<size_t>(vertexIndex) * meshInfo.vertexStride,
+                copySize);
+        }
     } else {
-        //未知格式：直接 memcpy
+        throw std::runtime_error(fmt::format(
+            "Mesh {} uses an unsupported vertex format",
+            path));
+    }
 
-        size_t copySize = std::min(vertexCount * sizeof(Vertex), vertexBuffer.size());
-        memcpy(engineVertices.data(), vertexBuffer.data(), copySize);
+    // Generate a stable tangent frame from the final engine vertex/index data.
+    // This preserves mirrored-UV handedness and avoids derivative-TBN seams.
+    std::vector<glm::vec3> tangentAccum(vertexCount, glm::vec3(0.f));
+    std::vector<glm::vec3> bitangentAccum(vertexCount, glm::vec3(0.f));
+    for (uint32_t triangle = 0; triangle + 2 < indexCount; triangle += 3) {
+        const uint32_t i0 = meshIndices[triangle + 0];
+        const uint32_t i1 = meshIndices[triangle + 1];
+        const uint32_t i2 = meshIndices[triangle + 2];
+        const Vertex& v0 = engineVertices[i0];
+        const Vertex& v1 = engineVertices[i1];
+        const Vertex& v2 = engineVertices[i2];
+        const glm::vec3 edge1 = v1.position - v0.position;
+        const glm::vec3 edge2 = v2.position - v0.position;
+        const glm::vec2 uv0(v0.uv_x, v0.uv_y);
+        const glm::vec2 uv1(v1.uv_x, v1.uv_y);
+        const glm::vec2 uv2(v2.uv_x, v2.uv_y);
+        const glm::vec2 deltaUV1 = uv1 - uv0;
+        const glm::vec2 deltaUV2 = uv2 - uv0;
+        const float determinant = deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x;
+        if (std::abs(determinant) <= 1e-8f) {
+            continue;
+        }
+
+        const float inverseDeterminant = 1.f / determinant;
+        const glm::vec3 tangent =
+            (edge1 * deltaUV2.y - edge2 * deltaUV1.y) * inverseDeterminant;
+        const glm::vec3 bitangent =
+            (edge2 * deltaUV1.x - edge1 * deltaUV2.x) * inverseDeterminant;
+        tangentAccum[i0] += tangent;
+        tangentAccum[i1] += tangent;
+        tangentAccum[i2] += tangent;
+        bitangentAccum[i0] += bitangent;
+        bitangentAccum[i1] += bitangent;
+        bitangentAccum[i2] += bitangent;
+    }
+
+    for (uint32_t vertexIndex = 0; vertexIndex < vertexCount; ++vertexIndex) {
+        Vertex& vertex = engineVertices[vertexIndex];
+        glm::vec3 normal = vertex.normal;
+        const float normalLengthSquared = glm::dot(normal, normal);
+        normal = normalLengthSquared > 1e-8f
+            ? normal / std::sqrt(normalLengthSquared)
+            : glm::vec3(0.f, 1.f, 0.f);
+        vertex.normal = normal;
+
+        glm::vec3 tangent = tangentAccum[vertexIndex]
+            - normal * glm::dot(normal, tangentAccum[vertexIndex]);
+        const float tangentLengthSquared = glm::dot(tangent, tangent);
+        if (tangentLengthSquared <= 1e-8f) {
+            const glm::vec3 fallbackAxis = std::abs(normal.z) < 0.999f
+                ? glm::vec3(0.f, 0.f, 1.f)
+                : glm::vec3(0.f, 1.f, 0.f);
+            tangent = glm::normalize(glm::cross(fallbackAxis, normal));
+        } else {
+            tangent /= std::sqrt(tangentLengthSquared);
+        }
+
+        const float handedness = glm::dot(
+            glm::cross(normal, tangent), bitangentAccum[vertexIndex]) < 0.f
+            ? -1.f
+            : 1.f;
+        vertex.tangent = glm::vec4(tangent, handedness);
     }
 
     // 创建 MeshAsset
@@ -320,6 +407,16 @@ float parse_float(const std::string& str, float defaultVal) {
     }
 }
 
+bool parse_bool(const std::string& str, bool defaultVal) {
+    if (str == "true" || str == "1") {
+        return true;
+    }
+    if (str == "false" || str == "0") {
+        return false;
+    }
+    return defaultVal;
+}
+
 std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     auto it = _materials.find(path);
     if (it != _materials.end()) {
@@ -337,6 +434,8 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     MaterialSurface surface = MaterialSurface::Opaque;
     if (matInfo.transparency == assets::TransparencyMode::Transparent) {
         surface = MaterialSurface::Transparent;
+    } else if (matInfo.transparency == assets::TransparencyMode::Masked) {
+        surface = MaterialSurface::Masked;
     }
 
     // Resolve Textures
@@ -381,11 +480,25 @@ std::shared_ptr<Material> AssetManager::load_material(const std::string& path) {
     
     float metallic = parse_float(matInfo.customProperties["metallicFactor"], 1.0f);
     float roughness = parse_float(matInfo.customProperties["roughnessFactor"], 1.0f);
-    constants.metal_rough_factors = glm::vec4(metallic, roughness, 0.0f, 0.0f);
+    float normalScale = parse_float(matInfo.customProperties["normalScale"], 1.0f);
+    float occlusionStrength = parse_float(matInfo.customProperties["occlusionStrength"], 1.0f);
+    constants.metal_rough_factors = glm::vec4(
+        metallic,
+        roughness,
+        normalScale,
+        occlusionStrength);
 
     constants.emissive_factors = glm::vec4(
         parse_vec3(matInfo.customProperties["emissiveFactor"], glm::vec3(0.0f)),
         parse_float(matInfo.customProperties["alphaCutoff"], 0.5f));
+    constants.materialFlags = parse_bool(
+        matInfo.customProperties["doubleSided"], false)
+        ? MaterialFlagDoubleSided
+        : MaterialFlagNone;
+    if (parse_bool(
+            matInfo.customProperties["tangentSpaceReady"], false)) {
+        constants.materialFlags |= MaterialFlagTangentSpaceReady;
+    }
 
     // Pass constants struct directly to write_material for SSBO inclusion
     resources.data = constants;

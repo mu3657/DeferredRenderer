@@ -333,11 +333,14 @@ void DDGIProbeDebugPass::draw_debug_ui()
         "Position",
         "Irradiance",
         "Update state",
+        "Relocation offset",
     };
-    ImGui::Combo("Display mode", &_mode, modes, 3);
+    ImGui::Combo("Display mode", &_mode, modes, 4);
     if (_mode == 1) {
         ImGui::SliderFloat(
             "Irradiance intensity", &_irradianceIntensity, 0.f, 4.f);
+    } else if (_mode == 3) {
+        ImGui::TextDisabled("Dark: unchanged; blue to red: increasing offset up to 0.45 probe cells");
     }
     ImGui::Checkbox("Current batch only", &_currentBatchOnly);
     ImGui::Text("Last submitted probes: %u", _lastDrawnProbeCount);

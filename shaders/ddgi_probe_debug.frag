@@ -21,6 +21,7 @@ layout(std140, set = 1, binding = 0) uniform DDGIVolumeConstants {
 
 layout(set = 1, binding = 1) uniform sampler2DArray irradianceAtlas;
 layout(set = 1, binding = 2) uniform sampler2DArray distanceAtlas;
+layout(set = 1, binding = 3) uniform sampler2DArray probeData;
 
 layout(push_constant) uniform DDGIProbeDebugPushConstants {
     vec4 originRadius;
@@ -32,6 +33,7 @@ layout(push_constant) uniform DDGIProbeDebugPushConstants {
 const uint MODE_POSITION = 0u;
 const uint MODE_IRRADIANCE = 1u;
 const uint MODE_UPDATE_STATE = 2u;
+const uint MODE_RELOCATION = 3u;
 const float PI = 3.14159265358979323846;
 
 vec2 signNotZero(vec2 value)
@@ -116,6 +118,14 @@ void main()
         } else {
             color = vec3(0.16);
         }
+    } else if (pushConstants.countsAndMode.w == MODE_RELOCATION) {
+        uvec3 coordinates = probeTextureCoordinates(inProbeIndex);
+        vec3 offset = texelFetch(probeData, ivec3(coordinates), 0).xyz;
+        vec3 normalizedOffset = offset / max(volume.spacingHysteresis.xyz, vec3(1e-4));
+        float relocationAmount = clamp(length(normalizedOffset) / 0.45, 0.0, 1.0);
+        color = relocationAmount > 1e-4
+            ? mix(vec3(0.12, 0.55, 1.0), vec3(1.0, 0.12, 0.02), relocationAmount)
+            : vec3(0.08);
     } else {
         color = vec3(0.08, 0.65, 1.0);
     }

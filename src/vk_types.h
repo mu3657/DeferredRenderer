@@ -8,6 +8,7 @@
 #include <vector>
 #include <span>
 #include <array>
+#include <cstddef>
 #include <functional>
 #include <deque>
 
@@ -57,7 +58,12 @@ struct Vertex {
     glm::vec3 normal;
     float uv_y;
     glm::vec4 color;
+    // xyz tangent, w handedness. Kept at 64 bytes for buffer-reference ABI.
+    glm::vec4 tangent{1.f, 0.f, 0.f, 1.f};
 };
+
+static_assert(sizeof(Vertex) == 64);
+static_assert(offsetof(Vertex, tangent) == 48);
 
 // holds the resources needed for a mesh
 struct GPUMeshBuffers {
@@ -83,6 +89,16 @@ enum class MaterialSurface :uint8_t {
     Transparent,
     Other
 };
+
+enum MaterialFlagBits : uint32_t {
+    MaterialFlagNone = 0,
+    MaterialFlagAlphaMask = 1u << 0,
+    MaterialFlagDoubleSided = 1u << 1,
+    // Set only when the mesh carries an authored, validated tangent basis.
+    MaterialFlagTangentSpaceReady = 1u << 2,
+};
+
+using MaterialFlags = uint32_t;
 
 enum class ShadingModel : uint8_t {
     MetallicRoughness,
@@ -114,6 +130,7 @@ struct MaterialInstance {
     MaterialPipeline* pipeline{nullptr};
     uint32_t materialID{0};
     MaterialSurface surface{MaterialSurface::Opaque};
+    bool doubleSided{false};
     ShadingModel shadingModel{ShadingModel::MetallicRoughness};
     MaterialTechnique* technique{nullptr};
     bool castsShadow{true};

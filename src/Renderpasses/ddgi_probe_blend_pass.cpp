@@ -179,10 +179,14 @@ void transition_probe_data_for_rtxgi(
     VkImageMemoryBarrier2 transition{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     transition.srcStageMask = probeData.layout == VK_IMAGE_LAYOUT_UNDEFINED
         ? VK_PIPELINE_STAGE_2_NONE
-        : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        : (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+            | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+            | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
     transition.srcAccessMask = probeData.layout == VK_IMAGE_LAYOUT_UNDEFINED
         ? VK_ACCESS_2_NONE
-        : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        : (VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     transition.dstStageMask = clear
         ? VK_PIPELINE_STAGE_2_TRANSFER_BIT
         : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -262,6 +266,32 @@ void make_atlases_visible_to_sampling(
     vkCmdPipelineBarrier2(cmd, &dependencyInfo);
 }
 
+void make_probe_data_visible_after_relocation(
+    VkCommandBuffer cmd,
+    VkImage probeData)
+{
+    VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    barrier.dstStageMask =
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+        | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+        | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.image = probeData;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
 glm::uvec4 pack_layout(const DDGIAtlasLayout& layout)
 {
     return glm::uvec4(
@@ -325,7 +355,10 @@ void DDGIProbeBlendPass::init(const RenderPassInitContext& ctx)
     VK_CHECK(vkCreatePipelineLayout(
         ctx.device, &layoutInfo, nullptr, &_rtxgiPipelineLayout));
 
-    const auto createRtxgiPipeline = [&](const char* path, VkPipeline& pipeline) {
+    const auto createRtxgiPipeline = [this, &ctx](
+                                         const char* path,
+                                         const char* entryPoint,
+                                         VkPipeline& pipeline) {
         VkShaderModule module{VK_NULL_HANDLE};
         if (!vkutil::load_shader_module(path, ctx.device, &module)) {
             throw std::runtime_error(fmt::format("Failed to load {}", path));
@@ -335,17 +368,23 @@ void DDGIProbeBlendPass::init(const RenderPassInitContext& ctx)
         info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         info.stage.module = module;
-        info.stage.pName = "DDGIProbeBlendingCS";
+        info.stage.pName = entryPoint;
         VK_CHECK(vkCreateComputePipelines(
             ctx.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline));
         vkDestroyShaderModule(ctx.device, module, nullptr);
     };
     createRtxgiPipeline(
         "../cmake-build-debug/shaders/rtxgi_ddgi_irradiance_blend.comp.hlsl.spv",
+        "DDGIProbeBlendingCS",
         _rtxgiIrradiancePipeline);
     createRtxgiPipeline(
         "../cmake-build-debug/shaders/rtxgi_ddgi_distance_blend.comp.hlsl.spv",
+        "DDGIProbeBlendingCS",
         _rtxgiDistancePipeline);
+    createRtxgiPipeline(
+        "../cmake-build-debug/shaders/rtxgi_ddgi_probe_relocation.comp.hlsl.spv",
+        "DDGIProbeRelocationCS",
+        _rtxgiRelocationPipeline);
 
     VkShaderModule diagnosticModule{VK_NULL_HANDLE};
     if (!vkutil::load_shader_module(
@@ -371,6 +410,24 @@ void DDGIProbeBlendPass::init(const RenderPassInitContext& ctx)
         &_rtxgiDiagnosticPipeline));
     vkDestroyShaderModule(ctx.device, diagnosticModule, nullptr);
 
+    VkShaderModule relocationDiagnosticModule{VK_NULL_HANDLE};
+    if (!vkutil::load_shader_module(
+            "../cmake-build-debug/shaders/ddgi_probe_relocation_diagnostic.comp.spv",
+            ctx.device,
+            &relocationDiagnosticModule)) {
+        throw std::runtime_error(
+            "Failed to load ddgi_probe_relocation_diagnostic.comp.spv");
+    }
+    diagnosticInfo.stage.module = relocationDiagnosticModule;
+    VK_CHECK(vkCreateComputePipelines(
+        ctx.device,
+        VK_NULL_HANDLE,
+        1,
+        &diagnosticInfo,
+        nullptr,
+        &_relocationDiagnosticPipeline));
+    vkDestroyShaderModule(ctx.device, relocationDiagnosticModule, nullptr);
+
     _pendingFrameStats.resize(ctx.engine.ddgiVolume.resources().frames.size());
 }
 
@@ -385,12 +442,16 @@ void DDGIProbeBlendPass::cleanup()
     vkDestroyPipeline(_engine->_device, _rtxgiIrradiancePipeline, nullptr);
     vkDestroyPipeline(_engine->_device, _rtxgiDistancePipeline, nullptr);
     vkDestroyPipeline(_engine->_device, _rtxgiDiagnosticPipeline, nullptr);
+    vkDestroyPipeline(_engine->_device, _rtxgiRelocationPipeline, nullptr);
+    vkDestroyPipeline(_engine->_device, _relocationDiagnosticPipeline, nullptr);
     vkDestroyPipelineLayout(_engine->_device, _rtxgiPipelineLayout, nullptr);
     _pipeline = VK_NULL_HANDLE;
     _pipelineLayout = VK_NULL_HANDLE;
     _rtxgiIrradiancePipeline = VK_NULL_HANDLE;
     _rtxgiDistancePipeline = VK_NULL_HANDLE;
     _rtxgiDiagnosticPipeline = VK_NULL_HANDLE;
+    _rtxgiRelocationPipeline = VK_NULL_HANDLE;
+    _relocationDiagnosticPipeline = VK_NULL_HANDLE;
     _rtxgiPipelineLayout = VK_NULL_HANDLE;
     _pendingFrameStats.clear();
     _stats = {};
@@ -415,16 +476,19 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
     DDGIVolumeResources& resources = ctx.volume.resources();
     const uint64_t historySerial = ctx.volume.history_clear_serial();
     const bool clearHistory = historySerial != _lastClearedHistorySerial;
+    const bool relocationEnabled = ctx.volume.probe_relocation_enabled();
     transition_atlases_for_blend(
         ctx.cmd, resources.irradiance, resources.distance, clearHistory);
+    if (_useOfficialRTXGI || relocationEnabled || clearHistory) {
+        transition_probe_data_for_rtxgi(
+            ctx.cmd, resources.probeData, clearHistory);
+    }
     if (clearHistory) {
         _lastClearedHistorySerial = historySerial;
         _hasHistory = false;
     }
 
     if (_useOfficialRTXGI) {
-        transition_probe_data_for_rtxgi(
-            ctx.cmd, resources.probeData, clearHistory);
         const VkDescriptorSet descriptorSet =
             ctx.volume.rtxgi_update_descriptor_set(ctx.frameIndex);
         vkCmdBindDescriptorSets(
@@ -550,6 +614,55 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
                 ctx.volume.irradiance_layout().tileTexels,
                 ctx.volume.distance_layout().tileTexels));
     }
+
+    if (relocationEnabled) {
+        const VkDescriptorSet descriptorSet =
+            ctx.volume.rtxgi_update_descriptor_set(ctx.frameIndex);
+        vkCmdBindDescriptorSets(
+            ctx.cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            _rtxgiPipelineLayout,
+            0,
+            1,
+            &descriptorSet,
+            0,
+            nullptr);
+
+        rtxgi::DDGIRootConstants rootConstants{};
+        rootConstants.volumeIndex = 0;
+        vkCmdPushConstants(
+            ctx.cmd,
+            _rtxgiPipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            rtxgi::DDGIRootConstants::GetSizeInBytes(),
+            &rootConstants);
+        vkCmdBindPipeline(
+            ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _rtxgiRelocationPipeline);
+        const uint32_t totalProbeCount = ctx.volume.total_probe_count();
+        vkCmdDispatch(ctx.cmd, (totalProbeCount + 31u) / 32u, 1u, 1u);
+        make_probe_data_visible_after_relocation(
+            ctx.cmd, resources.probeData.image.image);
+
+        const glm::uvec4 diagnosticConstants(
+            totalProbeCount,
+            ctx.volume.desc().probeCounts.x,
+            ctx.volume.desc().probeCounts.y,
+            0u);
+        vkCmdBindPipeline(
+            ctx.cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            _relocationDiagnosticPipeline);
+        vkCmdPushConstants(
+            ctx.cmd,
+            _rtxgiPipelineLayout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            sizeof(diagnosticConstants),
+            &diagnosticConstants);
+        vkCmdDispatch(ctx.cmd, (totalProbeCount + 63u) / 64u, 1u, 1u);
+        _stats.relocationProbeCount = totalProbeCount;
+    }
     make_atlases_visible_to_sampling(
         ctx.cmd,
         resources.irradiance.image.image,
@@ -610,8 +723,41 @@ void DDGIProbeBlendPass::draw_debug_ui()
             _useOfficialRTXGI
                 ? "NVIDIA ProbeBlendingCS.hlsl (explicit batched coordinate adapter)"
                 : "DeferredRenderer legacy GLSL blending fallback");
+        bool relocationEnabled = volume.probe_relocation_enabled();
+        if (ImGui::Checkbox("Probe relocation", &relocationEnabled)) {
+            volume.set_probe_relocation_enabled(relocationEnabled);
+        }
         ImGui::TextDisabled(
-            "RTXGI relocation/classification kernels compiled; activation awaits the 32 fixed-ray trace schedule");
+            relocationEnabled
+                ? "RTXGI: 32 stable fixed rays; offsets feed tracing, sampling and debug markers"
+                : "Probe offsets are zero and ignored");
+        ImGui::BeginDisabled(!relocationEnabled);
+        float fixedBackfaceThreshold = volume.desc().fixedRayBackfaceThreshold;
+        if (ImGui::SliderFloat(
+                "Fixed-ray backface ratio",
+                &fixedBackfaceThreshold,
+                0.01f,
+                1.f,
+                "%.2f")) {
+            volume.set_fixed_ray_backface_threshold(fixedBackfaceThreshold);
+        }
+        float minFrontfaceDistance = volume.desc().minFrontfaceDistance;
+        const float maxMinDistance = std::max(
+            0.1f,
+            std::min(
+                volume.desc().probeSpacing.x,
+                std::min(
+                    volume.desc().probeSpacing.y,
+                    volume.desc().probeSpacing.z)));
+        if (ImGui::SliderFloat(
+                "Minimum frontface distance",
+                &minFrontfaceDistance,
+                0.f,
+                maxMinDistance,
+                "%.2f")) {
+            volume.set_min_frontface_distance(minFrontfaceDistance);
+        }
+        ImGui::EndDisabled();
         ImGui::Text("Hysteresis: %.3f", volume.desc().hysteresis);
         float backfaceThreshold = volume.desc().randomRayBackfaceThreshold;
         if (ImGui::SliderFloat(
@@ -635,6 +781,7 @@ void DDGIProbeBlendPass::draw_debug_ui()
             distance.arrayLayers,
             distance.interiorTexels);
         ImGui::Text("Last blend: %u probes", _stats.probeCount);
+        ImGui::Text("Last relocation: %u probes scanned", _stats.relocationProbeCount);
         ImGui::Text("Interior texels: %u irradiance, %u distance",
             _stats.irradianceTexelCount,
             _stats.distanceTexelCount);

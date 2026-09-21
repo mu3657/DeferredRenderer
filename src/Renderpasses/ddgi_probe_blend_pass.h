@@ -23,6 +23,7 @@ struct DDGIProbeBlendDispatchStats {
     uint32_t probeCount{0};
     uint32_t irradianceTexelCount{0};
     uint32_t distanceTexelCount{0};
+    uint32_t relocationProbeCount{0};
 };
 
 class DDGIProbeBlendPass : public RenderPassBase {
@@ -54,6 +55,8 @@ private:
     VkPipeline _rtxgiIrradiancePipeline{VK_NULL_HANDLE};
     VkPipeline _rtxgiDistancePipeline{VK_NULL_HANDLE};
     VkPipeline _rtxgiDiagnosticPipeline{VK_NULL_HANDLE};
+    VkPipeline _rtxgiRelocationPipeline{VK_NULL_HANDLE};
+    VkPipeline _relocationDiagnosticPipeline{VK_NULL_HANDLE};
     std::vector<DDGIProbeBlendDispatchStats> _pendingFrameStats;
     DDGIProbeBlendDispatchStats _stats{};
     uint64_t _lastClearedHistorySerial{0};

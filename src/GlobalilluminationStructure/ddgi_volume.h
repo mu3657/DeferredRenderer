@@ -47,7 +47,7 @@ struct DDGIVolumeDesc {
     // assumed to be inside geometry and its irradiance update is rejected.
     float randomRayBackfaceThreshold{0.1f};
     float fixedRayBackfaceThreshold{0.25f};
-    float minFrontfaceDistance{1.f};
+    float minFrontfaceDistance{0.2f};
 
     DDGIVolumeFlags flags{DDGIVolumeFlagEnabled};
 };
@@ -120,9 +120,12 @@ struct alignas(16) DDGIDiagnosticsGPU {
     uint32_t nonZeroIrradianceTexels{0};
     uint32_t nonFiniteIrradianceTexels{0};
     uint32_t maxIrradianceBits{0};
-    uint32_t reserved0{0};
+    uint32_t relocatedProbeCount{0};
 
-    glm::uvec4 reserved1{};
+    uint32_t nonFiniteProbeOffsets{0};
+    uint32_t maxProbeOffsetBits{0};
+    uint32_t reserved0{0};
+    uint32_t reserved1{0};
 };
 
 static_assert(sizeof(DDGIDiagnosticsGPU) == 64);
@@ -180,9 +183,15 @@ public:
     void set_probe_spacing(const glm::vec3& spacing);
     void set_scroll_offsets(const glm::ivec3& offsets);
     void set_random_ray_backface_threshold(float threshold);
+    void set_probe_relocation_enabled(bool enabled);
+    void set_fixed_ray_backface_threshold(float threshold);
+    void set_min_frontface_distance(float distance);
 
     bool initialized() const { return _initialized; }
     bool enabled() const { return (_desc.flags & DDGIVolumeFlagEnabled) != 0; }
+    bool probe_relocation_enabled() const {
+        return (_desc.flags & DDGIVolumeFlagRelocation) != 0;
+    }
 
     uint32_t total_probe_count() const;
     DDGIProbeUpdateRange update_range() const { return _updateRange; }
