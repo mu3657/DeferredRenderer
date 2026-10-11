@@ -29,6 +29,9 @@
 #include "Renderpasses/ddgi_probe_blend_pass.h"
 #include "Renderpasses/ddgi_probe_debug_pass.h"
 #include "Renderpasses/tone_map_pass.h"
+#include "environment_lighting.h"
+
+#include <array>
 
 #if defined(_WIN32)
 	#define WIN32_LEAN_AND_MEAN
@@ -188,6 +191,15 @@ struct GLTFMetallic_Roughness {
 };
 constexpr unsigned int FRAME_OVERLAP = 3;
 
+struct DDGIUpdateTiming {
+    bool available{false};
+    bool automaticBudget{true};
+    float targetGpuMs{2.f};
+    float traceGpuMs{0.f};
+    float blendGpuMs{0.f};
+    float totalGpuMs{0.f};
+};
+
 class VulkanEngine {
 public:
 
@@ -247,9 +259,11 @@ public:
 	LightSystem lightSystem;
 	RayTracingScene rayTracingScene;
 	DDGIVolume ddgiVolume;
+	EnvironmentLighting environmentLighting;
 	DDGIProbeTracePass ddgiProbeTracePass;
 	DDGIProbeBlendPass ddgiProbeBlendPass;
 	DDGIProbeDebugPass ddgiProbeDebugPass;
+	DDGIUpdateTiming ddgiTiming;
 	ToneMapPass toneMapPass;
 	GeometryPass geometryPass;
 	int pbrDebugMode{0};
@@ -282,7 +296,7 @@ public:
 
 
 	std::vector<ComputeEffect> backgroundEffects;
-	int currentBackgroundEffect{0};
+	int currentBackgroundEffect{1};
 
 	VkPipelineLayout _trianglePipelineLayout;
 	VkPipeline _trianglePipeline;
@@ -368,16 +382,25 @@ public:
 	void init_camera();
 	bool load_scene_from_path(const std::string& path);
 	void set_active_scene(const std::string& sceneName);
+	void register_runtime_mesh(const MeshAsset& mesh);
 private:
 	std::unordered_map<const MeshAsset*, uint32_t> _rayTracingBLASIndices;
 	std::vector<RayTracingInstanceDesc> _lastRayTracingInstances;
 	bool _rayTracingBuildCompletionLogged{false};
 	bool _frameFenceTimeoutWarningPrinted{false};
+	VkQueryPool _ddgiTimestampPool{VK_NULL_HANDLE};
+	uint32_t _ddgiTimestampValidBits{0};
+	float _ddgiTimestampPeriodNs{0.f};
+	std::array<bool, FRAME_OVERLAP> _ddgiTimingPending{};
+	uint32_t _ddgiBudgetSamples{0};
 
 	void rebuild_ray_tracing_scene(const LoadedScene& scene);
 	void sync_ray_tracing_instances();
 	void init_vulkan();
+	void init_ddgi_timing();
+	void read_ddgi_timing(uint32_t frameIndex);
 	void draw_imgui(VkCommandBuffer cmd, VkImageView targetImageView);
+	void draw_editor_ui();
 	void draw_scene_browser();
 	void scan_scene_library();
 	void init_swapchain();

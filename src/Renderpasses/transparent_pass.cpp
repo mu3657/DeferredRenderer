@@ -118,13 +118,14 @@ void TransparentPass::execute(TransparentPassContext& ctx)
                 engine._bindlessDescriptorSet,
                 ctx.frame.lightDescriptor,
                 shadowSet,
+                engine.environmentLighting.descriptor_set(ctx.frameIndex),
             };
             vkCmdBindDescriptorSets(
                 cmd,
                 VK_PIPELINE_BIND_POINT_GRAPHICS,
                 pipeline->layout,
                 0,
-                4,
+                5,
                 descriptorSets,
                 0,
                 nullptr);

@@ -186,6 +186,7 @@ public:
     void set_probe_relocation_enabled(bool enabled);
     void set_fixed_ray_backface_threshold(float threshold);
     void set_min_frontface_distance(float distance);
+    void set_probes_updated_per_frame(uint32_t probeCount);
 
     bool initialized() const { return _initialized; }
     bool enabled() const { return (_desc.flags & DDGIVolumeFlagEnabled) != 0; }

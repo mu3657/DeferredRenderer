@@ -221,10 +221,11 @@ void DDGIProbeTracePass::init(const RenderPassInitContext& ctx)
         ctx.descriptors.layout(DescriptorLayoutID::DDGIProbeTrace),
         ctx.engine._bindlessDescriptorLayout,
         ctx.descriptors.layout(DescriptorLayoutID::LightData),
+        ctx.descriptors.layout(DescriptorLayoutID::Environment),
     };
 
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layoutInfo.setLayoutCount = 3;
+    layoutInfo.setLayoutCount = 4;
     layoutInfo.pSetLayouts = setLayouts;
     VkPushConstantRange pushConstantRange{};
     pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -273,7 +274,6 @@ void DDGIProbeTracePass::cleanup()
     _pendingFrameStats.clear();
     _stats = {};
     _lastProbeDataResetSerial = 0;
-    _dispatchInFlight = false;
     _engine = nullptr;
 }
 
@@ -282,7 +282,7 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
     ZoneScopedN("DDGIProbeTracePass");
     _stats = {};
 
-    if (!_enabled || _dispatchInFlight || !ctx.volume.enabled()
+    if (!_enabled || !ctx.volume.enabled()
         || !ctx.rayTracingScene.ready(ctx.frameIndex)) {
         return;
     }
@@ -335,6 +335,7 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
         traceDescriptor,
         ctx.engine._bindlessDescriptorSet,
         ctx.frame.lightDescriptor,
+        ctx.engine.environmentLighting.descriptor_set(ctx.frameIndex),
     };
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
     vkCmdBindDescriptorSets(
@@ -342,7 +343,7 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
         VK_PIPELINE_BIND_POINT_COMPUTE,
         _pipelineLayout,
         0,
-        3,
+        4,
         descriptorSets,
         0,
         nullptr);
@@ -392,7 +393,6 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
     if (ctx.frameIndex < _pendingFrameStats.size()) {
         _pendingFrameStats[ctx.frameIndex] = _stats;
     }
-    _dispatchInFlight = true;
     TracyPlot("DDGI Probes Traced", static_cast<int64_t>(_stats.probeCount));
     TracyPlot("DDGI Rays Traced", static_cast<int64_t>(_stats.rayCount));
 }
@@ -405,9 +405,6 @@ void DDGIProbeTracePass::notify_frame_completed(uint32_t frameIndex)
 
     const DDGIProbeTraceDispatchStats completed = _pendingFrameStats[frameIndex];
     _pendingFrameStats[frameIndex] = {};
-    if (completed.rayCount > 0) {
-        _dispatchInFlight = false;
-    }
     if (completed.rayCount > 0) {
         fmt::println(
             "DDGI probe trace completed: mode {}, multi-bounce {}, probes [{}, {}), {} probes, {} primary rays, ray-data ready",
@@ -468,11 +465,6 @@ void DDGIProbeTracePass::notify_frame_completed(uint32_t frameIndex)
 
 void DDGIProbeTracePass::draw_debug_ui()
 {
-    if (!ImGui::Begin("DDGI Probe Trace", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     ImGui::Checkbox("Enabled", &_enabled);
     const char* traceModes[] = {
         "Distance Only",
@@ -549,5 +541,4 @@ void DDGIProbeTracePass::draw_debug_ui()
             _engine->ddgiVolume.request_history_reset();
         }
     }
-    ImGui::End();
 }

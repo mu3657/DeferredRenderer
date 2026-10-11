@@ -306,11 +306,6 @@ bool DDGIProbeDebugPass::fit_volume_to_active_scene(DDGIVolume& volume)
 
 void DDGIProbeDebugPass::draw_debug_ui()
 {
-    if (!ImGui::Begin("DDGI Probe Debug", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     ImGui::Checkbox("Visualize probes", &_enabled);
     ImGui::SameLine();
     ImGui::Checkbox("X-Ray", &_xray);
@@ -421,5 +416,4 @@ void DDGIProbeDebugPass::draw_debug_ui()
             volume.desc().probeCounts.y,
             volume.desc().probeCounts.z);
     }
-    ImGui::End();
 }

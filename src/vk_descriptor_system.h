@@ -19,6 +19,7 @@ enum class DescriptorLayoutID : uint8_t {
     DDGIProbeBlend,
     DDGIProbeBlendRTXGI,
     GIInput,
+    Environment,
     Count
 };
 

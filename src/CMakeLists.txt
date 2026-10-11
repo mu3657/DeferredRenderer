@@ -20,7 +20,10 @@ add_executable (engine
   material_system.h
   material_system.cpp
   vk_engine.h
+  editor_layout.h
   vk_engine.cpp
+  environment_lighting.h
+  environment_lighting.cpp
   vk_loader.h
   vk_loader.cpp
   camera.cpp

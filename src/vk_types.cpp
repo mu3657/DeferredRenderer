@@ -2,6 +2,7 @@
 #include "vk_loader.h"
 
 void MeshNode::Draw(const glm::mat4& topMatrix, DrawContext& ctx) {
+    if (!visible || !mesh) return;
     glm::mat4 nodeMatrix = topMatrix * localTransform;
 
     RayTracingRenderInstance rayTracingInstance{};
@@ -28,6 +29,6 @@ void MeshNode::Draw(const glm::mat4& topMatrix, DrawContext& ctx) {
         }
     }
 
-    // recurse down — pass accumulated nodeMatrix so children inherit this node's transform
-    Node::Draw(nodeMatrix, ctx);
+    // Node::Draw applies this node's local transform before recursing.
+    Node::Draw(topMatrix, ctx);
 }

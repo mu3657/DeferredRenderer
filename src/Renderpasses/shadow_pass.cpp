@@ -104,15 +104,20 @@ GPUSceneData make_shadow_scene_data(
         maxBounds = glm::max(maxBounds, lightSpaceCorner);
     }
 
-    const float width = maxBounds.x - minBounds.x;
-    const float height = maxBounds.y - minBounds.y;
-    const float halfExtent = std::max(width, height) * 0.5f;
-    glm::vec2 lightSpaceCenter = (glm::vec2(minBounds) + glm::vec2(maxBounds)) * 0.5f;
+    // A fixed bounding sphere keeps the projection scale steady as the camera
+    // rotates. Snap relative to the world origin: snapping a camera-centred
+    // light view around (0, 0) does not stabilize its world-space texel grid.
+    const float halfExtent = std::ceil(frustumRadius * 16.f) / 16.f +
+        2.f * frustumRadius / static_cast<float>(shadowExtent.width);
+    glm::vec2 lightSpaceCenter = glm::vec2(view * glm::vec4(frustumCenter, 1.f));
 
     const float shadowTexelSize = (halfExtent * 2.f) / static_cast<float>(shadowExtent.width);
     outTexelWorldSize = shadowTexelSize;
     if (shadowTexelSize > 0.f) {
-        lightSpaceCenter = glm::floor(lightSpaceCenter / shadowTexelSize) * shadowTexelSize;
+        const glm::vec2 worldOriginInLightSpace =
+            glm::vec2(view * glm::vec4(0.f, 0.f, 0.f, 1.f));
+        lightSpaceCenter = worldOriginInLightSpace +
+            glm::round((lightSpaceCenter - worldOriginInLightSpace) / shadowTexelSize) * shadowTexelSize;
     }
 
     const float left = lightSpaceCenter.x - halfExtent;
@@ -313,7 +318,16 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
     sampl.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     sampl.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     sampl.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    vkCreateSampler(_engine->_device, &sampl, nullptr, &_shadowSampler);
+    VK_CHECK(vkCreateSampler(_engine->_device, &sampl, nullptr, &_shadowSampler));
+
+    // Linear filtering of the depth *comparison* gives each PCSS tap a
+    // stable four-texel reconstruction, without averaging raw depth values.
+    VkSamplerCreateInfo compareSampler = sampl;
+    compareSampler.magFilter = VK_FILTER_LINEAR;
+    compareSampler.minFilter = VK_FILTER_LINEAR;
+    compareSampler.compareEnable = VK_TRUE;
+    compareSampler.compareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    VK_CHECK(vkCreateSampler(_engine->_device, &compareSampler, nullptr, &_shadowCompareSampler));
 
 
     VkDescriptorSetLayout layouts[] = {
@@ -485,6 +499,14 @@ void ShadowPass::init(const RenderPassInitContext& ctx)
             _frames[i].punctualShadowDataBuffer.buffer,
             sizeof(GPUPunctualShadowData),
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+
+        ctx.descriptors.write_image(
+            _frames[i].descriptor,
+            4,
+            _shadowDepthImage.imageView,
+            _shadowCompareSampler,
+            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     }
 
 
@@ -522,6 +544,10 @@ void ShadowPass::cleanup()
     if (_shadowSampler != VK_NULL_HANDLE) {
         vkDestroySampler(_engine->_device, _shadowSampler, nullptr);
         _shadowSampler = VK_NULL_HANDLE;
+    }
+    if (_shadowCompareSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(_engine->_device, _shadowCompareSampler, nullptr);
+        _shadowCompareSampler = VK_NULL_HANDLE;
     }
 
     if (_shadowDepthImage.image != VK_NULL_HANDLE) {
@@ -632,6 +658,16 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         _strength,
         1.0f / static_cast<float>(cascadeExtent.width),
         _enabled && directionalLight.colorIntensity.w > 0.f ? 1.0f : 0.0f);
+    _shadowData.pcssParams = glm::vec4(
+        _pcssEnabled ? 1.f : 0.f,
+        std::tan(glm::radians(std::clamp(_sunAngularRadiusDegrees, 0.05f, 2.f))),
+        std::clamp(_pcssMaxSearchRadius, 1.f, 32.f),
+        std::clamp(_pcssMaxFilterRadius, 1.f, 32.f));
+    _shadowData.pcssSamples = glm::vec4(
+        static_cast<float>(std::clamp(_pcssBlockerSamples, 8, 32)),
+        static_cast<float>(std::clamp(_pcssFilterSamples, 8, 32)),
+        0.75f,
+        0.f);
 
     std::memcpy(shadowFrame.shadowDataBuffer.info.pMappedData, &_shadowData, sizeof(GPUShadowData));
     VK_CHECK(vmaFlushAllocation(
@@ -1023,11 +1059,6 @@ void ShadowPass::execute(ShadowPassContext& ctx)
 
 void ShadowPass::draw_debug_ui()
 {
-    if (!ImGui::Begin("Shadow Pass", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     ImGui::Checkbox("Enabled", &_enabled);
     ImGui::SliderFloat("Max distance", &_maxDistance, 10.f, 300.f, "%.1f");
     ImGui::SliderFloat("Split lambda", &_splitLambda, 0.f, 1.f, "%.2f");
@@ -1037,6 +1068,15 @@ void ShadowPass::draw_debug_ui()
     ImGui::SliderFloat("Raster constant bias", &_rasterConstantBias, 0.f, 5.f, "%.2f");
     ImGui::SliderFloat("Raster slope bias", &_rasterSlopeBias, 0.f, 5.f, "%.2f");
     ImGui::SliderFloat("Strength", &_strength, 0.f, 1.f, "%.2f");
+    ImGui::Checkbox("PCSS", &_pcssEnabled);
+    if (_pcssEnabled) {
+        ImGui::SliderFloat("Sun angular radius (deg)", &_sunAngularRadiusDegrees, 0.05f, 2.f, "%.2f");
+        ImGui::SliderFloat("Max blocker search (texels)", &_pcssMaxSearchRadius, 1.f, 32.f, "%.0f");
+        ImGui::SliderFloat("Max penumbra (texels)", &_pcssMaxFilterRadius, 1.f, 32.f, "%.0f");
+        ImGui::SliderInt("Blocker samples", &_pcssBlockerSamples, 8, 32);
+        ImGui::SliderInt("Filter samples", &_pcssFilterSamples, 8, 32);
+        ImGui::TextDisabled("Stable disk sampling + bilinear comparison filtering");
+    }
     ImGui::Text("Shadow atlas: %ux%u", _shadowExtent.width, _shadowExtent.height);
     for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {
         ImGui::Text(
@@ -1047,7 +1087,9 @@ void ShadowPass::draw_debug_ui()
             _lastVisibleCasters[cascadeIndex],
             _lastTexelWorldSize[cascadeIndex]);
         ImGui::PushID(static_cast<int>(cascadeIndex));
-        ImGui::SliderInt("PCF radius", &_pcfKernelRadii[cascadeIndex], 0, 3);
+        if (!_pcssEnabled) {
+            ImGui::SliderInt("PCF radius", &_pcfKernelRadii[cascadeIndex], 0, 3);
+        }
         ImGui::PopID();
     }
 
@@ -1068,5 +1110,4 @@ void ShadowPass::draw_debug_ui()
         MAX_PUNCTUAL_SHADOW_TILES);
     ImGui::Text("Punctual caster draws: %u", _lastPunctualCasterDraws);
 
-    ImGui::End();
 }

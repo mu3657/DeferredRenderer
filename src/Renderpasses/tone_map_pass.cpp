@@ -120,13 +120,8 @@ void ToneMapPass::execute(RenderPassFrameContext& ctx)
 
 void ToneMapPass::draw_debug_ui()
 {
-    if (!ImGui::Begin("Tone Mapping", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
     ImGui::Checkbox("Enabled", &_enabled);
     ImGui::SliderFloat(
         "Exposure", &_exposure, 0.05f, 4.f, "%.2f", ImGuiSliderFlags_Logarithmic);
     ImGui::TextDisabled("ACES fitted, then linear to sRGB");
-    ImGui::End();
 }

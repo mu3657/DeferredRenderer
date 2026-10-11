@@ -97,6 +97,13 @@ void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 
     // Compute the probe index for this thread
     uint probeIndex = DispatchThreadID.x;
+#if RTXGI_DDGI_RELOCATION_USE_ROOT_DISPATCH_BASE
+    // The application traces a contiguous batch in its legacy X,Y,Z order.
+    // Keep relocation on that batch so untouched ray-data is never inspected.
+    uint3 updateRange = GetReductionInputSize();
+    if (DispatchThreadID.x >= updateRange.y) return;
+    probeIndex += updateRange.x;
+#endif
 
 #if RTXGI_DDGI_BINDLESS_RESOURCES
     #if RTXGI_BINDLESS_TYPE == RTXGI_BINDLESS_TYPE_DESCRIPTOR_HEAP
@@ -107,6 +114,17 @@ void DDGIProbeRelocationCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 
     // Get the volume's constants
     DDGIVolumeDescGPU volume = UnpackDDGIVolumeDescGPU(DDGIVolumes[volumeIndex]);
+
+#if RTXGI_DDGI_RELOCATION_USE_ROOT_DISPATCH_BASE
+    // RTXGI's Y-up linear order is X,Z,Y. Convert the legacy X,Y,Z index
+    // before reading ray data or storing the probe offset.
+    uint legacyIndex = probeIndex;
+    int3 gridCoords = int3(
+        legacyIndex % volume.probeCounts.x,
+        (legacyIndex / volume.probeCounts.x) % volume.probeCounts.y,
+        legacyIndex / (volume.probeCounts.x * volume.probeCounts.y));
+    probeIndex = DDGIGetProbeIndex(gridCoords, volume);
+#endif
 
     // Early out: if this thread maps past the number of probes in the volume
     int numProbes = (volume.probeCounts.x * volume.probeCounts.y * volume.probeCounts.z);

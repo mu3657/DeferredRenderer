@@ -171,11 +171,6 @@ void LightBinningPass::execute(RenderPassFrameContext& ctx)
 
 void LightBinningPass::draw_debug_ui()
 {
-    if (!ImGui::Begin("Tiled Deferred Lighting", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     ImGui::Checkbox("Enabled", &_enabled);
     ImGui::BeginDisabled(!_enabled);
     ImGui::Checkbox("Tile light-count heatmap", &_debugHeatmap);
@@ -188,5 +183,4 @@ void LightBinningPass::draw_debug_ui()
     ImGui::Text("Mask storage: %.2f MiB / frame",
         static_cast<double>(_maskBufferSize) / (1024.0 * 1024.0));
     ImGui::TextDisabled("2D conservative binning; transparent lighting remains brute force.");
-    ImGui::End();
 }

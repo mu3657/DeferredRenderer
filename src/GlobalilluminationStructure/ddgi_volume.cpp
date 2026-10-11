@@ -746,6 +746,14 @@ void DDGIVolume::set_min_frontface_distance(float distance)
     }
 }
 
+void DDGIVolume::set_probes_updated_per_frame(uint32_t probeCount)
+{
+    if (probeCount == 0) {
+        throw std::invalid_argument("DDGI probe update count must be positive");
+    }
+    _desc.probesUpdatedPerFrame = std::min(probeCount, total_probe_count());
+}
+
 uint32_t DDGIVolume::total_probe_count() const
 {
     return checked_probe_count(_desc.probeCounts);

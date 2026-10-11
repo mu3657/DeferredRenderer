@@ -23,6 +23,7 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_vulkan.h"
+#include "editor_layout.h"
 
 #include "vk_pipelines.h"
 #include "Renderpasses/shadow_pass.h"
@@ -175,6 +176,7 @@ void VulkanEngine::init()
     init_commands();
 
     init_sync_structures();
+	init_ddgi_timing();
 
     rayTracingScene.init(RayTracingSceneInitContext{
         _chosenGPU,
@@ -185,6 +187,8 @@ void VulkanEngine::init()
 
     init_descriptors();
     init_default_data();
+    environmentLighting.init(*this);
+    _mainDeletionQueue.push_function([this]() { environmentLighting.cleanup(); });
 
     DDGIVolumeDesc ddgiVolumeDesc{};
     // Keep the first integration comfortably below the Windows TDR budget.
@@ -254,6 +258,77 @@ void VulkanEngine::init()
 
 
 }
+
+void VulkanEngine::init_ddgi_timing()
+{
+    uint32_t familyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(_chosenGPU, &familyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> families(familyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(_chosenGPU, &familyCount, families.data());
+    if (_graphicsQueueFamily >= familyCount
+        || families[_graphicsQueueFamily].timestampValidBits == 0) {
+        ddgiTiming.available = false;
+        ddgiTiming.automaticBudget = false;
+        return;
+    }
+
+    VkPhysicalDeviceProperties properties{};
+    vkGetPhysicalDeviceProperties(_chosenGPU, &properties);
+    _ddgiTimestampValidBits = families[_graphicsQueueFamily].timestampValidBits;
+    _ddgiTimestampPeriodNs = properties.limits.timestampPeriod;
+
+    VkQueryPoolCreateInfo queryInfo{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryInfo.queryCount = FRAME_OVERLAP * 3u;
+    VK_CHECK(vkCreateQueryPool(_device, &queryInfo, nullptr, &_ddgiTimestampPool));
+    ddgiTiming.available = true;
+}
+
+void VulkanEngine::read_ddgi_timing(uint32_t frameIndex)
+{
+    if (_ddgiTimestampPool == VK_NULL_HANDLE || !_ddgiTimingPending[frameIndex]) {
+        return;
+    }
+    _ddgiTimingPending[frameIndex] = false;
+
+    std::array<uint64_t, 3> timestamps{};
+    VK_CHECK(vkGetQueryPoolResults(
+        _device, _ddgiTimestampPool, frameIndex * 3u, 3u,
+        sizeof(timestamps), timestamps.data(), sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT));
+    const uint64_t validMask = _ddgiTimestampValidBits == 64u
+        ? ~uint64_t{0}
+        : (uint64_t{1} << _ddgiTimestampValidBits) - 1u;
+    const auto milliseconds = [&](uint64_t start, uint64_t end) {
+        return static_cast<float>((end - start) & validMask)
+            * _ddgiTimestampPeriodNs / 1000000.f;
+    };
+    ddgiTiming.traceGpuMs = milliseconds(timestamps[0], timestamps[1]);
+    ddgiTiming.blendGpuMs = milliseconds(timestamps[1], timestamps[2]);
+    ddgiTiming.totalGpuMs = ddgiTiming.traceGpuMs + ddgiTiming.blendGpuMs;
+    TracyPlot("DDGI Trace GPU ms", ddgiTiming.traceGpuMs);
+    TracyPlot("DDGI Blend GPU ms", ddgiTiming.blendGpuMs);
+
+    if (!ddgiTiming.automaticBudget || ++_ddgiBudgetSamples < FRAME_OVERLAP) {
+        return;
+    }
+    _ddgiBudgetSamples = 0;
+    const uint32_t current = ddgiVolume.desc().probesUpdatedPerFrame;
+    uint32_t next = current;
+    if (ddgiTiming.totalGpuMs > ddgiTiming.targetGpuMs * 1.15f) {
+        next = current - std::max(1u, current / 4u);
+        next = std::max(1u, next);
+    } else if (ddgiTiming.totalGpuMs < ddgiTiming.targetGpuMs * 0.7f) {
+        next = std::min(128u, current + std::max(1u, current / 4u));
+    }
+    if (next != current) {
+        ddgiVolume.set_probes_updated_per_frame(next);
+        fmt::println("DDGI GPU budget: trace {:.3f} ms, blend/relocation {:.3f} ms, target {:.2f} ms, probes/frame {} -> {}",
+            ddgiTiming.traceGpuMs, ddgiTiming.blendGpuMs,
+            ddgiTiming.targetGpuMs, current, next);
+    }
+}
+
 void VulkanEngine::init_renderdoc() {
 	// 1. 动态加载 RenderDoc 动态链接库
 #if defined(_WIN32)
@@ -319,10 +394,11 @@ void VulkanEngine::init_imgui()
 	ImGui::CreateContext();
 	ImGuiIO& io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	io.IniFilename = nullptr;
 
 	ImGui::StyleColorsDark();
 	ImGuiStyle& style = ImGui::GetStyle();
-	style.WindowRounding = 6.f;
+	style.WindowRounding = 0.f;
 	style.ChildRounding = 4.f;
 	style.FrameRounding = 4.f;
 	style.PopupRounding = 6.f;
@@ -335,6 +411,7 @@ void VulkanEngine::init_imgui()
 	style.ItemInnerSpacing = ImVec2(6.f, 4.f);
 	style.IndentSpacing = 16.f;
 	style.ScrollbarSize = 13.f;
+	style.WindowBorderSize = 1.f;
 
 	ImVec4* colors = style.Colors;
 	colors[ImGuiCol_WindowBg] = ImVec4(0.065f, 0.070f, 0.078f, 0.96f);
@@ -347,18 +424,18 @@ void VulkanEngine::init_imgui()
 	colors[ImGuiCol_TitleBg] = ImVec4(0.050f, 0.055f, 0.062f, 1.00f);
 	colors[ImGuiCol_TitleBgActive] = ImVec4(0.080f, 0.110f, 0.115f, 1.00f);
 	colors[ImGuiCol_Button] = ImVec4(0.135f, 0.160f, 0.165f, 1.00f);
-	colors[ImGuiCol_ButtonHovered] = ImVec4(0.200f, 0.285f, 0.265f, 1.00f);
-	colors[ImGuiCol_ButtonActive] = ImVec4(0.135f, 0.365f, 0.315f, 1.00f);
-	colors[ImGuiCol_Header] = ImVec4(0.130f, 0.185f, 0.185f, 0.82f);
-	colors[ImGuiCol_HeaderHovered] = ImVec4(0.170f, 0.260f, 0.240f, 0.95f);
-	colors[ImGuiCol_HeaderActive] = ImVec4(0.120f, 0.335f, 0.290f, 1.00f);
-	colors[ImGuiCol_CheckMark] = ImVec4(0.230f, 0.760f, 0.650f, 1.00f);
-	colors[ImGuiCol_SliderGrab] = ImVec4(0.250f, 0.660f, 0.580f, 1.00f);
-	colors[ImGuiCol_SliderGrabActive] = ImVec4(0.300f, 0.850f, 0.700f, 1.00f);
+	colors[ImGuiCol_ButtonHovered] = ImVec4(0.190f, 0.285f, 0.390f, 1.00f);
+	colors[ImGuiCol_ButtonActive] = ImVec4(0.165f, 0.345f, 0.490f, 1.00f);
+	colors[ImGuiCol_Header] = ImVec4(0.130f, 0.185f, 0.255f, 0.82f);
+	colors[ImGuiCol_HeaderHovered] = ImVec4(0.175f, 0.265f, 0.365f, 0.95f);
+	colors[ImGuiCol_HeaderActive] = ImVec4(0.145f, 0.325f, 0.460f, 1.00f);
+	colors[ImGuiCol_CheckMark] = ImVec4(0.365f, 0.740f, 1.000f, 1.00f);
+	colors[ImGuiCol_SliderGrab] = ImVec4(0.285f, 0.610f, 0.845f, 1.00f);
+	colors[ImGuiCol_SliderGrabActive] = ImVec4(0.380f, 0.760f, 1.000f, 1.00f);
 	colors[ImGuiCol_Separator] = ImVec4(0.240f, 0.255f, 0.275f, 0.70f);
-	colors[ImGuiCol_SeparatorHovered] = ImVec4(0.240f, 0.580f, 0.520f, 0.90f);
+	colors[ImGuiCol_SeparatorHovered] = ImVec4(0.300f, 0.580f, 0.810f, 0.90f);
 	colors[ImGuiCol_ResizeGrip] = ImVec4(0.160f, 0.350f, 0.315f, 0.35f);
-	colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.240f, 0.620f, 0.540f, 0.70f);
+	colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.290f, 0.600f, 0.820f, 0.70f);
 
 	// this initializes imgui for SDL
 	ImGui_ImplSDL2_InitForVulkan(_window);
@@ -405,6 +482,10 @@ void VulkanEngine::cleanup()
     if (_isInitialized) {
 
         vkDeviceWaitIdle(_device);
+		if (_ddgiTimestampPool != VK_NULL_HANDLE) {
+			vkDestroyQueryPool(_device, _ddgiTimestampPool, nullptr);
+			_ddgiTimestampPool = VK_NULL_HANDLE;
+		}
     	// make sure the gpu has stopped doing its things
 
         rayTracingScene.cleanup();
@@ -461,7 +542,18 @@ void VulkanEngine::draw_background(VkCommandBuffer cmd)
 	// bind the descriptor set containing the draw image for the compute pipeline
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _gradientPipelineLayout, 0, 1, &_drawImageDescriptors, 0, nullptr);
 
-	vkCmdPushConstants(cmd, _gradientPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ComputePushConstants), &effect.data);
+	if (currentBackgroundEffect == 1) {
+        const glm::mat4 inverseViewProjection = glm::inverse(sceneData.viewproj);
+        const VkDescriptorSet environmentSet = environmentLighting.descriptor_set(
+            static_cast<uint32_t>(_frameNumber % FRAME_OVERLAP));
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            _gradientPipelineLayout, 1, 1, &environmentSet, 0, nullptr);
+        vkCmdPushConstants(cmd, _gradientPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(glm::mat4), &inverseViewProjection);
+    } else {
+        vkCmdPushConstants(cmd, _gradientPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(ComputePushConstants), &effect.data);
+    }
 	// execute the compute pipeline dispatch. We are using 16x16 workgroup size so we need to divide by it
 	vkCmdDispatch(cmd, std::ceil(_drawExtent.width / 16.0), std::ceil(_drawExtent.height / 16.0), 1);
 }
@@ -512,6 +604,7 @@ void VulkanEngine::draw()
     _frameFenceTimeoutWarningPrinted = false;
 
     const uint32_t completedFrameIndex = _frameNumber % FRAME_OVERLAP;
+    read_ddgi_timing(completedFrameIndex);
     ddgiProbeBlendPass.notify_frame_completed(completedFrameIndex);
     ddgiProbeTracePass.notify_frame_completed(completedFrameIndex);
     if (!_rayTracingBuildCompletionLogged
@@ -559,6 +652,7 @@ void VulkanEngine::draw()
     }
 
     VK_CHECK(vkResetFences(_device, 1, &get_current_frame()._renderFence));
+    environmentLighting.prepare_frame(completedFrameIndex);
 
     VkCommandBuffer cmd = get_current_frame()._mainCommandBuffer;
 
@@ -592,6 +686,12 @@ void VulkanEngine::draw()
     }
 
     if (!buildingStaticRayTracingGeometry && hadFrameTLASBeforeBuild) {
+        const uint32_t queryBase = passContext.frameIndex * 3u;
+        if (_ddgiTimestampPool != VK_NULL_HANDLE) {
+            vkCmdResetQueryPool(cmd, _ddgiTimestampPool, queryBase, 3u);
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                _ddgiTimestampPool, queryBase);
+        }
         ZoneScopedN("DDGI Probe Trace");
         DDGIProbeTracePassContext ddgiTraceContext{
             passContext,
@@ -601,12 +701,21 @@ void VulkanEngine::draw()
         };
         ddgiProbeTracePass.execute(ddgiTraceContext);
         if (ddgiProbeTracePass.stats().rayCount > 0) {
+            if (_ddgiTimestampPool != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                    _ddgiTimestampPool, queryBase + 1u);
+            }
             ZoneScopedN("DDGI Probe Blend");
             DDGIProbeBlendPassContext ddgiBlendContext{
                 passContext,
                 ddgiVolume,
             };
             ddgiProbeBlendPass.execute(ddgiBlendContext);
+            if (_ddgiTimestampPool != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                    _ddgiTimestampPool, queryBase + 2u);
+                _ddgiTimingPending[passContext.frameIndex] = true;
+            }
         }
     }
 
@@ -779,6 +888,7 @@ void VulkanEngine::run()
 {
     SDL_Event e;
     bool bQuit = false;
+    unsigned cameraMouseButtons = 0;
 	uint64_t lastTime = SDL_GetPerformanceCounter();
 	uint64_t frequency = SDL_GetPerformanceFrequency();
     // main loop
@@ -799,10 +909,28 @@ void VulkanEngine::run()
                 capture_next_frame = true;
             }
 
-        	// Only forward mouse-button-down to the camera when ImGui is NOT consuming the mouse
-            // (i.e. the user is clicking in the 3D viewport, not on a panel)
-            bool imguiWantsMouse = ImGui::GetIO().WantCaptureMouse;
-            if (!imguiWantsMouse || e.type != SDL_MOUSEBUTTONDOWN) {
+            // Camera gestures belong to the center viewport. Always deliver
+            // button releases so a drag cannot remain latched over a panel.
+            const EditorLayout layout = EditorLayout::current();
+            int mouseX = 0, mouseY = 0;
+            SDL_GetMouseState(&mouseX, &mouseY);
+            const bool inViewport = mouseX >= layout.left &&
+                mouseX < layout.width - layout.right &&
+                mouseY >= layout.toolbar && mouseY < layout.height - layout.status;
+            const bool wantsMouse = ImGui::GetIO().WantCaptureMouse;
+            if (e.type == SDL_MOUSEBUTTONDOWN) {
+                if (inViewport && !wantsMouse) {
+                    cameraMouseButtons |= SDL_BUTTON(e.button.button);
+                    mainCamera.processSDLEvent(e);
+                }
+            } else if (e.type == SDL_MOUSEBUTTONUP) {
+                mainCamera.processSDLEvent(e);
+                cameraMouseButtons &= ~SDL_BUTTON(e.button.button);
+            } else if (e.type == SDL_MOUSEMOTION) {
+                if (cameraMouseButtons != 0) mainCamera.processSDLEvent(e);
+            } else if (e.type == SDL_MOUSEWHEEL) {
+                if (inViewport && !wantsMouse) mainCamera.processSDLEvent(e);
+            } else {
                 mainCamera.processSDLEvent(e);
             }
         	ImGui_ImplSDL2_ProcessEvent(&e);
@@ -835,81 +963,7 @@ void VulkanEngine::run()
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::Begin("Stats");
-
-        ImGui::Text("Frame %.3f ms", stats.frametime);
-        ImGui::Text("Scene update %.3f ms", stats.scene_update_time);
-        ImGui::Text("Render record %.3f ms", stats.mesh_draw_time);
-        ImGui::Text("Submitted triangles %i", stats.triangle_count);
-        ImGui::Text("Submitted draws %i", stats.drawcall_count);
-        ImGui::Separator();
-        ImGui::Text(
-            "Shadow    %.3f ms | draws %i | tris %i",
-            stats.shadow.cpu_time_ms,
-            stats.shadow.drawcall_count,
-            stats.shadow.triangle_count);
-        ImGui::Text(
-            "Geometry  %.3f ms | draws %i | tris %i",
-            stats.geometry.cpu_time_ms,
-            stats.geometry.drawcall_count,
-            stats.geometry.triangle_count);
-        ImGui::Text(
-            "Lighting  %.3f ms | draws %i | tris %i",
-            stats.lighting.cpu_time_ms,
-            stats.lighting.drawcall_count,
-            stats.lighting.triangle_count);
-		if (ImGui::Button("Capture Frame (RenderDoc)")) {
-			capture_next_frame = true;
-		}
-        ImGui::End();
-
-        if (ImGui::Begin("background")) {
-
-            ImGui::SliderFloat("Render Scale",&renderScale, 0.3f, 1.f);
-
-            ComputeEffect& selected = backgroundEffects[currentBackgroundEffect];
-
-            ImGui::Text("Selected effect: ", selected.name);
-
-            ImGui::SliderInt("Effect Index", &currentBackgroundEffect,0, backgroundEffects.size() - 1);
-
-            ImGui::InputFloat4("data1",(float*)& selected.data.data1);
-            ImGui::InputFloat4("data2",(float*)& selected.data.data2);
-            ImGui::InputFloat4("data3",(float*)& selected.data.data3);
-            ImGui::InputFloat4("data4",(float*)& selected.data.data4);
-        }
-        ImGui::End();
-
-        draw_scene_browser();
-        lightSystem.draw_debug_ui();
-        if (ImGui::Begin("PBR Material Debug", nullptr, ImGuiWindowFlags_NoCollapse)) {
-            const char* pbrDebugModes[] = {
-                "Final lighting",
-                "Base color",
-                "World normal",
-                "Metallic",
-                "Perceptual roughness",
-                "Ambient occlusion",
-                "HDR emissive",
-                "Normal faces camera (green=yes, red=no)",
-                "Direct lighting only",
-            };
-            ImGui::Combo("Output", &pbrDebugMode, pbrDebugModes, IM_ARRAYSIZE(pbrDebugModes));
-            ImGui::Checkbox("Emissive contribution", &pbrEmissiveEnabled);
-            ImGui::TextDisabled(
-                "Reads the same GBuffer channels consumed by deferred lighting");
-        }
-        ImGui::End();
-        lightBinningPass.draw_debug_ui();
-        shadowPass.draw_debug_ui();
-        contactShadowPass.draw_debug_ui();
-        ddgiProbeTracePass.draw_debug_ui();
-        ddgiProbeBlendPass.draw_debug_ui();
-        ddgiProbeDebugPass.draw_debug_ui();
-        toneMapPass.draw_debug_ui();
-
-        // Outliner, Properties, and ImGuizmo gizmo — all inside the same ImGui frame
-        sceneOutliner.draw(*this);
+        draw_editor_ui();
 
         ImGui::Render();
 
@@ -1023,6 +1077,19 @@ void VulkanEngine::rebuild_ray_tracing_scene(const LoadedScene& scene)
     std::fflush(stdout);
 }
 
+void VulkanEngine::register_runtime_mesh(const MeshAsset& mesh)
+{
+    if (_rayTracingBLASIndices.contains(&mesh)) return;
+    std::optional<RayTracingMeshDesc> desc =
+        make_ray_tracing_mesh_desc(mesh, bindlessMaterialCount);
+    if (!desc) return;
+    const uint32_t blasIndex = rayTracingScene.register_mesh(*desc);
+    _rayTracingBLASIndices.emplace(&mesh, blasIndex);
+    _rayTracingBuildCompletionLogged = false;
+    fmt::println("Runtime mesh registered for DDGI: {} (BLAS {})", mesh.name, blasIndex);
+    std::fflush(stdout);
+}
+
 void VulkanEngine::sync_ray_tracing_instances()
 {
     std::vector<RayTracingInstanceDesc> instances;
@@ -1048,28 +1115,181 @@ void VulkanEngine::sync_ray_tracing_instances()
     }
 }
 
+void VulkanEngine::draw_editor_ui()
+{
+    const EditorLayout layout = EditorLayout::current();
+    const ImGuiWindowFlags barFlags = EditorPanelFlags |
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar;
+
+    ImGui::SetNextWindowPos(ImVec2(0.f, 0.f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(layout.width, layout.toolbar), ImGuiCond_Always);
+    if (ImGui::Begin("##EditorToolbar", nullptr, barFlags)) {
+        ImGui::TextColored(ImVec4(0.39f, 0.75f, 1.f, 1.f), "D / R");
+        ImGui::SameLine();
+        ImGui::TextDisabled("SCENE");
+        ImGui::SameLine();
+        draw_scene_browser();
+        ImGui::SameLine();
+        ImGui::TextDisabled("SCALE");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(110.f);
+        ImGui::SliderFloat("##RenderScale", &renderScale, 0.3f, 1.f, "%.2f");
+        ImGui::SameLine();
+        if (ImGui::Button("Capture frame")) capture_next_frame = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("F11");
+    }
+    ImGui::End();
+
+    sceneOutliner.draw(*this);
+
+    // A compact viewport label makes the center read as a dedicated scene view.
+    const ImVec2 badgeMin(layout.viewport_left() + 16.f, layout.toolbar + 16.f);
+    const ImVec2 badgeMax(badgeMin.x + 158.f, badgeMin.y + 30.f);
+    ImDrawList* viewportDrawList = ImGui::GetForegroundDrawList();
+    viewportDrawList->AddRectFilled(badgeMin, badgeMax, IM_COL32(18, 25, 35, 225), 5.f);
+    viewportDrawList->AddRect(badgeMin, badgeMax, IM_COL32(75, 103, 137, 190), 5.f);
+    viewportDrawList->AddText(ImVec2(badgeMin.x + 12.f, badgeMin.y + 8.f),
+        IM_COL32(190, 215, 240, 255), "PERSPECTIVE  /  LIT");
+
+    ImGui::SetNextWindowPos(ImVec2(layout.width - layout.right, layout.toolbar), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(layout.right, layout.panel_height()), ImGuiCond_Always);
+    if (ImGui::Begin("Inspector", nullptr, EditorPanelFlags)) {
+        static int page = 0;
+        constexpr const char* pages[] = {
+            "Selection", "Lighting", "Shadows", "Global illumination", "Output", "Profiler"
+        };
+        ImGui::SetNextItemWidth(-1.f);
+        ImGui::Combo("##InspectorPage", &page, pages, IM_ARRAYSIZE(pages));
+        ImGui::Separator();
+        if (ImGui::BeginChild("##InspectorContent", ImVec2(0.f, 0.f), false)) {
+            switch (page) {
+            case 0:
+                sceneOutliner.draw_properties(*this);
+                break;
+            case 1:
+                if (ImGui::CollapsingHeader("Scene lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushID("SceneLights");
+                    lightSystem.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                if (ImGui::CollapsingHeader("Tiled deferred", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushID("LightBinning");
+                    lightBinningPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                break;
+            case 2:
+                if (ImGui::CollapsingHeader("Cascaded and punctual", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushID("ShadowPass");
+                    shadowPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                if (ImGui::CollapsingHeader("Contact shadows")) {
+                    ImGui::PushID("ContactShadows");
+                    contactShadowPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                break;
+            case 3:
+                if (ImGui::CollapsingHeader("Probe tracing", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushID("ProbeTrace");
+                    ddgiProbeTracePass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                if (ImGui::CollapsingHeader("Probe blending")) {
+                    ImGui::PushID("ProbeBlend");
+                    ddgiProbeBlendPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                if (ImGui::CollapsingHeader("Probe visualization")) {
+                    ImGui::PushID("ProbeDebug");
+                    ddgiProbeDebugPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                break;
+            case 4: {
+                if (ImGui::CollapsingHeader("Tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushID("ToneMapping");
+                    toneMapPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
+                if (ImGui::CollapsingHeader("Material view")) {
+                    const char* modes[] = {
+                        "Final lighting", "Base color", "World normal", "Metallic",
+                        "Perceptual roughness", "Ambient occlusion", "HDR emissive",
+                        "Normal faces camera (green=yes, red=no)", "Direct lighting only"
+                    };
+                    pbrDebugMode = std::clamp(pbrDebugMode, 0, IM_ARRAYSIZE(modes) - 1);
+                    ImGui::Combo("Output", &pbrDebugMode, modes, IM_ARRAYSIZE(modes));
+                    ImGui::Checkbox("Emissive contribution", &pbrEmissiveEnabled);
+                    ImGui::TextDisabled("GBuffer channels consumed by deferred lighting");
+                }
+                if (ImGui::CollapsingHeader("HDR environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::SliderFloat("HDR contribution", &environmentLighting.intensity,
+                        0.0f, 2.0f, "%.2f");
+                    if (ImGui::IsItemDeactivatedAfterEdit() && ddgiVolume.initialized()) {
+                        ddgiVolume.request_history_reset();
+                    }
+                    ImGui::TextDisabled("Sky and DDGI ray misses");
+                }
+                if (ImGui::CollapsingHeader("Background effect") && !backgroundEffects.empty()) {
+                    currentBackgroundEffect = std::clamp(currentBackgroundEffect, 0,
+                        static_cast<int>(backgroundEffects.size()) - 1);
+                    ImGui::SliderInt("Effect", &currentBackgroundEffect, 0,
+                        static_cast<int>(backgroundEffects.size()) - 1,
+                        backgroundEffects[currentBackgroundEffect].name);
+                    if (currentBackgroundEffect != 1) {
+                        ComputeEffect& effect = backgroundEffects[currentBackgroundEffect];
+                        ImGui::InputFloat4("Data 1", (float*)&effect.data.data1);
+                        ImGui::InputFloat4("Data 2", (float*)&effect.data.data2);
+                        ImGui::InputFloat4("Data 3", (float*)&effect.data.data3);
+                        ImGui::InputFloat4("Data 4", (float*)&effect.data.data4);
+                    }
+                }
+                break;
+            }
+            case 5:
+                ImGui::SeparatorText("CPU frame");
+                ImGui::Text("Frame             %.3f ms", stats.frametime);
+                ImGui::Text("Scene update      %.3f ms", stats.scene_update_time);
+                ImGui::Text("Render record     %.3f ms", stats.mesh_draw_time);
+                ImGui::SeparatorText("Passes");
+                ImGui::Text("Shadow    %.3f ms  |  %i draws  |  %i tris",
+                    stats.shadow.cpu_time_ms, stats.shadow.drawcall_count, stats.shadow.triangle_count);
+                ImGui::Text("Geometry  %.3f ms  |  %i draws  |  %i tris",
+                    stats.geometry.cpu_time_ms, stats.geometry.drawcall_count, stats.geometry.triangle_count);
+                ImGui::Text("Lighting  %.3f ms  |  %i draws  |  %i tris",
+                    stats.lighting.cpu_time_ms, stats.lighting.drawcall_count, stats.lighting.triangle_count);
+                break;
+            }
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+
+    ImGui::SetNextWindowPos(ImVec2(0.f, layout.height - layout.status), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(layout.width, layout.status), ImGuiCond_Always);
+    if (ImGui::Begin("##EditorStatus", nullptr, barFlags)) {
+        ImGui::Text("%.1f FPS  |  %.2f ms", stats.frametime > 0.f ? 1000.f / stats.frametime : 0.f,
+            stats.frametime);
+        ImGui::SameLine();
+        ImGui::TextDisabled("  %i draws  |  %i triangles  |  %u scenes cached",
+            stats.drawcall_count, stats.triangle_count, static_cast<unsigned>(loadedScenes.size()));
+        ImGui::SameLine();
+        ImGui::TextDisabled("  |  %ux%u", _windowExtent.width, _windowExtent.height);
+    }
+    ImGui::End();
+}
+
 void VulkanEngine::draw_scene_browser()
 {
-    ImGui::SetNextWindowPos(ImVec2(340, 0), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(360, 180), ImGuiCond_Once);
-
-    if (!ImGui::Begin("Scene Browser", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
-    if (ImGui::Button("Refresh")) {
-        scan_scene_library();
-    }
-
-    ImGui::SameLine();
-    ImGui::Text("Available: %d", static_cast<int>(sceneLibrary.size()));
-
     const std::string activeLabel = activeSceneName.empty()
         ? std::string("(none)")
         : scene_display_name(activeSceneName);
 
-    if (ImGui::BeginCombo("Active Scene", activeLabel.c_str())) {
+    ImGui::SetNextItemWidth(260.f);
+    if (ImGui::BeginCombo("##ActiveScene", activeLabel.c_str())) {
         for (const std::string& path : sceneLibrary) {
             const bool active = (path == activeSceneName);
             const bool loaded = (loadedScenes.find(path) != loadedScenes.end());
@@ -1088,15 +1308,11 @@ void VulkanEngine::draw_scene_browser()
         }
         ImGui::EndCombo();
     }
-
-    if (!activeSceneName.empty()) {
-        ImGui::TextWrapped("%s", activeSceneName.c_str());
-    } else {
-        ImGui::TextDisabled("No active scene");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", activeSceneName.empty() ? "No active scene" : activeSceneName.c_str());
     }
-
-    ImGui::Text("Loaded cache: %d", static_cast<int>(loadedScenes.size()));
-    ImGui::End();
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh scenes")) scan_scene_library();
 }
 
 void VulkanEngine::init_vulkan()
@@ -1768,6 +1984,9 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
 							4, 1, &contactShadowSet, 0, nullptr);
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
 							5, 1, &ddgiSet, 0, nullptr);
+	const VkDescriptorSet environmentSet = environmentLighting.descriptor_set(ctx.frameIndex);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _deferredLightingPipelineLayout,
+							6, 1, &environmentSet, 0, nullptr);
 
     DeferredLightingPushConstants lightingPushConstants{};
     const bool ddgiHistoryValid = ddgiVolume.enabled()
@@ -1815,8 +2034,12 @@ void VulkanEngine::init_background_pipelines()
     VkPipelineLayoutCreateInfo computeLayout{};
     computeLayout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     computeLayout.pNext = nullptr;
-    computeLayout.pSetLayouts = &_drawImageDescriptorLayout;
-    computeLayout.setLayoutCount = 1;
+    VkDescriptorSetLayout backgroundLayouts[] = {
+        _drawImageDescriptorLayout,
+        _descriptorSystem.layout(DescriptorLayoutID::Environment),
+    };
+    computeLayout.pSetLayouts = backgroundLayouts;
+    computeLayout.setLayoutCount = 2;
 
     VkPushConstantRange pushConstant{};
     pushConstant.offset = 0;
@@ -1830,12 +2053,14 @@ void VulkanEngine::init_background_pipelines()
 
 
     VkShaderModule gradientShader;
-    if (!vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/gradient.comp.spv", _device, &gradientShader)) {
+    if (!vkutil::load_shader_module("../cmake-build-debug/shaders/gradient.comp.spv", _device, &gradientShader)
+        && !vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/gradient.comp.spv", _device, &gradientShader)) {
 	    fmt::print("Error when building the compute shader \n");
     }
 
     VkShaderModule skyShader;
-    if (!vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/sky.comp.spv", _device, &skyShader)) {
+    if (!vkutil::load_shader_module("../cmake-build-debug/shaders/sky.comp.spv", _device, &skyShader)
+        && !vkutil::load_shader_module("../cmake-build-debug-mingw/shaders/sky.comp.spv", _device, &skyShader)) {
 	    fmt::print("Error when building the compute shader \n");
     }
 
@@ -1903,14 +2128,15 @@ void VulkanEngine::init_Deferredlighting_pipeline()
 		fmt::print("Error when building the deferred lighting shader module \n");
 	}
 	VkPipelineLayoutCreateInfo layoutCreateInfo = vkinit::pipeline_layout_create_info();
-	layoutCreateInfo.setLayoutCount = 6;
+	layoutCreateInfo.setLayoutCount = 7;
 	VkDescriptorSetLayout lightingLayouts[] = {
         _gpuSceneDataDescriptorLayout,
         _gBufferDescriptorLayout,
         _descriptorSystem.layout(DescriptorLayoutID::LightData),
 		_descriptorSystem.layout(DescriptorLayoutID::ShadowInput),
 		_descriptorSystem.layout(DescriptorLayoutID::ContactShadowInput),
-		_descriptorSystem.layout(DescriptorLayoutID::GIInput)
+		_descriptorSystem.layout(DescriptorLayoutID::GIInput),
+		_descriptorSystem.layout(DescriptorLayoutID::Environment)
     };
 	layoutCreateInfo.pSetLayouts = lightingLayouts;
 	VkPushConstantRange pushConstantRange{};
@@ -2035,10 +2261,11 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
             engine->_bindlessDescriptorLayout,
             engine->_descriptorSystem.layout(DescriptorLayoutID::LightData),
             engine->_descriptorSystem.layout(DescriptorLayoutID::ShadowInput),
+            engine->_descriptorSystem.layout(DescriptorLayoutID::Environment),
         };
 
         VkPipelineLayoutCreateInfo transparentLayoutInfo = vkinit::pipeline_layout_create_info();
-        transparentLayoutInfo.setLayoutCount = 4;
+        transparentLayoutInfo.setLayoutCount = 5;
         transparentLayoutInfo.pSetLayouts = transparentLayouts;
         transparentLayoutInfo.pPushConstantRanges = &matrixRange;
         transparentLayoutInfo.pushConstantRangeCount = 1;

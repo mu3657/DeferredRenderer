@@ -186,11 +186,6 @@ void LightSystem::upload_frame(FrameData& frame)
 
 void LightSystem::draw_debug_ui()
 {
-    if (!ImGui::Begin("Light System", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     ImGui::Checkbox("Fallback directional", &_enableFallbackDirectional);
     ImGui::Text("Lights: %u / %u", _lightData.lightCount, MAX_GPU_LIGHTS);
     ImGui::Text("Directional: %u", _lightData.directionalLightCount);
@@ -216,7 +211,6 @@ void LightSystem::draw_debug_ui()
         ImGui::Text("#%u %s intensity %.2f range %.2f", i, typeName, light.colorIntensity.w, light.positionRange.w);
     }
 
-    ImGui::End();
 }
 
  GPULight LightSystem::GetDirectionalLight()

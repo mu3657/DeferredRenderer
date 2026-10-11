@@ -630,6 +630,8 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
 
         rtxgi::DDGIRootConstants rootConstants{};
         rootConstants.volumeIndex = 0;
+        rootConstants.reductionInputSizeX = updateRange.firstProbe;
+        rootConstants.reductionInputSizeY = updateRange.probeCount;
         vkCmdPushConstants(
             ctx.cmd,
             _rtxgiPipelineLayout,
@@ -639,13 +641,12 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
             &rootConstants);
         vkCmdBindPipeline(
             ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _rtxgiRelocationPipeline);
-        const uint32_t totalProbeCount = ctx.volume.total_probe_count();
-        vkCmdDispatch(ctx.cmd, (totalProbeCount + 31u) / 32u, 1u, 1u);
+        vkCmdDispatch(ctx.cmd, (updateRange.probeCount + 31u) / 32u, 1u, 1u);
         make_probe_data_visible_after_relocation(
             ctx.cmd, resources.probeData.image.image);
 
         const glm::uvec4 diagnosticConstants(
-            totalProbeCount,
+            ctx.volume.total_probe_count(),
             ctx.volume.desc().probeCounts.x,
             ctx.volume.desc().probeCounts.y,
             0u);
@@ -660,8 +661,8 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
             0,
             sizeof(diagnosticConstants),
             &diagnosticConstants);
-        vkCmdDispatch(ctx.cmd, (totalProbeCount + 63u) / 64u, 1u, 1u);
-        _stats.relocationProbeCount = totalProbeCount;
+        vkCmdDispatch(ctx.cmd, (ctx.volume.total_probe_count() + 63u) / 64u, 1u, 1u);
+        _stats.relocationProbeCount = updateRange.probeCount;
     }
     make_atlases_visible_to_sampling(
         ctx.cmd,
@@ -707,11 +708,6 @@ void DDGIProbeBlendPass::notify_frame_completed(uint32_t frameIndex)
 
 void DDGIProbeBlendPass::draw_debug_ui()
 {
-    if (!ImGui::Begin("DDGI Probe Blend", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     if (_engine && _engine->ddgiVolume.initialized()) {
         DDGIVolume& volume = _engine->ddgiVolume;
         const DDGIAtlasLayout& irradiance = volume.irradiance_layout();
@@ -781,7 +777,7 @@ void DDGIProbeBlendPass::draw_debug_ui()
             distance.arrayLayers,
             distance.interiorTexels);
         ImGui::Text("Last blend: %u probes", _stats.probeCount);
-        ImGui::Text("Last relocation: %u probes scanned", _stats.relocationProbeCount);
+        ImGui::Text("Last relocation: %u probes updated", _stats.relocationProbeCount);
         ImGui::Text("Interior texels: %u irradiance, %u distance",
             _stats.irradianceTexelCount,
             _stats.distanceTexelCount);
@@ -790,6 +786,29 @@ void DDGIProbeBlendPass::draw_debug_ui()
             volume.total_probe_count(),
             100.f * static_cast<float>(volume.history_probe_count())
                 / static_cast<float>(volume.total_probe_count()));
+        ImGui::Separator();
+        DDGIUpdateTiming& timing = _engine->ddgiTiming;
+        if (timing.available) {
+            ImGui::Text("GI GPU: %.2f ms (trace %.2f, blend/relocation %.2f)",
+                timing.totalGpuMs, timing.traceGpuMs, timing.blendGpuMs);
+            ImGui::Checkbox("Automatic probe budget", &timing.automaticBudget);
+            if (timing.automaticBudget) {
+                ImGui::SliderFloat("GI target GPU ms", &timing.targetGpuMs,
+                    0.5f, 8.f, "%.1f ms");
+            }
+        } else {
+            ImGui::TextDisabled("GPU timestamps unavailable; fixed probe budget");
+        }
+        if (!timing.available || !timing.automaticBudget) {
+            int probesPerFrame = static_cast<int>(volume.desc().probesUpdatedPerFrame);
+            if (ImGui::SliderInt("Probes per frame", &probesPerFrame,
+                    1, static_cast<int>(std::min(128u, volume.total_probe_count())))) {
+                volume.set_probes_updated_per_frame(
+                    static_cast<uint32_t>(probesPerFrame));
+            }
+        } else {
+            ImGui::Text("Probes per frame: %u", volume.desc().probesUpdatedPerFrame);
+        }
         ImGui::Separator();
         ImGui::Checkbox("Deferred lighting", &_lightingEnabled);
         ImGui::SliderFloat("Indirect intensity", &_lightingIntensity, 0.f, 4.f);
@@ -822,5 +841,4 @@ void DDGIProbeBlendPass::draw_debug_ui()
             ImGui::TextDisabled("Waiting for the first completed probe blend");
         }
     }
-    ImGui::End();
 }

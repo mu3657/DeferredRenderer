@@ -249,11 +249,6 @@ void ContactShadowPass::execute(ContactShadowPassContext& ctx)
 
 void ContactShadowPass::draw_debug_ui()
 {
-    if (!ImGui::Begin("Contact Shadows", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     ImGui::Checkbox("Enabled", &_enabled);
     ImGui::SliderFloat("Surface thickness", &_surfaceThickness, 0.0001f, 0.05f, "%.4f", ImGuiSliderFlags_Logarithmic);
     ImGui::SliderFloat("Bilinear threshold", &_bilinearThreshold, 0.001f, 0.1f, "%.4f", ImGuiSliderFlags_Logarithmic);
@@ -267,5 +262,4 @@ void ContactShadowPass::draw_debug_ui()
     ImGui::Checkbox("Thread index", &_debugThreadIndex);
     ImGui::Checkbox("Wave index", &_debugWaveIndex);
     ImGui::TextUnformatted("Bend SSS: 60 samples, 64-thread wavefront projection.");
-    ImGui::End();
 }

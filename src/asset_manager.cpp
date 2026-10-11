@@ -10,6 +10,35 @@
 #include <vk_loader.h>
 #include <algorithm>
 #include <cmath>
+#include <glm/gtc/constants.hpp>
+
+namespace {
+
+Vertex primitive_vertex(glm::vec3 position, glm::vec3 normal, glm::vec3 tangent,
+                        float u, float v) {
+    Vertex vertex{};
+    vertex.position = position;
+    vertex.normal = normal;
+    vertex.tangent = glm::vec4(glm::normalize(tangent), 1.f);
+    vertex.uv_x = u;
+    vertex.uv_y = v;
+    vertex.color = glm::vec4(1.f);
+    return vertex;
+}
+
+void append_quad(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices,
+                 glm::vec3 center, glm::vec3 right, glm::vec3 up, glm::vec3 normal) {
+    const uint32_t first = static_cast<uint32_t>(vertices.size());
+    vertices.push_back(primitive_vertex(center - right - up, normal, right, 0.f, 0.f));
+    vertices.push_back(primitive_vertex(center + right - up, normal, right, 1.f, 0.f));
+    vertices.push_back(primitive_vertex(center + right + up, normal, right, 1.f, 1.f));
+    vertices.push_back(primitive_vertex(center - right + up, normal, right, 0.f, 1.f));
+    indices.insert(indices.end(), {first, first + 1, first + 2,
+                                   first, first + 2, first + 3});
+}
+
+} // namespace
+
 void AssetManager::init(VulkanEngine* engine) {
     _engine = engine;
     // Build a default material wrapping the engine's pre-allocated defaultData
@@ -18,11 +47,93 @@ void AssetManager::init(VulkanEngine* engine) {
 }
 
 void AssetManager::cleanup() {
+    for (auto& mesh : _primitives) {
+        if (!mesh) continue;
+        _engine->destroy_buffer(mesh->meshBuffers.indexBuffer);
+        _engine->destroy_buffer(mesh->meshBuffers.vertexBuffer);
+        mesh.reset();
+    }
     for (auto& [path, mesh] : _meshes) {
         _engine->destroy_buffer(mesh->meshBuffers.indexBuffer);
         _engine->destroy_buffer(mesh->meshBuffers.vertexBuffer);
     }
     _meshes.clear();
+}
+
+std::shared_ptr<MeshAsset> AssetManager::get_primitive(PrimitiveShape shape) {
+    const size_t slot = static_cast<size_t>(shape);
+    if (slot >= _primitives.size()) return nullptr;
+    if (_primitives[slot]) return _primitives[slot];
+
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    Bounds bounds{};
+    const char* name = nullptr;
+
+    if (shape == PrimitiveShape::Cube) {
+        name = "Cube";
+        append_quad(vertices, indices, {0.f, 0.f, 0.5f}, {0.5f, 0.f, 0.f},
+                    {0.f, 0.5f, 0.f}, {0.f, 0.f, 1.f});
+        append_quad(vertices, indices, {0.f, 0.f, -0.5f}, {-0.5f, 0.f, 0.f},
+                    {0.f, 0.5f, 0.f}, {0.f, 0.f, -1.f});
+        append_quad(vertices, indices, {0.5f, 0.f, 0.f}, {0.f, 0.f, -0.5f},
+                    {0.f, 0.5f, 0.f}, {1.f, 0.f, 0.f});
+        append_quad(vertices, indices, {-0.5f, 0.f, 0.f}, {0.f, 0.f, 0.5f},
+                    {0.f, 0.5f, 0.f}, {-1.f, 0.f, 0.f});
+        append_quad(vertices, indices, {0.f, 0.5f, 0.f}, {0.5f, 0.f, 0.f},
+                    {0.f, 0.f, -0.5f}, {0.f, 1.f, 0.f});
+        append_quad(vertices, indices, {0.f, -0.5f, 0.f}, {0.5f, 0.f, 0.f},
+                    {0.f, 0.f, 0.5f}, {0.f, -1.f, 0.f});
+        bounds.extents = glm::vec3(0.5f);
+        bounds.sphereRadius = glm::length(bounds.extents);
+    } else if (shape == PrimitiveShape::Plane) {
+        name = "Plane";
+        append_quad(vertices, indices, {0.f, 0.f, 0.f}, {0.5f, 0.f, 0.f},
+                    {0.f, 0.f, -0.5f}, {0.f, 1.f, 0.f});
+        bounds.extents = glm::vec3(0.5f, 0.f, 0.5f);
+        bounds.sphereRadius = glm::length(bounds.extents);
+    } else {
+        name = "Sphere";
+        constexpr uint32_t stacks = 16;
+        constexpr uint32_t slices = 32;
+        for (uint32_t stack = 0; stack <= stacks; ++stack) {
+            const float theta = glm::pi<float>() * static_cast<float>(stack) / stacks;
+            const float y = std::cos(theta);
+            const float ring = std::sin(theta);
+            for (uint32_t slice = 0; slice <= slices; ++slice) {
+                const float phi = glm::two_pi<float>() * static_cast<float>(slice) / slices;
+                const glm::vec3 normal(ring * std::cos(phi), y, ring * std::sin(phi));
+                vertices.push_back(primitive_vertex(0.5f * normal, normal,
+                    glm::vec3(-std::sin(phi), 0.f, std::cos(phi)),
+                    static_cast<float>(slice) / slices,
+                    static_cast<float>(stack) / stacks));
+            }
+        }
+        for (uint32_t stack = 0; stack < stacks; ++stack) {
+            for (uint32_t slice = 0; slice < slices; ++slice) {
+                const uint32_t a = stack * (slices + 1) + slice;
+                const uint32_t b = a + 1;
+                const uint32_t c = a + slices + 1;
+                const uint32_t d = c + 1;
+                if (stack > 0) indices.insert(indices.end(), {a, b, c});
+                if (stack + 1 < stacks) indices.insert(indices.end(), {b, d, c});
+            }
+        }
+        bounds.extents = glm::vec3(0.5f);
+        bounds.sphereRadius = 0.5f;
+    }
+
+    auto mesh = std::make_shared<MeshAsset>();
+    mesh->name = name;
+    mesh->meshBuffers = _engine->uploadMesh(indices, vertices);
+    GeoSurface surface{};
+    surface.startIndex = 0;
+    surface.count = static_cast<uint32_t>(indices.size());
+    surface.bounds = bounds;
+    surface.material = _defaultMaterial;
+    mesh->surfaces.push_back(surface);
+    _primitives[slot] = mesh;
+    return mesh;
 }
 
 std::shared_ptr<MeshAsset> AssetManager::load_mesh(const std::string& path) {

@@ -53,7 +53,6 @@ private:
     DDGIProbeTraceDispatchStats _stats{};
     uint64_t _lastProbeDataResetSerial{0};
     bool _enabled{true};
-    bool _dispatchInFlight{false};
     bool _multiBounceEnabled{true};
     bool _wholeProbeBackfaceRejection{false};
     float _multiBounceStrength{0.85f};

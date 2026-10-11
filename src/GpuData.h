@@ -55,6 +55,8 @@ struct GPUShadowData {
     glm::vec4 cascadeDepthRanges;
     glm::vec4 lightDir;
     glm::vec4 params; // bias in shadow texels, strength, texelSize, enabled
+    glm::vec4 pcssParams; // enabled, tan(sun half angle), max search radius, max filter radius (texels)
+    glm::vec4 pcssSamples; // blocker samples, filter samples, minimum filter radius (texels), unused
 };
 
 struct GPUPunctualShadow {

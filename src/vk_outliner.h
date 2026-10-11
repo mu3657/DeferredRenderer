@@ -43,6 +43,8 @@ public:
     // Call every ImGui frame (inside ImGui::NewFrame / ImGui::Render block)
     // engine is used to read/write camera + node transforms.
     void draw(VulkanEngine& engine);
+    // Draws selection controls inside the caller's inspector window.
+    void draw_properties(VulkanEngine& engine);
 
     // Returns the currently selected node (nullptr if none)
     std::shared_ptr<Node> get_selected_node() const;
@@ -58,7 +60,6 @@ public:
 private:
     // Sub-panel drawing helpers
     void draw_outliner(VulkanEngine& engine);
-    void draw_properties(VulkanEngine& engine);
     void draw_light_gizmo(VulkanEngine& engine);
     void draw_gizmo(VulkanEngine& engine);
 

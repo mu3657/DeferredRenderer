@@ -47,6 +47,33 @@ winding is not yet a trustworthy authored single-sided contract.
 
 ## Runtime validation
 
+### Shared HDR environment
+
+At startup, `EnvironmentLighting` loads `assets/environment.hdr` or the bundled
+`assets/rogland_clear_night_2k.hdr` (resolving the parent `assets` directory
+when launched from `bin`). If neither exists, it generates a directional HDR sky.
+The full-resolution panorama supplies the visible camera-directed sky, sharp
+reflections, and DDGI ray misses. A separately prefiltered cubemap supplies
+rough reflections, and a CPU-integrated BRDF LUT supplies the GGX response.
+Deferred and transparent metallic-roughness shaders add a separate indirect
+specular term; DDGI still supplies indirect diffuse. The PBR debug output includes
+`Indirect specular only` so the new contribution can be isolated.
+The Output inspector exposes `HDR contribution` (default 0.25, range 0 to 2).
+It scales the visible sky, indirect specular and DDGI ray misses together.
+Releasing the slider resets DDGI probe history so diffuse bounce lighting
+converges to the new environment level.
+
+This first global environment has no indoor parallax correction or local
+reflection occlusion. In Bistro, polished surfaces near walls need local
+reflection probes or ray-based reflections for accurate nearby content. The
+background-effect selector can still show the old gradient for diagnostics;
+the HDR sky is the default.
+
+The environment resource, four affected SPIR-V modules, and the engine built
+and launched on the target GPU. In a short runtime check DDGI continued to
+produce finite ray and irradiance diagnostics. Final image quality needs an
+on-screen comparison with fixed camera/exposure and reflective materials.
+
 The `PBR Material Debug` window isolates final lighting, base color, world
 normal, metallic, perceptual roughness, ambient occlusion, and HDR emissive.
 It also exposes signed normal/view hemisphere (green = facing camera, red =
@@ -101,11 +128,16 @@ history has converged. Use indirect-only and confidence outputs to distinguish
 missing probe coverage from material response. Test MASK using a known cutout
 surface and its shadow. Do not infer any of these results from build success.
 
-Probe relocation and classification kernels are compiled but remain disabled
-until their 32 fixed-ray schedule can be integrated with the renderer's partial
-probe-batch scheduler. The active implementation uses visibility moments,
-normal/view bias, back-face diagnostics, hysteresis, and multi-bounce history;
-it should not be described as a complete RTXGI feature port.
+Probe relocation is enabled and runs on the same partial probe batch as tracing;
+the batch's legacy X/Y/Z indices are converted to RTXGI's X/Z/Y order before
+reading fixed ray data. Classification remains disabled. Probe trace batches can
+be recorded in consecutive frames on the graphics queue. GPU timestamps measure
+trace and blend/relocation separately, and an adjustable 2 ms default target
+adapts the batch size from its initial 8 probes up to 128 probes per frame.
+The active implementation uses visibility moments, normal/view bias, back-face
+diagnostics, hysteresis, and multi-bounce history; it should not be described
+as a complete RTXGI feature port. GPU timings and final visual comparisons
+remain hardware- and scene-dependent.
 
 ## Resume-ready summary
 

@@ -42,6 +42,7 @@ public:
     AllocatedImage _shadowDepthImage{};
     AllocatedImage _punctualShadowDepthImage{};
     VkSampler _shadowSampler{VK_NULL_HANDLE};
+    VkSampler _shadowCompareSampler{VK_NULL_HANDLE};
     VkExtent2D _shadowExtent{4096, 4096};
     VkExtent2D _punctualShadowExtent{4096, 4096};
     uint32_t _punctualTileResolution{512};
@@ -56,6 +57,12 @@ public:
     float _rasterConstantBias{1.25f};
     float _rasterSlopeBias{1.75f};
     float _strength{1.0f};
+    bool _pcssEnabled{true};
+    float _sunAngularRadiusDegrees{0.5f};
+    float _pcssMaxSearchRadius{24.f};
+    float _pcssMaxFilterRadius{16.f};
+    int _pcssBlockerSamples{16};
+    int _pcssFilterSamples{24};
     bool _punctualEnabled{true};
     float _punctualNormalBias{0.02f};
     float _punctualRasterConstantBias{1.25f};

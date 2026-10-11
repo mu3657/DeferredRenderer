@@ -186,6 +186,7 @@ function(add_rtxgi_ddgi_probe_management_shader OUTPUT_NAME SOURCE_NAME ENTRY_PO
             -DPROBE_DATA_SPACE=0
             -DRTXGI_PUSH_CONSTS_TYPE=1
             -DRTXGI_DECLARE_PUSH_CONSTS=1
+            -DRTXGI_DDGI_RELOCATION_USE_ROOT_DISPATCH_BASE=1
             -Fo "${SPIRV}"
             "${RTXGI_DDGI_SHADER_DIR}/ddgi/${SOURCE_NAME}"
         DEPENDS ${RTXGI_DDGI_SHADER_DEPENDENCIES}

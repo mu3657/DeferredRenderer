@@ -6,6 +6,7 @@
 #include "camera.h"
 
 #include "imgui.h"
+#include "editor_layout.h"
 #include "ImGuizmo.h"
 
 #include <algorithm>
@@ -262,6 +263,24 @@ static std::shared_ptr<Node> create_light_node(
     return node;
 }
 
+static std::shared_ptr<Node> create_primitive_node(
+    VulkanEngine& engine, LoadedScene& scene,
+    const std::shared_ptr<Node>& parent, PrimitiveShape shape)
+{
+    std::shared_ptr<MeshAsset> mesh = engine.assetManager.get_primitive(shape);
+    if (!mesh) return nullptr;
+    engine.register_runtime_mesh(*mesh);
+
+    auto node = std::make_shared<MeshNode>();
+    node->name = unique_node_name(scene, mesh->name);
+    node->visible = true;
+    node->mesh = std::move(mesh);
+    node->localTransform = spawn_transform(engine, parent);
+    node->worldTransform = glm::mat4(1.f);
+    attach_node(scene, node, parent);
+    return node;
+}
+
 static void draw_create_menu_items(
     VulkanEngine& engine,
     LoadedScene& scene,
@@ -277,6 +296,19 @@ static void draw_create_menu_items(
 
     if (ImGui::MenuItem("Empty Node")) {
         createdNode = create_empty_node(engine, scene, parent);
+    }
+
+    if (ImGui::BeginMenu("Mesh")) {
+        if (ImGui::MenuItem("Cube")) {
+            createdNode = create_primitive_node(engine, scene, parent, PrimitiveShape::Cube);
+        }
+        if (ImGui::MenuItem("Sphere")) {
+            createdNode = create_primitive_node(engine, scene, parent, PrimitiveShape::Sphere);
+        }
+        if (ImGui::MenuItem("Plane")) {
+            createdNode = create_primitive_node(engine, scene, parent, PrimitiveShape::Plane);
+        }
+        ImGui::EndMenu();
     }
 
     if (ImGui::BeginMenu("Light")) {
@@ -390,7 +422,6 @@ void SceneOutliner::draw(VulkanEngine& engine) {
     ImGuizmo::SetDrawlist(ImGui::GetBackgroundDrawList());
 
     draw_outliner(engine);
-    draw_properties(engine);
     draw_light_gizmo(engine);
     draw_gizmo(engine);
 }
@@ -399,11 +430,11 @@ void SceneOutliner::draw(VulkanEngine& engine) {
 // draw_outliner()
 // ─────────────────────────────────────────────────────────────────────────────
 void SceneOutliner::draw_outliner(VulkanEngine& engine) {
-    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(330, 600), ImGuiCond_Once);
+    const EditorLayout layout = EditorLayout::current();
+    ImGui::SetNextWindowPos(ImVec2(0, layout.toolbar), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(layout.left, layout.panel_height()), ImGuiCond_Always);
 
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
-    if (!ImGui::Begin("Outliner", nullptr, flags)) {
+    if (!ImGui::Begin("Hierarchy", nullptr, EditorPanelFlags)) {
         ImGui::End();
         return;
     }
@@ -547,18 +578,9 @@ void SceneOutliner::draw_outliner(VulkanEngine& engine) {
 // draw_properties()
 // ─────────────────────────────────────────────────────────────────────────────
 void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
-    ImGui::SetNextWindowPos(ImVec2(0, 610), ImGuiCond_Once);
-    ImGui::SetNextWindowSize(ImVec2(330, 300), ImGuiCond_Once);
-
-    if (!ImGui::Begin("Properties", nullptr, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
-        return;
-    }
-
     auto node = get_selected_node();
     if (!node) {
-        ImGui::TextDisabled("(no selection)");
-        ImGui::End();
+        ImGui::TextDisabled("Select an object in the Hierarchy to inspect it.");
         return;
     }
 
@@ -649,7 +671,6 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
         }
     }
 
-    ImGui::End();
 }
 
 // Draw a Blender-style spotlight overlay in the viewport. This is editor-only:
