@@ -42,6 +42,8 @@ _deps
 /build*/
 /bin/
 /cmake-build-*/
+/.runtime/taa/
+/.runtime/clustered/
 /out/
 
 # IDEs / Editors
@@ -65,6 +67,7 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
+/.runtime/ddgi/
 /assets/
 /assets/brickadia
 third_party/*
@@ -73,3 +76,11 @@ third_party/*
 *.rdc
 *.resolved
 DESCRIPTOR_SYSTEM.md
+TAA.md
+.gitignore
+DDGI_VALIDATION.md
+CLUSTERED_LIGHTING.md
+tests/clustered_validation.cpp
+tests/ddgi_validation.cpp
+tests/taa_validation.cpp
+PROJECT_TECHNICAL_OVERVIEW.md

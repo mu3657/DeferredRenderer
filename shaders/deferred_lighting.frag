@@ -4,6 +4,7 @@
 #define LIGHTING_PASS 1
 #define USE_LIGHT_DATA 1
 #include "input_structures.glsl"
+#include "cluster_grid.glsl"
 #define ENVIRONMENT_SET 6
 #include "environment_map.glsl"
 
@@ -24,6 +25,7 @@ layout(push_constant) uniform DeferredLightingPushConstants {
     vec4 ddgiParams;      // x history valid, y intensity, z debug mode, w composite enabled
     vec4 ddgiDebugParams; // x DDGI heatmap exposure, y PBR debug mode, zw unused
     uvec4 lightGridParams; // xy tile counts, z tile size, w flags
+    vec4 clusterDepthParams;
 } lightingPushConstants;
 
 layout(std140, set = 5, binding = 0) uniform DDGIVolumeConstants {
@@ -419,11 +421,15 @@ vec3 lightCountHeatmap(float normalizedCount)
 void main()
 {
     // 1. Sample G-Buffer
-    vec4 albedoSample   = texture(gAlbedo, inUV);
-    vec4 normalSample   = texture(gNormal, inUV); // Normal encoded as 0..1, a=metallic
-    vec4 materialSample = texture(gMaterial, inUV); // r=roughness, g=ao
-    vec3 emissive       = max(texture(gEmissive, inUV).rgb, vec3(0.0));
-    float depth         = texture(gDepth, inUV).r;
+    // Raster occupies the active top-left region of fixed-size render targets.
+    // Fetch matching texels even when renderScale/window size changes.
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 bufferUV = gl_FragCoord.xy / vec2(textureSize(gDepth, 0));
+    vec4 albedoSample   = texelFetch(gAlbedo, pixel, 0);
+    vec4 normalSample   = texelFetch(gNormal, pixel, 0);
+    vec4 materialSample = texelFetch(gMaterial, pixel, 0);
+    vec3 emissive       = max(texelFetch(gEmissive, pixel, 0).rgb, vec3(0.0));
+    float depth         = texelFetch(gDepth, pixel, 0).r;
 
     // Reverse-Z depth clears the background to 0. Discard keeps the pre-drawn background.
     if (depth <= 0.0) {
@@ -451,15 +457,17 @@ void main()
     uint directionalSeen = 0;
     uint evaluatedLightCount = 0;
     // --- Direct Lighting ---
-    bool tiledLightingEnabled = (lightingPushConstants.lightGridParams.w & 1u) != 0u;
-    if (tiledLightingEnabled) {
+    bool clusteredLightingEnabled = (lightingPushConstants.lightGridParams.w & 1u) != 0u;
+    if (clusteredLightingEnabled) {
         uint tileSize = max(lightingPushConstants.lightGridParams.z, 1u);
         uvec2 tile = uvec2(gl_FragCoord.xy) / tileSize;
         tile = min(tile, lightingPushConstants.lightGridParams.xy - uvec2(1u));
-        uint tileIndex = tile.y * lightingPushConstants.lightGridParams.x + tile.x;
+        float viewDepth = -(sceneData.view * vec4(worldPos, 1.0)).z;
+        uint slice = clusterDepthSlice(viewDepth, lightingPushConstants.clusterDepthParams);
+        uint clusterIndex = clusterLinearIndex(uvec3(tile, slice), lightingPushConstants.lightGridParams.xy);
 
         for (uint wordIndex = 0u; wordIndex < 8u; ++wordIndex) {
-            uint mask = tileLightMasks[tileIndex * 8u + wordIndex];
+            uint mask = clusterLightMasks[clusterIndex * 8u + wordIndex];
             evaluatedLightCount += bitCount(mask);
             while (mask != 0u) {
                 uint bitIndex = uint(findLSB(mask));
@@ -473,7 +481,7 @@ void main()
                         N,
                         V,
                         worldPos,
-                        inUV,
+                        bufferUV,
                         Lo,
                         directionalSeen);
                 }
@@ -491,15 +499,13 @@ void main()
                 N,
                 V,
                 worldPos,
-                inUV,
+                bufferUV,
                 Lo,
                 directionalSeen);
         }
     }
 
-    // --- Ambient and DDGI diffuse indirect lighting ---
-    vec3 diffuseEnergy = pbrDiffuseEnergy(albedo, metallic, roughness, NdotV);
-    vec3 legacyAmbient = lightData.ambientColor.rgb * albedo * diffuseEnergy * ao;
+    // --- DDGI diffuse indirect lighting ---
     DDGISample ddgi = DDGISample(vec3(0.0), 0.0, 0.0);
     vec3 indirectDiffuse = vec3(0.0);
     if (lightingPushConstants.ddgiParams.x > 0.5) {
@@ -513,9 +519,11 @@ void main()
             * ao
             * lightingPushConstants.ddgiParams.y;
     }
+    // Missing probe coverage is missing GI, not a constant source of light.
+    // Disabling GI gives a direct-light baseline for the same scene.
     vec3 ambient = lightingPushConstants.ddgiParams.w > 0.5
-        ? mix(legacyAmbient, indirectDiffuse, ddgi.confidence)
-        : legacyAmbient;
+        ? indirectDiffuse * ddgi.confidence
+        : vec3(0.0);
     vec3 emissiveContribution = lightingPushConstants.ddgiDebugParams.z > 0.5
         ? emissive
         : vec3(0.0);

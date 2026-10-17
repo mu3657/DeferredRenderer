@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <stdexcept>
 
@@ -517,6 +518,17 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
                 const uint32_t segment = std::min(remaining, counts.x - x);
                 rtxgi::DDGIRootConstants rootConstants{};
                 rootConstants.volumeIndex = 0;
+                // Application extension, only in our bound Vulkan blend kernels:
+                // these two descriptor-heap indices are unused by RTXGI here.
+                rootConstants.volumeConstantsIndex = std::bit_cast<uint32_t>(ctx.volume.gpu_data().blendThresholds.y);
+                // Activity is in [0,1], so its top two bits are free for mode
+                // flags. Keep the bound-kernel root ABI unchanged.
+                if (ctx.volume.gpu_data().blendThresholds.w == 1.f)
+                    rootConstants.volumeConstantsIndex |= 0x80000000u;
+                if (ctx.volume.gpu_data().blendThresholds.w == 2.f)
+                    rootConstants.volumeConstantsIndex |= 0x40000000u;
+                rootConstants.volumeResourceIndicesIndex = std::bit_cast<uint32_t>(
+                    _validationDistanceHistory >= 0.f ? _validationDistanceHistory : ctx.volume.gpu_data().blendThresholds.z);
                 rootConstants.reductionInputSizeX = x;
                 rootConstants.reductionInputSizeY = z;
                 rootConstants.reductionInputSizeZ = y;
@@ -755,6 +767,15 @@ void DDGIProbeBlendPass::draw_debug_ui()
         }
         ImGui::EndDisabled();
         ImGui::Text("Hysteresis: %.3f", volume.desc().hysteresis);
+        ImGui::Text("Base irradiance history weight: %.3f", volume.gpu_data().spacingHysteresis.w);
+        bool dynamicResponse = volume.dynamic_response_enabled();
+        if (ImGui::Checkbox("Adaptive light response", &dynamicResponse))
+            volume.set_dynamic_response_enabled(dynamicResponse);
+        ImGui::Text("Light response activity: %.2f", volume.gpu_data().blendThresholds.y);
+        ImGui::Text("Distance history weight: %.3f", volume.gpu_data().blendThresholds.z);
+        if (volume.relighting_this_frame()) {
+            ImGui::TextDisabled("Refreshing current light sources before multi-bounce");
+        }
         float backfaceThreshold = volume.desc().randomRayBackfaceThreshold;
         if (ImGui::SliderFloat(
                 "Backface rejection ratio",
@@ -802,7 +823,7 @@ void DDGIProbeBlendPass::draw_debug_ui()
         if (!timing.available || !timing.automaticBudget) {
             int probesPerFrame = static_cast<int>(volume.desc().probesUpdatedPerFrame);
             if (ImGui::SliderInt("Probes per frame", &probesPerFrame,
-                    1, static_cast<int>(std::min(128u, volume.total_probe_count())))) {
+                    1, static_cast<int>(std::min(512u, volume.total_probe_count())))) {
                 volume.set_probes_updated_per_frame(
                     static_cast<uint32_t>(probesPerFrame));
             }

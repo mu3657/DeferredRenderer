@@ -23,7 +23,7 @@ void GeometryPass::execute(GeometryPassContext& ctx)
     opaqueDraws.reserve(drawContext.OpaqueSurfaces.size());
 
     for (uint32_t i = 0; i < drawContext.OpaqueSurfaces.size(); i++) {
-        if (util::is_visible(drawContext.OpaqueSurfaces[i], ctx.sceneData.viewproj)) {
+        if (util::is_visible(drawContext.OpaqueSurfaces[i], ctx.sceneData.unjitteredViewproj)) {
             opaqueDraws.push_back(i);
         }
     }
@@ -51,19 +51,22 @@ void GeometryPass::execute(GeometryPassContext& ctx)
         engine._gEmissive.imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo depthAttachment = vkinit::depth_attachment_info(
         engine._depthImage.imageView, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo motionAttachment = vkinit::attachment_info(
+        engine.taaPass.motion_image().imageView, &clearColor, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     VkRenderingAttachmentInfo colorAttachments[] = {
         albedoAttachment,
         normalAttachment,
         ormAttachment,
         emissiveAttachment,
+        motionAttachment,
     };
 
     VkRenderingInfo renderInfo = {};
     renderInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     renderInfo.renderArea = VkRect2D{{0, 0}, ctx.drawExtent};
     renderInfo.layerCount = 1;
-    renderInfo.colorAttachmentCount = 4;
+    renderInfo.colorAttachmentCount = 5;
     renderInfo.pColorAttachments = colorAttachments;
     renderInfo.pDepthAttachment = &depthAttachment;
 
@@ -87,6 +90,7 @@ void GeometryPass::execute(GeometryPassContext& ctx)
 
     GPUSceneData* sceneUniformData = static_cast<GPUSceneData*>(ctx.frame.cameraBuffer.info.pMappedData);
     *sceneUniformData = ctx.sceneData;
+    VK_CHECK(vmaFlushAllocation(engine._allocator, ctx.frame.cameraBuffer.allocation, 0, sizeof(GPUSceneData)));
 
     VkDescriptorSet globalDescriptor = ctx.frame.globalDescriptor;
     MaterialPipeline* lastPipeline = nullptr;
@@ -126,6 +130,8 @@ void GeometryPass::execute(GeometryPassContext& ctx)
         pushConstants.worldMatrix = r.transform;
         pushConstants.vertexBuffer = r.vertexBufferAddress;
         pushConstants.materialID = r.material->materialID;
+        pushConstants.previousTransform = r.previousTransformAddress;
+        pushConstants.hasPreviousTransform = 1;
 
         vkCmdPushConstants(
             cmd,

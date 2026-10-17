@@ -24,6 +24,7 @@ glm::mat4 Camera::getViewMatrix()
 
 void Camera::focusOn(const glm::vec3& target, float distance)
 {
+    mark_cut();
     pivot        = target;
     _orbitDist   = distance;
     glm::vec3 fwd = glm::vec3(getRotationMatrix() * glm::vec4(0.f, 0.f, -1.f, 0.f));

@@ -8,11 +8,12 @@ layout(rgba16f, set = 0, binding = 0) uniform image2D targetImage;
 layout(set = 1, binding = 2) uniform sampler2D environmentPanorama;
 layout(push_constant) uniform SkyPushConstants {
     mat4 inverseViewProjection;
+    uvec4 extent;
 } sky;
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 extent = imageSize(targetImage);
+    ivec2 extent = ivec2(sky.extent.xy);
     if (any(greaterThanEqual(pixel, extent))) return;
 
     vec2 ndc = (vec2(pixel) + 0.5) / vec2(extent) * 2.0 - 1.0;

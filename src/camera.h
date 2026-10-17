@@ -38,6 +38,8 @@ public:
 
     // Focus camera on a world-space point
     void focusOn(const glm::vec3& target, float distance = 5.f);
+    void mark_cut() { ++cutSerial; }
+    uint64_t cutSerial{0};
 
 private:
     // --- Input state ---

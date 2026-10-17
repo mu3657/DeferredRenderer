@@ -62,9 +62,10 @@ struct alignas(16) DeferredLightingPushConstants {
     glm::vec4 ddgiParams{};
     glm::vec4 ddgiDebugParams{};
     glm::uvec4 lightGridParams{}; // xy = tile counts, z = tile size, w = flags
+    glm::vec4 clusterDepthParams{};
 };
 
-static_assert(sizeof(DeferredLightingPushConstants) == 48);
+static_assert(sizeof(DeferredLightingPushConstants) == 64);
 
 std::optional<RayTracingMeshDesc> make_ray_tracing_mesh_desc(
     const MeshAsset& mesh,
@@ -226,10 +227,12 @@ void VulkanEngine::init()
     ddgiProbeBlendPass.init(passInitContext);
     ddgiProbeDebugPass.init(passInitContext);
     toneMapPass.init(passInitContext);
+    taaPass.init(passInitContext);
     transparentPass.init(passInitContext);
     _mainDeletionQueue.push_function([this]() {
         transparentPass.cleanup();
         toneMapPass.cleanup();
+        taaPass.cleanup();
         ddgiProbeDebugPass.cleanup();
         ddgiProbeBlendPass.cleanup();
         ddgiProbeTracePass.cleanup();
@@ -319,7 +322,11 @@ void VulkanEngine::read_ddgi_timing(uint32_t frameIndex)
         next = current - std::max(1u, current / 4u);
         next = std::max(1u, next);
     } else if (ddgiTiming.totalGpuMs < ddgiTiming.targetGpuMs * 0.7f) {
-        next = std::min(128u, current + std::max(1u, current / 4u));
+        // The original 128-probe integration cap left most of the 2 ms budget
+        // unused on faster GPUs and imposed a 16-frame minimum sweep at 2048
+        // probes. Use a conservative larger automatic cap: 512-probe batches
+        // improved latency but produced large GPU-time tails in validation.
+        next = std::min(std::min(256u, ddgiVolume.total_probe_count()), current + std::max(1u, current / 4u));
     }
     if (next != current) {
         ddgiVolume.set_probes_updated_per_frame(next);
@@ -543,13 +550,18 @@ void VulkanEngine::draw_background(VkCommandBuffer cmd)
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _gradientPipelineLayout, 0, 1, &_drawImageDescriptors, 0, nullptr);
 
 	if (currentBackgroundEffect == 1) {
-        const glm::mat4 inverseViewProjection = glm::inverse(sceneData.viewproj);
+        struct SkyPushConstants {
+            glm::mat4 inverseViewProjection;
+            glm::uvec4 extent;
+        };
+        const SkyPushConstants skyConstants{glm::inverse(sceneData.viewproj),
+            glm::uvec4(_drawExtent.width, _drawExtent.height, 0, 0)};
         const VkDescriptorSet environmentSet = environmentLighting.descriptor_set(
             static_cast<uint32_t>(_frameNumber % FRAME_OVERLAP));
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             _gradientPipelineLayout, 1, 1, &environmentSet, 0, nullptr);
         vkCmdPushConstants(cmd, _gradientPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(glm::mat4), &inverseViewProjection);
+            0, sizeof(skyConstants), &skyConstants);
     } else {
         vkCmdPushConstants(cmd, _gradientPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
             0, sizeof(ComputePushConstants), &effect.data);
@@ -669,6 +681,7 @@ void VulkanEngine::draw()
 	const auto renderRecordStart = std::chrono::steady_clock::now();
     VK_CHECK(vkBeginCommandBuffer(cmd, &cmdBeginInfo));
     RenderPassFrameContext passContext = make_pass_frame_context(cmd);
+    taaPass.prepare_frame(passContext);
 
     const bool buildingStaticRayTracingGeometry =
         rayTracingScene.stats().pendingBLASBuilds > 0;
@@ -734,6 +747,7 @@ void VulkanEngine::draw()
     vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _gEmissive.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    vkutil::transition_image(cmd, taaPass.motion_image().image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
 	ShadowPassContext shadowContext{ passContext, sceneData, mainDrawContext, lightSystem };
 	const auto shadowPassStart = std::chrono::steady_clock::now();
@@ -752,6 +766,7 @@ void VulkanEngine::draw()
 	vkutil::transition_image(cmd, _gNormal.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gORM.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _gEmissive.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    vkutil::transition_image(cmd, taaPass.motion_image().image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 	vkutil::transition_image(cmd, _contactShadowImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
@@ -777,6 +792,9 @@ void VulkanEngine::draw()
 	lighting_pass(lightingContext);
     stats.lighting.cpu_time_ms = elapsed_ms(lightingPassStart);
     TracyPlot("LightingPass CPU ms", stats.lighting.cpu_time_ms);
+
+    // Accumulate HDR opaque/sky before transparent and editor scene overlays.
+    taaPass.execute(passContext);
 
     TransparentPassContext transparentContext{
         passContext,
@@ -851,6 +869,7 @@ void VulkanEngine::draw()
     //submit command buffer to the queue and execute it.
     // _renderFence will now block until the graphic commands finish execution
     VK_CHECK(vkQueueSubmit2(_graphicsQueue, 1, &submit, get_current_frame()._renderFence));
+    taaPass.commit_frame();
 
     //prepare present
     // this will put the image we just rendered to into the visible window.
@@ -1173,7 +1192,7 @@ void VulkanEngine::draw_editor_ui()
                     lightSystem.draw_debug_ui();
                     ImGui::PopID();
                 }
-                if (ImGui::CollapsingHeader("Tiled deferred", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::CollapsingHeader("Clustered deferred", ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::PushID("LightBinning");
                     lightBinningPass.draw_debug_ui();
                     ImGui::PopID();
@@ -1209,6 +1228,11 @@ void VulkanEngine::draw_editor_ui()
                 }
                 break;
             case 4: {
+                if (ImGui::CollapsingHeader("Temporal anti-aliasing", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::PushID("TAA");
+                    taaPass.draw_debug_ui();
+                    ImGui::PopID();
+                }
                 if (ImGui::CollapsingHeader("Tone mapping", ImGuiTreeNodeFlags_DefaultOpen)) {
                     ImGui::PushID("ToneMapping");
                     toneMapPass.draw_debug_ui();
@@ -1226,12 +1250,18 @@ void VulkanEngine::draw_editor_ui()
                     ImGui::TextDisabled("GBuffer channels consumed by deferred lighting");
                 }
                 if (ImGui::CollapsingHeader("HDR environment", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (ImGui::Checkbox("HDR lighting (DDGI)", &environmentLighting.ddgiLightingEnabled)
+                        && ddgiVolume.initialized()) {
+                        ddgiVolume.request_history_reset();
+                    }
                     ImGui::SliderFloat("HDR contribution", &environmentLighting.intensity,
                         0.0f, 2.0f, "%.2f");
                     if (ImGui::IsItemDeactivatedAfterEdit() && ddgiVolume.initialized()) {
                         ddgiVolume.request_history_reset();
                     }
-                    ImGui::TextDisabled("Sky and DDGI ray misses");
+                    ImGui::TextDisabled(environmentLighting.ddgiLightingEnabled
+                        ? "Sky and DDGI ray misses"
+                        : "Visible sky only; DDGI uses scene lights and emissive");
                 }
                 if (ImGui::CollapsingHeader("Background effect") && !backgroundEffects.empty()) {
                     currentBackgroundEffect = std::clamp(currentBackgroundEffect, 0,
@@ -2011,6 +2041,7 @@ void VulkanEngine::lighting_pass(LightingPassContext& ctx)
         lightBinningPass.tile_count_y(ctx.drawExtent),
         LightBinningPass::TileSize,
         lightGridFlags);
+    lightingPushConstants.clusterDepthParams = lightBinningPass.depth_params();
     vkCmdPushConstants(
         cmd,
         _deferredLightingPipelineLayout,
@@ -2043,7 +2074,7 @@ void VulkanEngine::init_background_pipelines()
 
     VkPushConstantRange pushConstant{};
     pushConstant.offset = 0;
-    pushConstant.size = sizeof(ComputePushConstants) ;
+    pushConstant.size = sizeof(glm::mat4) + sizeof(glm::uvec4);
     pushConstant.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     computeLayout.pPushConstantRanges = &pushConstant;
@@ -2221,7 +2252,8 @@ void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
         VK_FORMAT_R8G8B8A8_UNORM,       // Albedo matches _gAlbedo format
         VK_FORMAT_R16G16B16A16_SFLOAT,  // Normal matches _gNormal format
         VK_FORMAT_R8G8B8A8_UNORM,       // Material matches _gORM format
-        VK_FORMAT_R16G16B16A16_SFLOAT   // HDR emissive matches _gEmissive format
+        VK_FORMAT_R16G16B16A16_SFLOAT,  // HDR emissive matches _gEmissive format
+        VK_FORMAT_R16G16B16A16_SFLOAT   // TAA motion + previous depth + validity
     };
 	pipelineBuilder.set_color_attachment_formats(gbufferFormats);
 	pipelineBuilder.set_depth_format(engine->_depthImage.imageFormat);
@@ -2676,6 +2708,7 @@ void VulkanEngine::destroy_swapchain()
 void VulkanEngine::resize_swapchain()
 {
     vkDeviceWaitIdle(_device);
+    taaPass.reset_history();
 
     destroy_swapchain();
 
@@ -2707,7 +2740,7 @@ void VulkanEngine::update_scene()
 	sceneData.view = view;
 	sceneData.proj = projection;
 	sceneData.viewproj = projection * view;
-    sceneData.ambientColor = glm::vec4(.1f);
+    sceneData.ambientColor = glm::vec4(0.f);
     sceneData.sunlightColor = glm::vec4(1.f);
     sceneData.sunlightDirection = glm::vec4(0,1,0.5,1.f);
 

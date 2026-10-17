@@ -9,6 +9,10 @@ float environmentIntensity() {
     return environmentParameters.intensity.x;
 }
 
+float environmentLightingIntensity() {
+    return environmentParameters.intensity.x * environmentParameters.intensity.y;
+}
+
 vec2 environmentPanoramaUV(vec3 direction) {
     direction = normalize(direction);
     const float inversePi = 0.3183098861837907;

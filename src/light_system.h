@@ -23,8 +23,16 @@ public:
     const std::vector<GPULight>& lights() const { return _cpuLights; }
     GPULight GetDirectionalLight();
 private:
+    struct GIResponseReference {
+        GPULight light{};
+        glm::vec3 stablePower{};
+        uint64_t quietProbesRemaining{0};
+        bool largeParameterChange{false};
+    };
     VulkanEngine* _engine{nullptr};
     std::vector<GPULight> _cpuLights;
+    std::vector<GPULight> _previousGILights;
+    std::vector<GIResponseReference> _giMotionReferences;
     GPULightData _lightData{};
     bool _initialized{false};
     bool _enableFallbackDirectional{true};

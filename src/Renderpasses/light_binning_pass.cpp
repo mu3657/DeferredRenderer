@@ -7,14 +7,17 @@
 #include <Tracy/Tracy.hpp>
 
 #include <array>
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace {
 struct alignas(16) LightBinningPushConstants {
     glm::uvec4 grid{}; // xy = render extent, zw = tile counts
+    glm::vec4 clusterDepthParams{};
 };
 
-static_assert(sizeof(LightBinningPushConstants) == 16);
+static_assert(sizeof(LightBinningPushConstants) == 32);
 }
 
 uint32_t LightBinningPass::tile_count_x(VkExtent2D extent) const
@@ -80,18 +83,18 @@ void LightBinningPass::init(const RenderPassInitContext& ctx)
     const VkDeviceSize maximumTileCount =
         static_cast<VkDeviceSize>(tile_count_x(maximumExtent))
         * static_cast<VkDeviceSize>(tile_count_y(maximumExtent));
-    _maskBufferSize = maximumTileCount * LightMaskWordCount * sizeof(uint32_t);
+    _maskBufferSize = maximumTileCount * DepthSliceCount * LightMaskWordCount * sizeof(uint32_t);
 
     for (uint32_t frameIndex = 0; frameIndex < FRAME_OVERLAP; ++frameIndex) {
         FrameData& frame = ctx.engine._frames[frameIndex];
-        frame.tileLightMaskBuffer = ctx.engine.create_buffer(
+        frame.clusterLightMaskBuffer = ctx.engine.create_buffer(
             _maskBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VMA_MEMORY_USAGE_GPU_ONLY);
         ctx.descriptors.write_buffer(
             frame.lightDescriptor,
             2,
-            frame.tileLightMaskBuffer.buffer,
+            frame.clusterLightMaskBuffer.buffer,
             _maskBufferSize,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     }
@@ -104,9 +107,9 @@ void LightBinningPass::cleanup()
     }
 
     for (FrameData& frame : _engine->_frames) {
-        if (frame.tileLightMaskBuffer.buffer != VK_NULL_HANDLE) {
-            _engine->destroy_buffer(frame.tileLightMaskBuffer);
-            frame.tileLightMaskBuffer = {};
+        if (frame.clusterLightMaskBuffer.buffer != VK_NULL_HANDLE) {
+            _engine->destroy_buffer(frame.clusterLightMaskBuffer);
+            frame.clusterLightMaskBuffer = {};
         }
     }
 
@@ -126,6 +129,17 @@ void LightBinningPass::execute(RenderPassFrameContext& ctx)
     if (!_enabled || _lastTileCountX == 0 || _lastTileCountY == 0) {
         return;
     }
+
+    // Extract the two clip distances from the actual reverse-Z projection.
+    // Jitter changes XY only; the same projection defines the cluster side planes.
+    const glm::mat4 inverseProjection = glm::inverse(ctx.engine.sceneData.proj);
+    const glm::vec4 nearPoint = inverseProjection * glm::vec4(0.f, 0.f, 1.f, 1.f);
+    const glm::vec4 farPoint = inverseProjection * glm::vec4(0.f, 0.f, 0.f, 1.f);
+    const float nearDepth = std::max(-nearPoint.z / nearPoint.w, 1e-4f);
+    const float farDepth = std::max(-farPoint.z / farPoint.w, nearDepth * 1.01f);
+    _depthParams = glm::vec4(nearDepth, farDepth,
+        static_cast<float>(DepthSliceCount) / std::log2(farDepth / nearDepth),
+        static_cast<float>(DepthSliceCount));
 
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
     const std::array<VkDescriptorSet, 2> descriptorSets = {
@@ -148,6 +162,7 @@ void LightBinningPass::execute(RenderPassFrameContext& ctx)
         ctx.drawExtent.height,
         _lastTileCountX,
         _lastTileCountY);
+    pushConstants.clusterDepthParams = _depthParams;
     vkCmdPushConstants(
         ctx.cmd,
         _pipelineLayout,
@@ -155,7 +170,7 @@ void LightBinningPass::execute(RenderPassFrameContext& ctx)
         0,
         sizeof(pushConstants),
         &pushConstants);
-    vkCmdDispatch(ctx.cmd, _lastTileCountX, _lastTileCountY, 1);
+    vkCmdDispatch(ctx.cmd, _lastTileCountX, _lastTileCountY, DepthSliceCount);
 
     VkMemoryBarrier2 lightGridBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     lightGridBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -171,16 +186,19 @@ void LightBinningPass::execute(RenderPassFrameContext& ctx)
 
 void LightBinningPass::draw_debug_ui()
 {
-    ImGui::Checkbox("Enabled", &_enabled);
+    ImGui::Checkbox("Clustered culling", &_enabled);
+    ImGui::TextDisabled("Disabled: brute-force deferred lighting.");
     ImGui::BeginDisabled(!_enabled);
-    ImGui::Checkbox("Tile light-count heatmap", &_debugHeatmap);
+    ImGui::Checkbox("Cluster light-count heatmap", &_debugHeatmap);
     ImGui::EndDisabled();
     ImGui::Text("Tile size: %u x %u", TileSize, TileSize);
-    ImGui::Text("Grid: %u x %u (%u tiles)",
+    ImGui::Text("Grid: %u x %u x %u (%u clusters)",
         _lastTileCountX,
         _lastTileCountY,
-        _lastTileCountX * _lastTileCountY);
+        DepthSliceCount,
+        _lastTileCountX * _lastTileCountY * DepthSliceCount);
+    ImGui::Text("Log depth range: %.3f - %.1f", _depthParams.x, _depthParams.y);
     ImGui::Text("Mask storage: %.2f MiB / frame",
         static_cast<double>(_maskBufferSize) / (1024.0 * 1024.0));
-    ImGui::TextDisabled("2D conservative binning; transparent lighting remains brute force.");
+    ImGui::TextDisabled("3D conservative clusters; transparent lighting remains brute force.");
 }

@@ -115,6 +115,8 @@ void blend_irradiance(uint probeIndex, uvec2 localTexel)
         1u,
         uint(float(rayCount) * clamp(volume.blendThresholds.x, 0.0, 1.0)));
     vec3 weightedRadiance = vec3(0.0);
+    vec3 secondMoment = vec3(0.0);
+    float squaredWeightSum = 0.0;
     float weightSum = 0.0;
     for (uint rayIndex = 0u; rayIndex < rayCount; ++rayIndex) {
         vec3 rayDirection = normalize(rotate_by_quaternion(
@@ -139,7 +141,10 @@ void blend_irradiance(uint probeIndex, uvec2 localTexel)
         if (any(isnan(rayRadiance)) || any(isinf(rayRadiance))) {
             rayRadiance = vec3(0.0);
         }
-        weightedRadiance += min(rayRadiance, vec3(65000.0)) * weight;
+        rayRadiance = min(rayRadiance, vec3(65000.0));
+        weightedRadiance += rayRadiance * weight;
+        secondMoment += rayRadiance * rayRadiance * weight;
+        squaredWeightSum += weight * weight;
         weightSum += weight;
     }
 
@@ -148,6 +153,12 @@ void blend_irradiance(uint probeIndex, uvec2 localTexel)
     vec3 irradiance = weightedRadiance * (0.5 / max(weightSum, 1e-5));
     irradiance *= max(volume.biasAndEncoding.w, 0.0);
     float encodingGamma = max(volume.biasAndEncoding.z, 1e-3);
+    vec3 meanRadiance = weightedRadiance / max(weightSum, 1e-5);
+    vec3 variance = max(vec3(0.0), secondMoment / max(weightSum, 1e-5) - meanRadiance * meanRadiance);
+    vec3 standardError = .5 * sqrt(variance * squaredWeightSum) / max(weightSum, 1e-5)
+        * max(volume.biasAndEncoding.w, 0.0);
+    float sampleVariance = pow(max(max(standardError.r, standardError.g), standardError.b), 2.0);
+    float filteredVariance = sampleVariance;
     vec3 encodedIrradiance = pow(
         max(irradiance, vec3(0.0)), vec3(1.0 / encodingGamma));
     encodedIrradiance = min(encodedIrradiance, vec3(65000.0));
@@ -156,13 +167,39 @@ void blend_irradiance(uint probeIndex, uvec2 localTexel)
         probeIndex, localTexel, pushConstants.irradianceLayout);
     bool resetHistory = (volume.frameAndFlags.y & VOLUME_FLAG_RESET_HISTORY) != 0u;
     if (!resetHistory) {
-        vec3 history = imageLoad(irradianceAtlas, atlasTexel).rgb;
-        encodedIrradiance = mix(
-            encodedIrradiance,
-            history,
-            clamp(volume.spacingHysteresis.w, 0.0, 1.0));
+        vec4 previousIrradiance = imageLoad(irradianceAtlas, atlasTexel);
+        vec3 history = previousIrradiance.rgb;
+        vec3 innovation = encodedIrradiance - history;
+        float historyWeight = clamp(volume.spacingHysteresis.w, 0.0, 1.0);
+        float previousVariance = dot(history, history) > 0.0 ? max(previousIrradiance.a, 0.0) : 0.0;
+        filteredVariance = historyWeight > 0.0 ? mix(previousVariance, sampleVariance, 0.3) : sampleVariance;
+        vec3 stepValue = (1.0 - historyWeight) * innovation;
+        if (historyWeight > 0.0) {
+            float scale = max(1e-4, max(max(max(encodedIrradiance.r, encodedIrradiance.g), encodedIrradiance.b),
+                max(max(history.r, history.g), history.b)));
+            float relativeChange = max(max(abs(innovation.r), abs(innovation.g)), abs(innovation.b)) / scale;
+            float parameterConfidence = 1.0;
+            if (volume.blendThresholds.w == 2.0) {
+                vec3 oldLinear = pow(max(history, vec3(0.0)) / scale, vec3(volume.biasAndEncoding.z));
+                vec3 newLinear = pow(max(encodedIrradiance, vec3(0.0)) / scale, vec3(volume.biasAndEncoding.z));
+                vec3 linearDelta = abs(newLinear - oldLinear);
+                float linearScale = max(1e-6, max(max(max(oldLinear.r, oldLinear.g), oldLinear.b), max(max(newLinear.r, newLinear.g), newLinear.b)));
+                relativeChange = max(max(linearDelta.r, linearDelta.g), linearDelta.b) / linearScale;
+                float signal = max(max(linearDelta.r, linearDelta.g), linearDelta.b) * pow(scale, encodingGamma);
+                float noise = max(1e-7, sqrt(max(sampleVariance, filteredVariance)));
+                parameterConfidence = smoothstep(0.5, 1.5, signal / noise);
+            }
+            bool parameterResponse = volume.blendThresholds.w == 2.0;
+            float response = volume.blendThresholds.y * (parameterResponse ? smoothstep(0.005, 0.05, relativeChange) * parameterConfidence : smoothstep(0.05, 0.4, relativeChange));
+            historyWeight = mix(historyWeight, min(historyWeight, parameterResponse ? 0.35 : 0.65), response);
+            stepValue = (1.0 - historyWeight) * innovation;
+            float stepLimit = parameterResponse ? mix(0.01, 0.05, response * response) : (volume.blendThresholds.y > 0.0 ? (volume.blendThresholds.w > 0.5 ? 0.02 : 0.05) : 0.01);
+            float maxStep = max(2e-5, scale * stepLimit);
+            stepValue *= min(1.0, maxStep / max(max(max(abs(stepValue.r), abs(stepValue.g)), abs(stepValue.b)), 1e-10));
+        }
+        encodedIrradiance = history + stepValue;
     }
-    imageStore(irradianceAtlas, atlasTexel, vec4(encodedIrradiance, 1.0));
+    imageStore(irradianceAtlas, atlasTexel, vec4(encodedIrradiance, filteredVariance));
 }
 
 void blend_distance(uint probeIndex, uvec2 localTexel)
@@ -201,7 +238,7 @@ void blend_distance(uint probeIndex, uvec2 localTexel)
         moments = mix(
             moments,
             history,
-            clamp(volume.spacingHysteresis.w, 0.0, 1.0));
+            clamp(volume.blendThresholds.z, 0.0, 1.0));
     }
     imageStore(distanceAtlas, atlasTexel, vec4(moments, 0.0, 1.0));
 }

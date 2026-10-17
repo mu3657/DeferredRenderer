@@ -27,6 +27,7 @@ public:
     void draw_debug_ui() override;
 
     VkDescriptorSet lighting_descriptor_set() const { return _lightingDescriptorSet; }
+    void set_enabled(bool enabled) { _enabled = enabled; }
 
 private:
     VulkanEngine* _engine{nullptr};

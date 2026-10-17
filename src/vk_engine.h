@@ -29,6 +29,7 @@
 #include "Renderpasses/ddgi_probe_blend_pass.h"
 #include "Renderpasses/ddgi_probe_debug_pass.h"
 #include "Renderpasses/tone_map_pass.h"
+#include "Renderpasses/taa_pass.h"
 #include "environment_lighting.h"
 
 #include <array>
@@ -86,7 +87,7 @@ struct FrameData {
 	// Lighting resources owned by the engine frame, filled by LightSystem.
 	AllocatedBuffer lightDataBuffer;
 	AllocatedBuffer lightBuffer;
-	AllocatedBuffer tileLightMaskBuffer{};
+	AllocatedBuffer clusterLightMaskBuffer{};
 	VkDescriptorSet lightDescriptor{ VK_NULL_HANDLE };
 };
 
@@ -265,6 +266,7 @@ public:
 	DDGIProbeDebugPass ddgiProbeDebugPass;
 	DDGIUpdateTiming ddgiTiming;
 	ToneMapPass toneMapPass;
+    TAAPass taaPass;
 	GeometryPass geometryPass;
 	int pbrDebugMode{0};
 	bool pbrEmissiveEnabled{true};
@@ -346,6 +348,9 @@ public:
 
 	//run main loop
 	void run();
+    int run_taa_validation();
+    int run_clustered_validation();
+    int run_ddgi_validation(bool temporal = false, bool rotation = false, int responseMode = 0);
 	void immediate_submit(std::function<void(VkCommandBuffer cmd)>&& function);
 	RenderPassFrameContext make_pass_frame_context(VkCommandBuffer cmd);
 

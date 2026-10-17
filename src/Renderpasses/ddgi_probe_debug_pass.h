@@ -31,6 +31,7 @@ public:
     void execute(DDGIProbeDebugPassContext& ctx);
     void draw_debug_ui() override;
     bool fit_volume_to_active_scene(DDGIVolume& volume);
+    void set_enabled(bool enabled) { _enabled = enabled; }
 
 private:
     VulkanEngine* _engine{nullptr};

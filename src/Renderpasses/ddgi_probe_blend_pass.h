@@ -43,9 +43,13 @@ public:
         return _hasHistory && _lastClearedHistorySerial == serial;
     }
     bool lighting_enabled() const { return _lightingEnabled; }
+    void set_lighting_enabled(bool enabled) { _lightingEnabled = enabled; }
     float lighting_intensity() const { return _lightingIntensity; }
+    void set_lighting_intensity(float intensity) { _lightingIntensity = intensity; }
     int lighting_debug_mode() const { return _lightingDebugMode; }
+    void set_lighting_debug_mode(int mode) { _lightingDebugMode = mode; }
     float heatmap_exposure() const { return _heatmapExposure; }
+    void set_distance_history_override_for_validation(float weight) { _validationDistanceHistory = weight; }
 
 private:
     VulkanEngine* _engine{nullptr};
@@ -65,5 +69,6 @@ private:
     bool _lightingEnabled{true};
     float _lightingIntensity{1.f};
     float _heatmapExposure{16.f};
+    float _validationDistanceHistory{-1.f};
     int _lightingDebugMode{0};
 };

@@ -22,6 +22,7 @@ void MeshNode::Draw(const glm::mat4& topMatrix, DrawContext& ctx) {
         def.bounds = s.bounds;
         def.transform = nodeMatrix;
         def.vertexBufferAddress = mesh->meshBuffers.vertexBufferAddress;
+        def.temporalID = temporalID;
         if (s.material->data.surface == MaterialSurface::Transparent) {
             ctx.TransparentSurfaces.push_back(def);
         } else {

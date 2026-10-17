@@ -351,13 +351,13 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
     DDGIProbeTracePushConstants pushConstants{};
     pushConstants.traceMode = static_cast<uint32_t>(_traceMode);
     pushConstants.materialCount = ctx.engine.bindlessMaterialCount;
-    // The first reset batch establishes valid zero-cleared atlases plus direct
-    // lighting. Later batches may safely consume that partial history; invalid
-    // neighbors carry zero distance confidence and therefore contribute nothing.
+    // A lighting edit refreshes one full sweep from current light sources.
+    // Feeding old indirect back during that sweep would preserve the old sun.
     const bool historyAvailable =
         ctx.volume.history_probe_count() > updateRange.probeCount;
     const bool useMultiBounce = _multiBounceEnabled
         && _traceMode == 3
+        && !ctx.volume.relighting_this_frame()
         && historyAvailable;
     if (useMultiBounce) {
         pushConstants.flags |= DDGIProbeTraceFlagMultiBounce;
@@ -468,7 +468,7 @@ void DDGIProbeTracePass::draw_debug_ui()
     ImGui::Checkbox("Enabled", &_enabled);
     const char* traceModes[] = {
         "Distance Only",
-        "Material Hit",
+        "Emissive only",
         "Direct Unshadowed",
         "Full Radiance",
         "Constant White (pipeline test)",

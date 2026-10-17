@@ -1,5 +1,8 @@
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+#include "cluster_grid.glsl"
+
 const uint TILE_SIZE = 16u;
 const uint MAX_GPU_LIGHTS = 256u;
 const uint LIGHT_MASK_WORD_COUNT = 8u;
@@ -45,12 +48,13 @@ layout(std430, set = 1, binding = 1) readonly buffer LightStorage {
     GPULight lights[];
 };
 
-layout(std430, set = 1, binding = 2) writeonly buffer TileLightMaskStorage {
-    uint tileLightMasks[];
+layout(std430, set = 1, binding = 2) writeonly buffer ClusterLightMaskStorage {
+    uint clusterLightMasks[];
 };
 
 layout(push_constant) uniform LightBinningPushConstants {
     uvec4 grid; // xy = render extent, zw = tile counts
+    vec4 clusterDepthParams;
 } pushConstants;
 
 shared uint sharedLightMask[LIGHT_MASK_WORD_COUNT];
@@ -70,7 +74,8 @@ bool sphereInsidePlane(vec3 center, float radius, vec4 plane)
     return dot(plane, vec4(center, 1.0)) >= -radius * normalLength;
 }
 
-bool lightIntersectsTile(GPULight light, vec2 tileMinimumNdc, vec2 tileMaximumNdc)
+bool lightIntersectsCluster(GPULight light, vec2 tileMinimumNdc, vec2 tileMaximumNdc,
+    uint slice)
 {
     if (light.colorIntensity.w <= 0.0) {
         return false;
@@ -94,6 +99,17 @@ bool lightIntersectsTile(GPULight light, vec2 tileMinimumNdc, vec2 tileMaximumNd
     vec3 viewPosition = (sceneData.view * vec4(light.positionRange.xyz, 1.0)).xyz;
     float viewDepth = -viewPosition.z;
     if (viewDepth + radius <= 0.0) {
+        return false;
+    }
+
+    // Expand depth bounds slightly so floating-point log/exp at a slice boundary
+    // cannot drop a contributing light. Edge slices cover clamped depths too.
+    vec4 depthParams = pushConstants.clusterDepthParams;
+    float depthMinimum = clusterSliceBoundary(slice, depthParams);
+    float depthMaximum = clusterSliceBoundary(slice + 1u, depthParams);
+    float epsilon = max(1e-4, depthMaximum * 1e-4);
+    if ((slice > 0u && viewDepth + radius < depthMinimum - epsilon)
+        || (slice + 1u < uint(depthParams.w) && viewDepth - radius > depthMaximum + epsilon)) {
         return false;
     }
 
@@ -122,7 +138,8 @@ void main()
     }
     barrier();
 
-    uvec2 tile = gl_WorkGroupID.xy;
+    uvec3 cluster = gl_WorkGroupID;
+    uvec2 tile = cluster.xy;
     uvec2 pixelMinimum = tile * TILE_SIZE;
     uvec2 pixelMaximum = min(pixelMinimum + uvec2(TILE_SIZE), pushConstants.grid.xy);
     vec2 renderExtent = vec2(pushConstants.grid.xy);
@@ -132,7 +149,7 @@ void main()
     for (uint lightIndex = localIndex;
          lightIndex < min(lightData.lightCount, MAX_GPU_LIGHTS);
          lightIndex += gl_WorkGroupSize.x) {
-        if (lightIntersectsTile(lights[lightIndex], tileMinimumNdc, tileMaximumNdc)) {
+        if (lightIntersectsCluster(lights[lightIndex], tileMinimumNdc, tileMaximumNdc, cluster.z)) {
             atomicOr(
                 sharedLightMask[lightIndex >> 5u],
                 1u << (lightIndex & 31u));
@@ -141,8 +158,8 @@ void main()
     barrier();
 
     if (localIndex < LIGHT_MASK_WORD_COUNT) {
-        uint tileIndex = tile.y * pushConstants.grid.z + tile.x;
-        tileLightMasks[tileIndex * LIGHT_MASK_WORD_COUNT + localIndex]
+        uint clusterIndex = clusterLinearIndex(cluster, pushConstants.grid.zw);
+        clusterLightMasks[clusterIndex * LIGHT_MASK_WORD_COUNT + localIndex]
             = sharedLightMask[localIndex];
     }
 }

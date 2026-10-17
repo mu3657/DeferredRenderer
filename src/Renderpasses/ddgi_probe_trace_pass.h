@@ -44,6 +44,7 @@ public:
     void draw_debug_ui() override;
 
     const DDGIProbeTraceDispatchStats& stats() const { return _stats; }
+    void set_multi_bounce_enabled_for_validation(bool enabled) { _multiBounceEnabled = enabled; }
 
 private:
     VulkanEngine* _engine{nullptr};

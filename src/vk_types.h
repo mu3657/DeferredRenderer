@@ -81,7 +81,12 @@ struct GPUDrawPushConstants {
     glm::mat4 worldMatrix;
     VkDeviceAddress vertexBuffer;
     uint32_t materialID;
+    uint32_t hasPreviousTransform{0};
+    VkDeviceAddress previousTransform{0};
 };
+
+static_assert(offsetof(GPUDrawPushConstants, previousTransform) == 80);
+static_assert(sizeof(GPUDrawPushConstants) <= 128);
 
 enum class MaterialSurface :uint8_t {
     Opaque,
@@ -149,6 +154,10 @@ class IRenderable {
 // the scene node can hold children and will also keep a transform to propagate
 // to them
 struct Node : public IRenderable {
+
+    // Monotonic identity survives draw sorting and does not reuse deleted pointers.
+    inline static uint64_t nextTemporalID{1};
+    const uint64_t temporalID{nextTemporalID++};
 
     // parent pointer must be a weak pointer to avoid circular dependencies
     std::weak_ptr<Node> parent;
@@ -231,6 +240,8 @@ struct RenderObject {
     Bounds bounds;
     glm::mat4 transform;
     VkDeviceAddress vertexBufferAddress;
+    uint64_t temporalID{0};
+    VkDeviceAddress previousTransformAddress{0};
 };
 
 // One scene-node instance for ray tracing. A mesh may contain multiple raster

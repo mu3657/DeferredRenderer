@@ -11,6 +11,8 @@ layout (location = 2) out vec2 outUV;
 layout (location = 3) out vec4 outColor;
 layout (location = 4) flat out uint outMaterialID;
 layout (location = 5) out vec4 outTangent;
+layout (location = 6) out vec4 outPreviousClip;
+layout (location = 7) flat out uint outHistoryValid;
 
 struct Vertex {
     vec3 position;
@@ -25,12 +27,19 @@ layout(buffer_reference, std430) readonly buffer VertexBuffer{
     Vertex vertices[];
 };
 
+layout(buffer_reference, std430) readonly buffer PreviousTransform {
+    mat4 worldMatrix;
+    uvec4 valid;
+};
+
 //push constants block
 layout( push_constant ) uniform constants
 {
     mat4 render_matrix;
     VertexBuffer vertexBuffer;
     uint materialID;
+    uint hasPreviousTransform;
+    layout(offset = 80) PreviousTransform previousTransform;
 } PushConstants;
 
 void main()
@@ -39,6 +48,15 @@ void main()
 
     vec4 worldPos = PushConstants.render_matrix * vec4(v.position, 1.0);
     gl_Position = sceneData.viewproj * worldPos;
+    outPreviousClip = gl_Position;
+    outHistoryValid = 0u;
+    // The same vertex shader is used by forward transparency. Its draw has no
+    // temporal record, so never dereference a null buffer-device address.
+    if (PushConstants.hasPreviousTransform != 0u) {
+        outPreviousClip = sceneData.previousViewproj
+            * PushConstants.previousTransform.worldMatrix * vec4(v.position, 1.0);
+        outHistoryValid = PushConstants.previousTransform.valid.x;
+    }
 
     outWorldPos = worldPos.xyz;
     mat3 normalMatrix = transpose(inverse(mat3(PushConstants.render_matrix)));

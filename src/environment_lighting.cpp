@@ -325,7 +325,7 @@ void EnvironmentLighting::init(VulkanEngine& engine) {
 
 void EnvironmentLighting::prepare_frame(uint32_t frameIndex) {
     const GPUEnvironmentParameters parameters{
-        glm::vec4(std::clamp(intensity, 0.f, 2.f), 0.f, 0.f, 0.f)};
+        glm::vec4(std::clamp(intensity, 0.f, 2.f), ddgiLightingEnabled ? 1.f : 0.f, 0.f, 0.f)};
     AllocatedBuffer& buffer = _parameterBuffers.at(frameIndex);
     std::memcpy(buffer.info.pMappedData, &parameters, sizeof(parameters));
     VK_CHECK(vmaFlushAllocation(_allocator, buffer.allocation, 0, sizeof(parameters)));

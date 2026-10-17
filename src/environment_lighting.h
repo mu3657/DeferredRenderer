@@ -7,8 +7,7 @@
 
 class VulkanEngine;
 
-// A single linear HDR environment supplies the visible sky, indirect specular,
-// and radiance for DDGI rays that leave the scene.
+// The visible HDR sky can optionally supply radiance to DDGI ray misses.
 class EnvironmentLighting {
 public:
     void init(VulkanEngine& engine);
@@ -18,6 +17,7 @@ public:
     VkDescriptorSet descriptor_set(uint32_t frameIndex) const { return _descriptorSets.at(frameIndex); }
     uint32_t mip_count() const { return _mipCount; }
     float intensity{0.25f};
+    bool ddgiLightingEnabled{false};
 
 private:
     VkDevice _device{VK_NULL_HANDLE};

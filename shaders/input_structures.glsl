@@ -6,6 +6,9 @@ layout(set = 0, binding = 0) uniform  SceneData{
     vec4 ambientColor;
     vec4 sunlightDirection; //w for sun power--
     vec4 sunlightColor;
+    mat4 previousViewproj;
+    mat4 unjitteredViewproj;
+    vec4 jitter;
 } sceneData;
 
 layout(set = 0, binding = 1) uniform  ObjectBuffer{
@@ -83,7 +86,7 @@ layout(set = 2, binding = 1) readonly buffer LightStorage {
     GPULight lights[];
 };
 
-layout(std430, set = 2, binding = 2) readonly buffer TileLightMaskStorage {
-    uint tileLightMasks[];
+layout(std430, set = 2, binding = 2) readonly buffer ClusterLightMaskStorage {
+    uint clusterLightMasks[];
 };
 #endif

@@ -1,0 +1,151 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba16f, set = 0, binding = 0) uniform readonly image2D currentColor;
+layout(set = 0, binding = 1) uniform sampler2D historyColor;
+layout(set = 0, binding = 2) uniform sampler2D motionVectors;
+layout(set = 0, binding = 3) uniform sampler2D currentDepth;
+layout(rgba16f, set = 0, binding = 4) uniform writeonly image2D resolvedColor;
+layout(std140, set = 0, binding = 5) uniform SceneData {
+    mat4 view;
+    mat4 proj;
+    mat4 viewproj;
+    vec4 ambientColor;
+    vec4 sunlightDirection;
+    vec4 sunlightColor;
+    mat4 previousViewproj;
+    mat4 unjitteredViewproj;
+    vec4 jitter;
+} scene;
+layout(push_constant) uniform TAAConstants {
+    uvec4 extentFlags;
+    vec4 params;
+} taa;
+
+bool finiteColor(vec3 c) { return !any(isnan(c)) && !any(isinf(c)); }
+vec3 toYCoCg(vec3 c) {
+    return vec3(dot(c, vec3(0.25, 0.5, 0.25)), 0.5 * (c.r - c.b),
+        dot(c, vec3(-0.25, 0.5, -0.25)));
+}
+vec3 toRGB(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+// Compress HDR before neighborhood statistics/blending so a single bright
+// specular sample cannot dominate temporal accumulation.
+vec3 compressHDR(vec3 c) { return c / (1.0 + max(c.r, max(c.g, c.b))); }
+vec3 expandHDR(vec3 c) { return c / max(1.0 - max(c.r, max(c.g, c.b)), 1e-5); }
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = ivec2(taa.extentFlags.xy);
+    if (any(greaterThanEqual(pixel, extent))) return;
+    vec3 current = max(imageLoad(currentColor, pixel).rgb, vec3(0.0));
+    if (!finiteColor(current)) current = vec3(0.0);
+    float depth = texelFetch(currentDepth, pixel, 0).r;
+    // Reverse-Z perspective: ndc.z = -proj[2][2] + proj[3][2] / viewDepth.
+    float viewDepth = depth > 0.0 ? scene.proj[3][2] / (depth + scene.proj[2][2]) : 0.0;
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(extent);
+    vec2 previousUV = uv;
+    float expectedDepth = 0.0;
+    bool valid = taa.extentFlags.z != 0u;
+    if (depth > 0.0) {
+        // Dilate the nearest surface's motion at silhouettes (reverse-Z max).
+        ivec2 motionPixel = pixel;
+        float nearestDepth = depth;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 p = clamp(pixel + ivec2(x, y), ivec2(0), extent - 1);
+                float d = texelFetch(currentDepth, p, 0).r;
+                float neighborViewDepth = scene.proj[3][2] / max(d + scene.proj[2][2], 1e-8);
+                if (d > nearestDepth && abs(neighborViewDepth - viewDepth) <= max(0.01, viewDepth * taa.params.y)) {
+                    nearestDepth = d;
+                    motionPixel = p;
+                }
+            }
+        }
+        vec4 motion = texelFetch(motionVectors, motionPixel, 0);
+        previousUV += motion.xy;
+        expectedDepth = motion.z;
+        valid = valid && motion.w > 0.5 && expectedDepth > 0.0;
+    } else if (taa.params.z > 0.5) {
+        // Environment has infinite depth: reproject a direction, excluding camera translation.
+        vec4 farPoint = inverse(scene.viewproj) * vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+        vec3 cameraPosition = inverse(scene.view)[3].xyz;
+        vec3 direction = normalize(farPoint.xyz / farPoint.w - cameraPosition);
+        vec4 previousClip = scene.previousViewproj * vec4(direction, 0.0);
+        valid = valid && previousClip.w > 0.0;
+        previousUV = previousClip.xy / max(previousClip.w, 1e-6) * 0.5 + 0.5;
+    } else {
+        // The procedural gradient is screen-space and has no world-space motion.
+        previousUV = uv;
+    }
+    vec2 halfTexel = 0.5 / vec2(extent);
+    valid = valid && !any(isnan(previousUV)) && !any(isinf(previousUV))
+        && all(greaterThanEqual(previousUV, halfTexel))
+        && all(lessThanEqual(previousUV, 1.0 - halfTexel));
+
+    vec3 history = vec3(0.0);
+    float coverage = 0.0;
+    float colorCoverage = 0.0;
+    if (valid) {
+        // Validate bilinear depth coverage, but retain the color footprint's
+        // edge coverage. Renormalizing only same-depth color taps would remove
+        // silhouette antialiasing and make jittered edges flicker indefinitely.
+        // Alpha stores positive view depth; zero means sky.
+        vec2 historyPixel = previousUV * vec2(extent) - 0.5;
+        ivec2 base = ivec2(floor(historyPixel));
+        vec2 fraction = fract(historyPixel);
+        for (int y = 0; y <= 1; ++y) {
+            for (int x = 0; x <= 1; ++x) {
+                ivec2 p = clamp(base + ivec2(x, y), ivec2(0), extent - 1);
+                vec4 h = texelFetch(historyColor, p, 0);
+                float weight = (x == 0 ? 1.0 - fraction.x : fraction.x)
+                    * (y == 0 ? 1.0 - fraction.y : fraction.y);
+                bool depthMatches = depth == 0.0 ? h.a == 0.0
+                    : h.a > 0.0 && abs(h.a - expectedDepth) <= max(0.01, expectedDepth * taa.params.y);
+                if (finiteColor(h.rgb)) {
+                    history += compressHDR(max(h.rgb, vec3(0.0))) * weight;
+                    colorCoverage += weight;
+                    if (depthMatches) coverage += weight;
+                }
+            }
+        }
+        valid = coverage > 0.5 && colorCoverage > 0.99;
+    }
+
+    vec3 result = current;
+    if (valid) {
+        vec3 colorMin = vec3(1e10), colorMax = vec3(-1e10);
+        vec3 mean = vec3(0.0), secondMoment = vec3(0.0);
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                ivec2 p = clamp(pixel + ivec2(x, y), ivec2(0), extent - 1);
+                vec3 c = max(imageLoad(currentColor, p).rgb, vec3(0.0));
+                if (!finiteColor(c)) c = current;
+                c = toYCoCg(compressHDR(c));
+                colorMin = min(colorMin, c);
+                colorMax = max(colorMax, c);
+                mean += c;
+                secondMoment += c * c;
+            }
+        }
+        mean /= 9.0;
+        vec3 sigma = sqrt(max(secondMoment / 9.0 - mean * mean, vec3(0.0)));
+        colorMin = max(colorMin, mean - 1.25 * sigma);
+        colorMax = min(colorMax, mean + 1.25 * sigma);
+        vec3 h = toYCoCg(history / colorCoverage);
+        // Clip toward the box center, preserving the color direction.
+        vec3 center = 0.5 * (colorMin + colorMax);
+        vec3 radius = max(0.5 * (colorMax - colorMin), vec3(1e-5));
+        vec3 delta = h - center;
+        float maxAxis = max(abs(delta.x) / radius.x,
+            max(abs(delta.y) / radius.y, abs(delta.z) / radius.z));
+        h = center + delta / max(1.0, maxAxis);
+        vec3 c = compressHDR(current);
+        float speed = length((previousUV - uv - (scene.jitter.zw - scene.jitter.xy)) * vec2(extent));
+        float disagreement = abs(toYCoCg(c).x - h.x) / max(0.05, toYCoCg(c).x);
+        float weight = taa.params.x * coverage * mix(1.0, 0.6, clamp(speed / 16.0, 0.0, 1.0))
+            * (1.0 - 0.8 * clamp(disagreement, 0.0, 1.0));
+        result = expandHDR(max(mix(c, toRGB(h), weight), vec3(0.0)));
+    }
+    imageStore(resolvedColor, pixel, vec4(min(result, vec3(65504.0)), min(viewDepth, 65504.0)));
+}

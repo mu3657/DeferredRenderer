@@ -40,7 +40,7 @@ void TransparentPass::execute(TransparentPassContext& ctx)
     transparentDraws.reserve(drawContext.TransparentSurfaces.size());
     for (uint32_t i = 0; i < drawContext.TransparentSurfaces.size(); i++) {
         const RenderObject& renderObject = drawContext.TransparentSurfaces[i];
-        if (renderObject.material && util::is_visible(renderObject, ctx.sceneData.viewproj)) {
+        if (renderObject.material && util::is_visible(renderObject, ctx.sceneData.unjitteredViewproj)) {
             transparentDraws.push_back(i);
         }
     }

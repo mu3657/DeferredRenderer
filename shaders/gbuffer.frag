@@ -10,12 +10,15 @@ layout (location = 2) in vec2 inUV;
 layout (location = 3) in vec4 inColor;
 layout (location = 4) flat in uint inMaterialID;
 layout (location = 5) in vec4 inTangent;
+layout (location = 6) in vec4 inPreviousClip;
+layout (location = 7) flat in uint inHistoryValid;
 
 // G-Buffer MRT outputs
 layout (location = 0) out vec4 outAlbedo;       // RT0: rgb = albedo, a = unused
 layout (location = 1) out vec4 outNormal;        // RT1: rgb = world normal ([-1,1] -> [0,1]), a = metallic
 layout (location = 2) out vec4 outMaterial;      // RT2: r = roughness, g = ao, b/a = reserved
 layout (location = 3) out vec4 outEmissive;      // RT3: rgb = linear HDR emissive
+layout (location = 4) out vec4 outMotion; // xy = previous-current UV, z = previous view depth, w = valid
 
 void main()
 {
@@ -85,4 +88,12 @@ void main()
     // --- Material ---
     outMaterial = vec4(roughness, ao, 0.0, 0.0);
     outEmissive = vec4(max(emissive, vec3(0.0)), 1.0);
+    vec4 currentClip = sceneData.viewproj * vec4(inWorldPos, 1.0);
+    outMotion = vec4(0.0);
+    if (inHistoryValid != 0u && inPreviousClip.w > 0.0) {
+        vec3 previousNDC = inPreviousClip.xyz / inPreviousClip.w;
+        vec2 currentUV = currentClip.xy / currentClip.w * 0.5 + 0.5;
+        outMotion = vec4(previousNDC.xy * 0.5 + 0.5 - currentUV,
+            inPreviousClip.w, float(previousNDC.z >= 0.0 && previousNDC.z <= 1.0));
+    }
 }

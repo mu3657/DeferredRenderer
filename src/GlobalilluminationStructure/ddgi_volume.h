@@ -35,7 +35,7 @@ struct DDGIVolumeDesc {
     uint32_t distanceInteriorTexels{16};
 
     float maxRayDistance{20.f};
-    float hysteresis{0.97f};
+    float hysteresis{0.97f}; // history weight per probe update, independent of batch size
     float normalBias{0.2f};
     float viewBias{0.1f};
     float irradianceEncodingGamma{1.f};
@@ -59,7 +59,7 @@ struct alignas(16) GPUDDGIVolume {
     glm::vec4 spacingHysteresis{};          // xyz spacing, w hysteresis
     glm::uvec4 probeCountsRaysPerProbe{};   // xyz probe counts, w rays per probe
     glm::vec4 biasAndEncoding{};            // normal bias, view bias, gamma, energy preservation
-    glm::vec4 blendThresholds{};             // x random-ray backface threshold, yzw reserved
+    glm::vec4 blendThresholds{};             // backface threshold, response activity, distance history, mode (0 global, 1 local, 2 parameters)
     glm::uvec4 texelsAndUpdate{};           // irradiance texels, distance texels, first probe, probe count
     glm::ivec4 scrollOffsets{};             // xyz scrolling offset, w unused
     glm::vec4 rayRotation{0.f, 0.f, 0.f, 1.f}; // world-space quaternion
@@ -179,6 +179,22 @@ public:
     void sync_sampling_frame(uint32_t frameIndex);
 
     void request_history_reset();
+    // Refresh radiance over one complete sweep without resetting relocation.
+    void notify_lighting_changed();
+    // A bounded radiance response window; never clears geometry history.
+    void notify_lighting_motion(bool localLight = false);
+    void notify_lighting_parameters(bool largeChange = false);
+    bool lighting_parameter_response_active() const { return _parameterResponseProbesRemaining > 0; }
+    void set_dynamic_response_enabled(bool enabled) {
+        _dynamicResponseEnabled = enabled;
+        if (!enabled) {
+            _responseProbesRemaining = 0;
+            _localResponseProbesRemaining = 0;
+            _parameterResponseProbesRemaining = 0;
+        }
+    }
+    bool dynamic_response_enabled() const { return _dynamicResponseEnabled; }
+    bool relighting_this_frame() const { return _relightingThisFrame; }
     void set_origin(const glm::vec3& origin);
     void set_probe_spacing(const glm::vec3& spacing);
     void set_scroll_offsets(const glm::ivec3& offsets);
@@ -234,6 +250,12 @@ private:
 
     uint32_t _nextProbeToUpdate{0};
     uint32_t _historyProbeCount{0};
+    uint32_t _relightProbesRemaining{0};
+    uint64_t _responseProbesRemaining{0};
+    uint64_t _localResponseProbesRemaining{0};
+    uint64_t _parameterResponseProbesRemaining{0};
+    bool _dynamicResponseEnabled{true};
+    bool _relightingThisFrame{false};
     uint64_t _historyClearSerial{1};
     bool _historyResetRequested{true};
     bool _initialized{false};

@@ -276,7 +276,7 @@ void DDGIVolume::init(const DDGIVolumeInitContext& ctx, const DDGIVolumeDesc& de
             _desc.irradianceEncodingGamma,
             _desc.energyPreservation);
         _gpuData.blendThresholds = glm::vec4(
-            _desc.randomRayBackfaceThreshold, 0.f, 0.f, 0.f);
+            _desc.randomRayBackfaceThreshold, 0.f, _desc.hysteresis, 0.f);
         _gpuData.texelsAndUpdate = glm::uvec4(
             _desc.irradianceInteriorTexels,
             _desc.distanceInteriorTexels,
@@ -508,6 +508,12 @@ void DDGIVolume::cleanup()
     _descriptors = nullptr;
     _nextProbeToUpdate = 0;
     _historyProbeCount = 0;
+    _relightProbesRemaining = 0;
+    _responseProbesRemaining = 0;
+    _localResponseProbesRemaining = 0;
+    _parameterResponseProbesRemaining = 0;
+    _dynamicResponseEnabled = true;
+    _relightingThisFrame = false;
     _historyClearSerial = 1;
     _historyResetRequested = true;
     _initialized = false;
@@ -538,8 +544,20 @@ void DDGIVolume::prepare_frame(
         _desc.viewBias,
         _desc.irradianceEncodingGamma,
         _desc.energyPreservation);
+    // Count actual probe updates, so changing the frame budget cannot prematurely
+    // expire the response window. Hold for twenty sweeps, ease out over four.
+    const bool localResponse = _responseProbesRemaining == 0 && _localResponseProbesRemaining > 0;
+    const bool parameterResponse = _parameterResponseProbesRemaining > 0;
+    const uint64_t responseRemaining = parameterResponse ? _parameterResponseProbesRemaining
+        : (localResponse ? _localResponseProbesRemaining : _responseProbesRemaining);
+    const float responseActivity = _dynamicResponseEnabled && !_historyResetRequested
+        ? std::min(1.f, float(responseRemaining) / (4.f * probeCount)) : 0.f;
     _gpuData.blendThresholds = glm::vec4(
-        _desc.randomRayBackfaceThreshold, 0.f, 0.f, 0.f);
+        _desc.randomRayBackfaceThreshold, responseActivity, _desc.hysteresis,
+        parameterResponse ? 2.f : (localResponse ? 1.f : 0.f));
+    _responseProbesRemaining -= std::min<uint64_t>(_responseProbesRemaining, _updateRange.probeCount);
+    _localResponseProbesRemaining -= std::min<uint64_t>(_localResponseProbesRemaining, _updateRange.probeCount);
+    _parameterResponseProbesRemaining -= std::min<uint64_t>(_parameterResponseProbesRemaining, _updateRange.probeCount);
     _gpuData.texelsAndUpdate = glm::uvec4(
         _desc.irradianceInteriorTexels,
         _desc.distanceInteriorTexels,
@@ -547,6 +565,12 @@ void DDGIVolume::prepare_frame(
         _updateRange.probeCount);
     _gpuData.scrollOffsets = glm::ivec4(_scrollOffsets, 0);
     _gpuData.rayRotation = rayRotation;
+    _relightingThisFrame = _relightProbesRemaining > 0;
+    // History weight is per probe UPDATE, not per rendered frame. Exponentiating
+    // it by the sweep length makes small budgets almost unfiltered and exposes
+    // the Monte Carlo noise of each newly rotated ray set as visible flicker.
+    _gpuData.spacingHysteresis.w = _relightingThisFrame ? 0.f : _desc.hysteresis;
+    _relightProbesRemaining -= std::min(_relightProbesRemaining, _updateRange.probeCount);
     DDGIVolumeFlags frameFlags = _desc.flags;
     if (_historyResetRequested) {
         frameFlags |= DDGIVolumeFlagResetHistory;
@@ -629,7 +653,7 @@ void DDGIVolume::update_rtxgi_gpu_data(const glm::vec4& rayRotation)
         static_cast<int>(_desc.irradianceInteriorTexels);
     gpu.probeNumDistanceInteriorTexels =
         static_cast<int>(_desc.distanceInteriorTexels);
-    gpu.probeHysteresis = _desc.hysteresis;
+    gpu.probeHysteresis = _gpuData.spacingHysteresis.w;
     gpu.probeMaxRayDistance = _desc.maxRayDistance;
     gpu.probeNormalBias = _desc.normalBias;
     gpu.probeViewBias = _desc.viewBias;
@@ -661,6 +685,33 @@ void DDGIVolume::request_history_reset()
     _nextProbeToUpdate = 0;
     _historyProbeCount = 0;
     ++_historyClearSerial;
+    notify_lighting_changed();
+}
+
+void DDGIVolume::notify_lighting_changed()
+{
+    _relightProbesRemaining = total_probe_count();
+    _responseProbesRemaining = 0;
+    _localResponseProbesRemaining = 0;
+    _parameterResponseProbesRemaining = 0;
+}
+
+void DDGIVolume::notify_lighting_motion(bool localLight)
+{
+    if (_dynamicResponseEnabled) {
+        auto& remaining = localLight ? _localResponseProbesRemaining : _responseProbesRemaining;
+        remaining = uint64_t(total_probe_count()) * 24;
+    }
+}
+
+void DDGIVolume::notify_lighting_parameters(bool largeChange)
+{
+    if (_dynamicResponseEnabled) {
+        // Small edits settle quickly; stop amplifying their noise after two
+        // hold sweeps and four fade sweeps. Large persistent changes need a
+        // longer window to remove or establish multi-bounce energy.
+        _parameterResponseProbesRemaining = uint64_t(total_probe_count()) * (largeChange ? 64 : 6);
+    }
 }
 
 void DDGIVolume::set_origin(const glm::vec3& origin)

@@ -432,6 +432,10 @@ void DDGIProbeBlendingCS(
 
         // Blend each ray's radiance or distance values to compute irradiance or fitered distance
         float4 result = float4(0.f, 0.f, 0.f, 0.f);
+    #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE) && RTXGI_DDGI_BLEND_RADIANCE
+        float3 radianceSecondMoment = 0.f;
+        float squaredWeightSum = 0.f;
+    #endif
         for ( ; rayIndex < volume.probeNumRays; rayIndex++)
         {
             // Get the direction for this probe ray
@@ -474,6 +478,10 @@ void DDGIProbeBlendingCS(
 
             // Blend the ray's radiance
             result += float4(probeRayRadiance * weight, weight);
+        #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE)
+            radianceSecondMoment += probeRayRadiance * probeRayRadiance * weight;
+            squaredWeightSum += weight * weight;
+        #endif
 
         #else // RTXGI_DDGI_BLEND_RADIANCE == 0
 
@@ -513,15 +521,37 @@ void DDGIProbeBlendingCS(
         // For distance, note that we are *not* dividing by the sum of the cosine weights, but to avoid branching here
         // we are still dividing by 2. This means distance values sampled from texture need to be multiplied by 2 (see
         // Irradiance.hlsl line 138).
+    #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE) && RTXGI_DDGI_BLEND_RADIANCE
+        float inverseWeight = 1.f / max(result.a, epsilon);
+        float3 meanRadiance = result.rgb * inverseWeight;
+        float3 radianceVariance = max(0.f, radianceSecondMoment * inverseWeight - meanRadiance * meanRadiance);
+        // Weighted Monte Carlo standard error in the atlas's linear units.
+        // This is a noise estimate for the ray set, not a temporal variance cache.
+        float3 standardError = 0.5f * sqrt(radianceVariance * squaredWeightSum) * inverseWeight;
+    #endif
         result.rgb *= 1.f / (2.f * max(result.a, epsilon));
         result.a = 1.f;
 
         // Get the irradiance mean stored in the probe
-        float3 probeIrradianceMean = Output[DispatchThreadID].rgb;
+        float4 previousIrradiance = Output[DispatchThreadID];
+        float3 probeIrradianceMean = previousIrradiance.rgb;
+    #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE) && RTXGI_DDGI_BLEND_RADIANCE
+        float sampleVariance = pow(RTXGIMaxComponent(standardError), 2.f);
+        // Alpha is unused by irradiance sampling. Retain a short variance
+        // history so a ray set that misses a rare bright path cannot suddenly
+        // declare a noisy innovation to be a low-noise lighting change.
+        float previousVariance = dot(probeIrradianceMean, probeIrradianceMean) > 0.f ? max(previousIrradiance.a, 0.f) : 0.f;
+        float filteredVariance = volume.probeHysteresis > 0.f ? lerp(previousVariance, sampleVariance, 0.3f) : sampleVariance;
+    #endif
 
         // Get the history weight (hysteresis) to use for the probe texel's previous value
         // If the probe was previously cleared to completely black, set the hysteresis to zero
         float  hysteresis = volume.probeHysteresis;
+    #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE) && !RTXGI_DDGI_BLEND_RADIANCE
+        // Lighting edits do not change geometry. The application supplies an
+        // independent distance history weight through the unused bound indices.
+        hysteresis = asfloat(DDGI.volumeResourceIndicesIndex);
+    #endif
         if (dot(probeIrradianceMean, probeIrradianceMean) == 0) hysteresis = 0.f;
 
     #if RTXGI_DDGI_BLEND_RADIANCE
@@ -553,15 +583,59 @@ void DDGIProbeBlendingCS(
         // may be smaller than what the texture format can represent. This can stop progress towards
         // the target value when going from high to low values. When darkening, step at least the minimum
         // value the texture format can represent to ensure the target value is reached. The threshold value
-        // for 10-bit/channel formats is always used (even for 32-bit/channel formats) to speed up light to
-        // dark convergence.
+        // for 10-bit/channel formats is also used for other low precision formats.
+        // F32x4 must retain the actual temporal blend: imposing a 10-bit step on
+        // dim floating-point irradiance overrides hysteresis and causes flicker.
         static const float c_threshold = 1.f / 1024.f;
         float3 lerpDelta = (1.f - hysteresis) * delta;
-        if (RTXGIMaxComponent(result.rgb) < RTXGIMaxComponent(probeIrradianceMean.rgb))
+    #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE)
+        bool localResponse = (DDGI.volumeConstantsIndex & 0x80000000u) != 0u;
+        bool parameterResponse = (DDGI.volumeConstantsIndex & 0x40000000u) != 0u;
+        float responseActivity = saturate(asfloat(DDGI.volumeConstantsIndex & 0x3fffffffu));
+        if (volume.probeHysteresis > 0.f)
+        {
+            // Use the same stable rule as the fallback even for black texels.
+            // The SDK's zero-history and darkening shortcuts above otherwise
+            // expose full ray-set noise without any volume-level history reset.
+            // Known emitter edits enable the faster, still bounded response.
+            float3 innovation = irradianceSample - probeIrradianceMean;
+            float scale = max(1.e-4f, max(RTXGIMaxComponent(irradianceSample), RTXGIMaxComponent(probeIrradianceMean)));
+            float relativeChange = RTXGIMaxComponent(abs(innovation)) / scale;
+            float parameterConfidence = 1.f;
+            if (parameterResponse)
+            {
+                // Gamma encoding compresses large energy changes into tiny
+                // innovations, hiding a dimmed source's stale bounce energy.
+                float3 oldLinear = pow(max(probeIrradianceMean, 0.f) / scale, volume.probeIrradianceEncodingGamma);
+                float3 newLinear = pow(max(irradianceSample, 0.f) / scale, volume.probeIrradianceEncodingGamma);
+                relativeChange = RTXGIMaxComponent(abs(newLinear - oldLinear))
+                    / max(1.e-6f, max(RTXGIMaxComponent(newLinear), RTXGIMaxComponent(oldLinear)));
+                float linearScale = pow(scale, volume.probeIrradianceEncodingGamma);
+                float signal = RTXGIMaxComponent(abs(newLinear - oldLinear)) * linearScale;
+                float noise = max(1.e-7f, sqrt(max(sampleVariance, filteredVariance)));
+                parameterConfidence = smoothstep(0.5f, 1.5f, signal / noise);
+            }
+            float response = responseActivity * (parameterResponse
+                ? smoothstep(0.005f, 0.05f, relativeChange) * parameterConfidence : smoothstep(0.05f, 0.4f, relativeChange));
+            float historyWeight = lerp(volume.probeHysteresis, min(volume.probeHysteresis, parameterResponse ? 0.35f : 0.65f), response);
+            lerpDelta = (1.f - historyWeight) * innovation;
+            // Symmetric scale: limiting only against old energy traps previously
+            // dark texels near zero and biases the fast response toward darkness.
+            float stepLimit = parameterResponse ? lerp(0.01f, 0.05f, response * response)
+                : (responseActivity > 0.f ? (localResponse ? 0.02f : 0.05f) : 0.01f);
+            float maxStep = max(2.e-5f, scale * stepLimit);
+            lerpDelta *= min(1.f, maxStep / max(RTXGIMaxComponent(abs(lerpDelta)), 1.e-10f));
+        }
+    #endif
+        if (volume.probeIrradianceFormat != RTXGI_DDGI_VOLUME_TEXTURE_FORMAT_F32x4
+            && RTXGIMaxComponent(result.rgb) < RTXGIMaxComponent(probeIrradianceMean.rgb))
         {
             lerpDelta = min(max(c_threshold, abs(lerpDelta)), abs(delta)) * sign(lerpDelta);
         }
         result = float4(probeIrradianceMean.rgb + lerpDelta, 1.f);
+    #if defined(RTXGI_DDGI_BOUND_DYNAMIC_RESPONSE)
+        result.a = filteredVariance;
+    #endif
 
         if (volume.probeVariabilityEnabled)
         {

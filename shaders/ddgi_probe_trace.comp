@@ -521,30 +521,22 @@ bool trace_visibility(vec3 origin, vec3 direction, float maxDistance)
     return rayQueryGetIntersectionTypeEXT(shadowQuery, true) == gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
-vec3 evaluate_direct_diffuse(
+vec3 evaluate_light_incident(
+    uint lightIndex,
     vec3 worldPosition,
     vec3 worldNormal,
-    vec3 albedo,
-    float metallic,
-    uint randomSeed,
-    bool traceShadow)
+    uint hashed,
+    bool traceShadow,
+    uint areaSampleIndex,
+    uint areaSampleCount)
 {
-    uint availableLightCount = lightData.lightCount;
-    if (availableLightCount == 0u) {
-        return vec3(0.0);
-    }
-
-    // PCG hash. Selecting one light keeps visibility cost at one secondary ray
-    // per probe ray; multiplying by the selection domain preserves expectation.
-    uint state = randomSeed * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    uint hashed = (word >> 22u) ^ word;
-    uint lightIndex = hashed % availableLightCount;
-
     GPULight light = lights[lightIndex];
     uint lightType = uint(light.directionType.w + 0.5);
     vec3 directionToLight;
     vec3 incidentRadiance = light.colorIntensity.rgb * light.colorIntensity.w;
+    if (max(max(incidentRadiance.r, incidentRadiance.g), incidentRadiance.b) <= 0.0) {
+        return vec3(0.0);
+    }
     float shadowDistance = volume.originMaxRayDistance.w;
 
     if (lightType == LIGHT_TYPE_DIRECTIONAL) {
@@ -552,10 +544,14 @@ vec3 evaluate_direct_diffuse(
     } else {
         vec3 lightPosition = light.positionRange.xyz;
         if (lightType == LIGHT_TYPE_RECT_AREA) {
-            uint areaHash = hashed * 1664525u + 1013904223u;
+            uint areaHash = (hashed ^ (areaSampleIndex * 0x9e3779b9u)) * 1664525u + 1013904223u;
             vec2 areaSample = vec2(
                 float(areaHash & 0xffffu),
                 float(areaHash >> 16u)) / 65535.0;
+            // Two strata at rest, a 2x2 grid during parameter response. Unlike
+            // mirrored pairs, these also sample different emitter radii.
+            areaSample.x = (areaSample.x + float(areaSampleIndex & 1u)) * 0.5;
+            areaSample.y = (areaSample.y + float(areaSampleIndex >> 1u)) / float(areaSampleCount / 2u);
             lightPosition += light.areaRight.xyz * light.areaRight.w
                     * (areaSample.x * 2.0 - 1.0)
                 + light.areaUp.xyz * light.areaUp.w
@@ -596,9 +592,85 @@ vec3 evaluate_direct_diffuse(
         }
     }
 
-    float lightSelectionWeight = float(availableLightCount);
-    return albedo * (1.0 - metallic) * incidentRadiance
-        * (nDotL / PI) * lightSelectionWeight;
+    return incidentRadiance * nDotL;
+}
+
+vec3 evaluate_incident_with_area_samples(
+    uint lightIndex, vec3 worldPosition, vec3 worldNormal, uint hashed, bool traceShadow)
+{
+    if (uint(lights[lightIndex].directionType.w + 0.5) != LIGHT_TYPE_RECT_AREA)
+        return evaluate_light_incident(lightIndex, worldPosition, worldNormal, hashed, traceShadow, 0u, 1u);
+    uint samples = volume.blendThresholds.w == 2.0 ? 4u : 2u;
+    vec3 incident = vec3(0.0);
+    for (uint sampleIndex = 0u; sampleIndex < samples; ++sampleIndex)
+        incident += evaluate_light_incident(lightIndex, worldPosition, worldNormal, hashed, traceShadow, sampleIndex, samples);
+    return incident / float(samples);
+}
+
+float light_roulette(inout uint state)
+{
+    state = state * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return float(((word >> 22u) ^ word) >> 8u) / 16777216.0;
+}
+
+vec3 evaluate_direct_diffuse(
+    vec3 worldPosition,
+    vec3 worldNormal,
+    vec3 albedo,
+    float metallic,
+    uint randomSeed,
+    bool traceShadow)
+{
+    uint availableLightCount = lightData.lightCount;
+    if (availableLightCount == 0u) return vec3(0.0);
+    uint state = randomSeed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    uint hashed = (word >> 22u) ^ word;
+    vec3 incident = vec3(0.0);
+    if (availableLightCount <= 4u) {
+        // Small interactive light sets can afford deterministic light sums.
+        // One-of-two sampling otherwise flickers between a stationary sun and
+        // a moving local source, and even wastes samples on disabled emitters.
+        for (uint i = 0u; i < availableLightCount; ++i) {
+            incident += evaluate_incident_with_area_samples(i, worldPosition, worldNormal,
+                hashed ^ (i * 0x9e3779b9u), traceShadow);
+        }
+    } else {
+        // Only potential evaluation scales with light count; visibility is
+        // queried for the selected emitter. Mix importance and uniform active
+        // reservoirs to retain a probability floor for occluded bright lights.
+        float weightSum = 0.0, weightedScore = 0.0, uniformScore = 0.0;
+        uint weightedIndex = 0u, uniformIndex = 0u, activeCount = 0u;
+        uvec4 exactIndices = uvec4(0u);
+        uint roulette = hashed ^ 0x68bc21ebu;
+        for (uint i = 0u; i < availableLightCount; ++i) {
+            vec3 potential = evaluate_incident_with_area_samples(i, worldPosition, worldNormal,
+                hashed ^ (i * 0x9e3779b9u), false) * albedo * (1.0 - metallic);
+            float score = max(max(potential.r, potential.g), potential.b);
+            if (score <= 0.0) continue;
+            weightSum += score;
+            if (activeCount < 4u) exactIndices[activeCount] = i;
+            ++activeCount;
+            if (light_roulette(roulette) * weightSum < score) { weightedIndex = i; weightedScore = score; }
+            if (light_roulette(roulette) * float(activeCount) < 1.0) { uniformIndex = i; uniformScore = score; }
+        }
+        if (activeCount > 0u && activeCount <= 4u) {
+            for (uint j = 0u; j < activeCount; ++j) {
+                uint selected = exactIndices[j];
+                incident += evaluate_incident_with_area_samples(selected, worldPosition, worldNormal,
+                    hashed ^ (selected * 0x9e3779b9u), traceShadow);
+            }
+        } else if (activeCount > 4u) {
+            bool importance = light_roulette(roulette) < 0.5;
+            uint selected = importance ? weightedIndex : uniformIndex;
+            float score = importance ? weightedScore : uniformScore;
+            float pdf = 0.5 * score / weightSum + 0.5 / float(activeCount);
+            incident = evaluate_incident_with_area_samples(selected, worldPosition, worldNormal,
+                hashed ^ (selected * 0x9e3779b9u), traceShadow) / pdf;
+        }
+    }
+    return albedo * (1.0 - metallic) * incident / PI;
 }
 
 void main()
@@ -647,7 +719,7 @@ void main()
     vec3 radiance = materialDiagnostic
         ? vec3(0.0)
         : sampleEnvironmentPanorama(environmentPanorama, rayDirection)
-            * environmentIntensity();
+            * environmentLightingIntensity();
     float signedDistance = maxRayDistance;
     bool hasHit = rayQueryGetIntersectionTypeEXT(query, true)
         == gl_RayQueryCommittedIntersectionTriangleEXT;
@@ -765,7 +837,9 @@ void main()
                     globalTextures[nonuniformEXT(material.normalTexID)], hit.uv, 0.0).rgb,
                     vec3(0.0));
             } else {
-                radiance = emissive + baseColor.rgb * lightData.ambientColor.rgb;
+                // Only actual emitters inject energy. A constant ambient term
+                // here is amplified by the probe feedback on every bounce.
+                radiance = emissive;
             }
             if (pushConstants.traceMode == 2u || pushConstants.traceMode == 3u) {
                 uint randomSeed = probeIndex * 9781u

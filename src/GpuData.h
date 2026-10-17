@@ -19,7 +19,14 @@ struct GPUSceneData {
     glm::vec4 ambientColor;
     glm::vec4 sunlightDirection; // w for sun power
     glm::vec4 sunlightColor;
+    // Raster matrices include jitter; keep the unjittered matrix for culling.
+    glm::mat4 previousViewproj{1.f};
+    glm::mat4 unjitteredViewproj{1.f};
+    glm::vec4 jitter{}; // xy = current UV offset, zw = previous UV offset
 };
+static_assert(sizeof(GPUSceneData) == 384);
+static_assert(offsetof(GPUSceneData, previousViewproj) == 240);
+static_assert(offsetof(GPUSceneData, jitter) == 368);
 
 
 struct GPUObjectData {
@@ -81,7 +88,7 @@ struct GPULightData {
     uint32_t padding0{0};
     uint32_t padding1{0};
     uint32_t padding2{0};
-    glm::vec4 ambientColor{0.1f};
+    glm::vec4 ambientColor{0.f};
 };
 
 static_assert(sizeof(GPULight) == 96);
