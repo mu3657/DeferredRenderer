@@ -404,6 +404,10 @@ void DDGIProbeBlendingCS(
         int probeState = DDGILoadProbeState(probeIndex, ProbeData, volume);
         if (probeState == RTXGI_DDGI_PROBE_STATE_INACTIVE)
         {
+            // Our raster and recursive consumers exclude inactive support.
+            // Clear abandoned history as well so reactivation cannot resurrect
+            // radiance from a former emitter or a former probe position.
+            Output[DispatchThreadID] = float4(0.f, 0.f, 0.f, 0.f);
         #if RTXGI_DDGI_BLEND_RADIANCE
             ProbeVariability[DispatchThreadID].r = 0.f;
         #endif
@@ -471,7 +475,11 @@ void DDGIProbeBlendingCS(
                 backfaces++;
 
                 // Early out: only blend ray radiance into the probe if the backface threshold hasn't been exceeded
-                if (backfaces >= maxBackfaces) return;
+                if (backfaces >= maxBackfaces)
+                {
+                    Output[DispatchThreadID] = float4(0.f, 0.f, 0.f, 0.f);
+                    return;
+                }
 
                 continue;
             }

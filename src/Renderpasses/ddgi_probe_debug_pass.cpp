@@ -281,7 +281,7 @@ void DDGIProbeDebugPass::execute(DDGIProbeDebugPassContext& ctx)
     TracyPlot("DDGI Debug Probes Drawn", static_cast<int64_t>(probeCount));
 }
 
-bool DDGIProbeDebugPass::fit_volume_to_active_scene(DDGIVolume& volume)
+bool DDGIProbeDebugPass::fit_volume_to_active_scene(DDGIVolume& volume, bool interior)
 {
     if (!_engine) {
         return false;
@@ -299,8 +299,25 @@ bool DDGIProbeDebugPass::fit_volume_to_active_scene(DDGIVolume& volume)
         (sceneBounds->maximum - sceneBounds->minimum
             + glm::vec3(Margin * 2.f)) / intervals,
         glm::vec3(0.05f));
-    volume.set_origin(sceneBounds->minimum - glm::vec3(Margin));
-    volume.set_probe_spacing(fittedSpacing);
+    if (interior) {
+        // Cell centers inside an enclosure use the budget in its occupied
+        // volume. Sampling still covers half a cell beyond the first/last probe.
+        const glm::vec3 spacing = glm::max(
+            (sceneBounds->maximum - sceneBounds->minimum)
+                / glm::vec3(volume.desc().probeCounts), glm::vec3(0.01f));
+        volume.set_origin(sceneBounds->minimum + spacing * 0.5f);
+        volume.set_probe_spacing(spacing);
+        volume.set_probe_classification_enabled(true);
+    } else {
+        volume.set_origin(sceneBounds->minimum - glm::vec3(Margin));
+        volume.set_probe_spacing(fittedSpacing);
+    }
+    const glm::vec3 spacing = volume.desc().probeSpacing;
+    const float cell = std::min(spacing.x, std::min(spacing.y, spacing.z));
+    // The old absolute defaults assumed one-meter cells. Keep those maxima,
+    // but scale down for small scenes to avoid crossing walls during sampling.
+    volume.set_surface_biases(std::min(0.2f, cell * 0.1f), std::min(0.1f, cell * 0.05f));
+    volume.set_min_frontface_distance(std::min(0.2f, cell * 0.2f));
     return true;
 }
 
@@ -386,6 +403,10 @@ void DDGIProbeDebugPass::draw_debug_ui()
             fit_volume_to_active_scene(volume);
         }
         ImGui::SameLine();
+        if (ImGui::Button("Fit interior bounds")) {
+            fit_volume_to_active_scene(volume, true);
+        }
+        ImGui::TextDisabled("Interior fit: cell centers inside scene bounds; use for enclosed rooms.");
         if (ImGui::Button("Center on camera")) {
             const glm::vec3 extent =
                 glm::vec3(volume.desc().probeCounts - glm::uvec3(1u))

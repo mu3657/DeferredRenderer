@@ -583,6 +583,8 @@ void ShadowPass::execute(ShadowPassContext& ctx)
 
     ShadowFrameResources& shadowFrame = _frames[ctx.frameIndex];
     GPULight directionalLight = ctx.lightSystem.GetDirectionalLight();
+    const bool renderDirectional = _enabled && directionalLight.colorIntensity.w > 0.f
+        && directionalLight.params.w > 0.f;
     constexpr float cameraNearDistance = 0.1f;
     const std::array<float, SHADOW_CASCADE_COUNT> cascadeSplits =
         make_cascade_splits(cameraNearDistance, _maxDistance, _splitLambda);
@@ -657,7 +659,7 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         _receiverBiasTexels,
         _strength,
         1.0f / static_cast<float>(cascadeExtent.width),
-        _enabled && directionalLight.colorIntensity.w > 0.f ? 1.0f : 0.0f);
+        renderDirectional ? 1.0f : 0.0f);
     _shadowData.pcssParams = glm::vec4(
         _pcssEnabled ? 1.f : 0.f,
         std::tan(glm::radians(std::clamp(_sunAngularRadiusDegrees, 0.05f, 2.f))),
@@ -665,7 +667,7 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         std::clamp(_pcssMaxFilterRadius, 1.f, 32.f));
     _shadowData.pcssSamples = glm::vec4(
         static_cast<float>(std::clamp(_pcssBlockerSamples, 8, 32)),
-        static_cast<float>(std::clamp(_pcssFilterSamples, 8, 32)),
+        static_cast<float>(std::clamp(_pcssFilterSamples, 8, 64)),
         0.75f,
         0.f);
 
@@ -676,17 +678,17 @@ void ShadowPass::execute(ShadowPassContext& ctx)
         0,
         sizeof(GPUShadowData)));
 
-    const bool renderDirectional = _enabled && directionalLight.colorIntensity.w > 0.f;
     if (!renderDirectional) {
         _lastVisibleCasters.fill(0);
     }
 
-    if (renderDirectional) {
-        vkutil::transition_image(
-            cmd,
-            _shadowDepthImage.image,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    // Keep the sampled atlas initialized/read-only even when the primary light
+    // has disabled shadows, including the first frame of a point-only scene.
+    vkutil::transition_image(
+        cmd,
+        _shadowDepthImage.image,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
 
     VkRenderingAttachmentInfo depthAttachment = vkinit::depth_attachment_info(
         _shadowDepthImage.imageView,
@@ -702,7 +704,7 @@ void ShadowPass::execute(ShadowPassContext& ctx)
 
     vkCmdBeginRendering(cmd, &renderInfo);
 
-    for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {
+    for (uint32_t cascadeIndex = 0; renderDirectional && cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {
         const GPUSceneData& shadowSceneData = cascadeSceneData[cascadeIndex];
 
         std::vector<uint32_t> opaqueDraws;
@@ -819,13 +821,11 @@ void ShadowPass::execute(ShadowPassContext& ctx)
 
     vkCmdEndRendering(cmd);
 
-        vkutil::transition_image(
-            cmd,
-            _shadowDepthImage.image,
-            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
-    }
-
+    vkutil::transition_image(
+        cmd,
+        _shadowDepthImage.image,
+        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     struct PunctualFaceRender {
         GPUSceneData sceneData{};
         uint32_t tileIndex{0};
@@ -1074,8 +1074,8 @@ void ShadowPass::draw_debug_ui()
         ImGui::SliderFloat("Max blocker search (texels)", &_pcssMaxSearchRadius, 1.f, 32.f, "%.0f");
         ImGui::SliderFloat("Max penumbra (texels)", &_pcssMaxFilterRadius, 1.f, 32.f, "%.0f");
         ImGui::SliderInt("Blocker samples", &_pcssBlockerSamples, 8, 32);
-        ImGui::SliderInt("Filter samples", &_pcssFilterSamples, 8, 32);
-        ImGui::TextDisabled("Stable disk sampling + bilinear comparison filtering");
+        ImGui::SliderInt("Filter samples", &_pcssFilterSamples, 8, 64);
+        ImGui::TextDisabled("Directional emitter disk; no frame-random jitter");
     }
     ImGui::Text("Shadow atlas: %ux%u", _shadowExtent.width, _shadowExtent.height);
     for (uint32_t cascadeIndex = 0; cascadeIndex < SHADOW_CASCADE_COUNT; cascadeIndex++) {

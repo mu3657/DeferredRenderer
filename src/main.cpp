@@ -19,6 +19,9 @@ int main(int argc, char* argv[])
     }
 #endif
     const bool validateTAA = argc == 2 && std::string(argv[1]) == "--taa-validation";
+    const bool validateScripting = argc == 2 && std::string(argv[1]) == "--scripting-validation";
+    const bool validateTAASponza = argc == 2 && std::string(argv[1]) == "--taa-sponza-validation";
+    const bool validateCornell = argc == 2 && std::string(argv[1]) == "--cornell-validation";
     const bool validateClustered = argc == 2 && std::string(argv[1]) == "--clustered-validation";
     const bool validateDDGI = argc == 2 && std::string(argv[1]) == "--ddgi-validation";
     const bool validateDDGITemporal = argc == 2 && std::string(argv[1]) == "--ddgi-temporal-validation";
@@ -39,12 +42,30 @@ int main(int argc, char* argv[])
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         fmt::println("Starting clustered lighting GPU validation");
     }
-    if (validateTAA) {
+    if (validateTAA || validateTAASponza) {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
         fmt::println("Starting TAA GPU validation");
     }
 	VulkanEngine engine;
 	engine.init();	
+
+    if (validateScripting) {
+        const int result = engine.run_scripting_validation();
+        engine.cleanup();
+        return result;
+    }
+
+    if (validateTAASponza) {
+        const int result = engine.run_taa_sponza_validation();
+        engine.cleanup();
+        return result;
+    }
+
+    if (validateCornell) {
+        const int result = engine.run_cornell_validation();
+        engine.cleanup();
+        return result;
+    }
 
     if (validateDDGI || validateDDGITemporal || validateDDGIRotation || ddgiResponseMode) {
         const int result = engine.run_ddgi_validation(validateDDGITemporal || validateDDGIRotation, validateDDGIRotation, ddgiResponseMode);

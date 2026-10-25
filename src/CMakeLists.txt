@@ -2,8 +2,14 @@
 # Add source to this project's executable.
 add_executable (engine 
   main.cpp
+  scene_script_host.cpp
+  scene_scripts.cpp
+  script_inspector.cpp
+  scripting/tests/scene_scripting_validation.cpp
   ../tests/taa_validation.cpp
+  ../tests/taa_sponza_validation.cpp
   ../tests/clustered_validation.cpp
+  ../tests/cornell_validation.cpp
   light_system.h
   light_system.cpp
   vk_types.h
@@ -70,6 +76,8 @@ target_compile_definitions(engine PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_include_directories(engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
 target_link_libraries(engine PUBLIC vma glm Vulkan::Vulkan fmt::fmt stb_image SDL2::SDL2 vkbootstrap imgui fastgltf::fastgltf lz4 assetlib json assimp renderdoc tracy entt RTXGI-VK)
+target_link_libraries(engine PRIVATE scripting)
+target_compile_definitions(engine PRIVATE SCRIPTING_EXAMPLES_DIR="${PROJECT_SOURCE_DIR}/src/scripting/examples")
 if(MSVC)
   # Optimize only the validation harness's CPU readback/statistics loops.
   # Its Debug CRT/ABI match engine; renderer runtime checks remain enabled.

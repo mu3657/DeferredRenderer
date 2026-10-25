@@ -10,6 +10,7 @@ public:
     void cleanup() override;
     void execute(RenderPassFrameContext& ctx);
     void draw_debug_ui() override;
+    void set_enabled(bool enabled) { _enabled = enabled; }
 
 private:
     VulkanEngine* _engine{nullptr};

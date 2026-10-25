@@ -22,7 +22,7 @@ struct DDGIProbeTracePassContext : RenderPassFrameContext {
         , volume(volume_)
         , lightSystem(lightSystem_)
     {
-    }
+}
 };
 
 struct DDGIProbeTraceDispatchStats {

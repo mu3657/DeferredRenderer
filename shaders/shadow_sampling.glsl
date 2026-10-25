@@ -6,8 +6,8 @@ layout(set = 3, binding = 0) uniform sampler2D shadowMap;
 layout(set = 3, binding = 4) uniform sampler2DShadow shadowCompareMap;
 
 const int SHADOW_CASCADE_COUNT = 4;
-const int MAX_PCSS_SAMPLES = 32;
-const vec2 SHADOW_DISK[MAX_PCSS_SAMPLES] = vec2[](
+const int MAX_PCSS_SAMPLES = 64;
+const vec2 SHADOW_DISK[32] = vec2[](
     vec2(0.1250000, 0.0000000), vec2(-0.1596450, 0.1462479),
     vec2(0.0244362, -0.2784383), vec2(0.2012222, 0.2624588),
     vec2(-0.3692676, -0.0653182), vec2(0.3498025, -0.2225157),
@@ -35,7 +35,7 @@ layout(std140, set = 3, binding = 1) uniform ShadowDataBuffer {
     vec4 lightDir;
     vec4 params;       // receiver bias, strength, local texel size, enabled
     vec4 pcssParams;   // enabled, tan(sun half angle), search radius, filter radius
-    vec4 pcssSamples;  // blocker count, filter count, minimum filter radius, unused
+    vec4 pcssSamples;  // blocker count, filter count, minimum filter radius, reserved
 } shadowData;
 
 struct ShadowCascadeSelection {
@@ -75,17 +75,27 @@ vec2 shadowAtlasUV(int cascadeIndex, vec2 localUV)
     return cascadeAtlasOffset(cascadeIndex) + safeUV * 0.5;
 }
 
-// A fixed Vogel disk avoids frame-to-frame stochastic noise. Hardware linear
-// comparison filtering reconstructs each tap from four depth comparisons.
+// Fixed disk samples avoid frame-to-frame stochastic noise.
 vec2 shadowDiskOffset(int index, int count)
 {
-    return SHADOW_DISK[index] * sqrt(float(MAX_PCSS_SAMPLES) / float(count));
+    if (count > 32) {
+        float radius = sqrt((float(index) + 0.5) / float(count));
+        float angle = float(index) * 2.399963229728653;
+        return vec2(cos(angle), sin(angle)) * radius;
+    }
+    return SHADOW_DISK[index] * sqrt(32.0 / float(count));
 }
 
-float shadowPCF(int cascadeIndex, vec2 localUV, float receiverDepth, float radiusTexels, int sampleCount)
+float shadowCompare(int cascadeIndex, vec2 localUV, float receiverDepth)
+{
+    return texture(shadowCompareMap, vec3(shadowAtlasUV(cascadeIndex, localUV), receiverDepth));
+}
+
+float shadowPCF(int cascadeIndex, vec2 localUV, float receiverDepth,
+    float radiusTexels, int sampleCount)
 {
     if (radiusTexels <= 0.75) {
-        return texture(shadowCompareMap, vec3(shadowAtlasUV(cascadeIndex, localUV), receiverDepth));
+        return shadowCompare(cascadeIndex, localUV, receiverDepth);
     }
 
     float visibility = 0.0;
@@ -93,8 +103,7 @@ float shadowPCF(int cascadeIndex, vec2 localUV, float receiverDepth, float radiu
         if (i >= sampleCount) break;
         vec2 sampleUV = localUV + shadowDiskOffset(i, sampleCount) *
             radiusTexels * shadowData.params.z;
-        visibility += texture(shadowCompareMap,
-            vec3(shadowAtlasUV(cascadeIndex, sampleUV), receiverDepth));
+        visibility += shadowCompare(cascadeIndex, sampleUV, receiverDepth);
     }
     return visibility / float(sampleCount);
 }
@@ -115,7 +124,6 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
     float depthRange = max(shadowData.cascadeDepthRanges[cascadeIndex], 1e-4);
     float bias = texelWorldSize * shadowData.params.x * mix(2.0, 1.0, ndotl) / depthRange;
     float biasedDepth = min(receiverDepth + bias, 1.0);
-
     float visibility;
     if (shadowData.pcssParams.x > 0.5) {
         // A blocker can be anywhere between the light's near plane and the
@@ -124,12 +132,12 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
         float searchRadius = clamp(
             distanceFromNear * shadowData.pcssParams.y / texelWorldSize,
             1.0, shadowData.pcssParams.z);
-        int blockerSamples = clamp(int(shadowData.pcssSamples.x + 0.5), 8, MAX_PCSS_SAMPLES);
+        int blockerSamples = clamp(int(shadowData.pcssSamples.x + 0.5), 8, 32);
         int filterSamples = clamp(int(shadowData.pcssSamples.y + 0.5), 8, MAX_PCSS_SAMPLES);
         float blockerDepthSum = 0.0;
         int blockerCount = 0;
         float centerDepth = texture(shadowMap, shadowAtlasUV(cascadeIndex, localUV)).r;
-        if (centerDepth > biasedDepth) {
+        if (centerDepth > receiverDepth + bias) {
             blockerDepthSum = centerDepth;
             blockerCount = 1;
         }
@@ -142,8 +150,9 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
                 : shadowDiskOffset(i - nearSamples, blockerSamples - nearSamples);
             float ringRadius = nearRing ? min(searchRadius, 4.0) : searchRadius;
             vec2 sampleUV = localUV + diskOffset * ringRadius * shadowData.params.z;
-            float sampleDepth = texture(shadowMap, shadowAtlasUV(cascadeIndex, sampleUV)).r;
-            if (sampleDepth > biasedDepth) {
+            vec2 atlasUV = shadowAtlasUV(cascadeIndex, sampleUV);
+            float sampleDepth = texture(shadowMap, atlasUV).r;
+            if (sampleDepth > receiverDepth + bias) {
                 blockerDepthSum += sampleDepth;
                 ++blockerCount;
             }
@@ -154,18 +163,16 @@ float sampleShadowCascade(int cascadeIndex, vec3 worldPos, vec3 N, vec3 L)
             // sparse search disk.
             visibility = shadowPCF(cascadeIndex, localUV, biasedDepth, 1.0, 8);
         } else {
-            float averageBlockerDepth = blockerDepthSum / float(blockerCount);
-            float blockerReceiverDistance = max(averageBlockerDepth - receiverDepth, 0.0) * depthRange;
+            float blockerDistance = blockerDepthSum / float(blockerCount) - receiverDepth;
+            float blockerReceiverDistance = max(blockerDistance, 0.0) * depthRange;
             float penumbraRadius = clamp(
                 blockerReceiverDistance * shadowData.pcssParams.y / texelWorldSize,
                 shadowData.pcssSamples.z, shadowData.pcssParams.w);
-            visibility = shadowPCF(cascadeIndex, localUV, biasedDepth,
-                penumbraRadius, filterSamples);
+            visibility = shadowPCF(cascadeIndex, localUV, biasedDepth, penumbraRadius, filterSamples);
         }
     } else {
         float radius = clamp(shadowData.pcfKernelRadii[cascadeIndex], 0.0, 3.0);
-        visibility = shadowPCF(cascadeIndex, localUV, biasedDepth,
-            max(radius, 0.75), 16);
+        visibility = shadowPCF(cascadeIndex, localUV, biasedDepth, max(radius, 0.75), 16);
     }
 
     return mix(1.0, visibility, clamp(shadowData.params.y, 0.0, 1.0));

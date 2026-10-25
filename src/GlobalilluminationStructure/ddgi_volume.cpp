@@ -3,6 +3,7 @@
 #include "vk_descriptor_system.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -519,6 +520,65 @@ void DDGIVolume::cleanup()
     _initialized = false;
 }
 
+void DDGIVolume::initialize_images(VkCommandBuffer cmd)
+{
+    if (!_initialized || cmd == VK_NULL_HANDLE) {
+        throw std::logic_error("DDGI image initialization requires a volume and command buffer");
+    }
+
+    const std::array<DDGIImageResource*, 4> images = {
+        &_resources.rayData, &_resources.irradiance,
+        &_resources.distance, &_resources.probeData,
+    };
+    std::array<VkImageMemoryBarrier2, 4> barriers{};
+    uint32_t barrierCount = 0;
+    for (DDGIImageResource* image : images) {
+        if (image->layout != VK_IMAGE_LAYOUT_UNDEFINED) {
+            continue;
+        }
+        VkImageMemoryBarrier2& barrier = barriers[barrierCount++];
+        barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        barrier.srcAccessMask = VK_ACCESS_2_NONE;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image->image.image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = image->arrayLayers;
+        image->layout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    if (barrierCount == 0) {
+        return;
+    }
+
+    VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dependency.imageMemoryBarrierCount = barrierCount;
+    dependency.pImageMemoryBarriers = barriers.data();
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    const VkClearColorValue zero{};
+    for (uint32_t index = 0; index < barrierCount; ++index) {
+        VkImageMemoryBarrier2& barrier = barriers[index];
+        vkCmdClearColorImage(cmd, barrier.image, VK_IMAGE_LAYOUT_GENERAL,
+            &zero, 1, &barrier.subresourceRange);
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+            | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+            | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+            | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
 void DDGIVolume::prepare_frame(
     uint32_t frameIndex,
     uint32_t frameNumber,
@@ -773,6 +833,17 @@ void DDGIVolume::set_probe_relocation_enabled(bool enabled)
     request_history_reset();
 }
 
+void DDGIVolume::set_probe_classification_enabled(bool enabled)
+{
+    if (enabled && _desc.raysPerProbe < 32u) {
+        throw std::logic_error("DDGI probe classification requires at least 32 rays per probe");
+    }
+    if (probe_classification_enabled() == enabled) return;
+    if (enabled) _desc.flags |= DDGIVolumeFlagClassification;
+    else _desc.flags &= ~DDGIVolumeFlagClassification;
+    request_history_reset();
+}
+
 void DDGIVolume::set_fixed_ray_backface_threshold(float threshold)
 {
     if (threshold < 0.f || threshold > 1.f) {
@@ -793,6 +864,19 @@ void DDGIVolume::set_min_frontface_distance(float distance)
     }
     if (_desc.minFrontfaceDistance != distance) {
         _desc.minFrontfaceDistance = distance;
+        request_history_reset();
+    }
+}
+
+void DDGIVolume::set_surface_biases(float normalBias, float viewBias)
+{
+    if (!std::isfinite(normalBias) || !std::isfinite(viewBias)
+        || normalBias < 0.f || viewBias < 0.f) {
+        throw std::invalid_argument("DDGI surface biases must be finite and non-negative");
+    }
+    if (_desc.normalBias != normalBias || _desc.viewBias != viewBias) {
+        _desc.normalBias = normalBias;
+        _desc.viewBias = viewBias;
         request_history_reset();
     }
 }

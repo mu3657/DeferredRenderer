@@ -195,7 +195,7 @@ void VulkanEngine::init()
     // Keep the first integration comfortably below the Windows TDR budget.
     // Irradiance history will amortize a full volume update over multiple frames.
     ddgiVolumeDesc.probesUpdatedPerFrame = 8;
-    ddgiVolumeDesc.flags |= DDGIVolumeFlagRelocation;
+    ddgiVolumeDesc.flags |= DDGIVolumeFlagRelocation | DDGIVolumeFlagClassification;
     ddgiVolume.init(
         DDGIVolumeInitContext{
             _chosenGPU,
@@ -205,6 +205,12 @@ void VulkanEngine::init()
             FRAME_OVERLAP,
         },
         ddgiVolumeDesc);
+    // Raster/debug descriptors can be used before the first probe update while
+    // acceleration structures are still building. Initialize every array layer
+    // independently of Trace/Blend, and complete the submission before rendering.
+    immediate_submit([this](VkCommandBuffer cmd) {
+        ddgiVolume.initialize_images(cmd);
+    });
 
     init_gbuffer();
 	init_contactshadowimage();
@@ -489,6 +495,7 @@ void VulkanEngine::cleanup()
     if (_isInitialized) {
 
         vkDeviceWaitIdle(_device);
+        sceneScripts.set_scene(nullptr);
 		if (_ddgiTimestampPool != VK_NULL_HANDLE) {
 			vkDestroyQueryPool(_device, _ddgiTimestampPool, nullptr);
 			_ddgiTimestampPool = VK_NULL_HANDLE;
@@ -982,7 +989,13 @@ void VulkanEngine::run()
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
+        const auto previousScriptMode = sceneScripts.mode();
         draw_editor_ui();
+
+        sceneScripts.update(deltaTime);
+        if (previousScriptMode != SceneScripts::Mode::Stopped && sceneScripts.mode() == SceneScripts::Mode::Stopped) {
+            taaPass.reset_history();
+        }
 
         ImGui::Render();
 
@@ -1051,6 +1064,7 @@ void VulkanEngine::set_active_scene(const std::string& sceneName)
         return;
     }
 
+    sceneScripts.set_scene(it->second.get(), sceneName);
     activeSceneName = sceneName;
     sceneOutliner.rebuild(*it->second);
     rebuild_ray_tracing_scene(*it->second);
@@ -1174,6 +1188,7 @@ void VulkanEngine::draw_editor_ui()
     ImGui::SetNextWindowPos(ImVec2(layout.width - layout.right, layout.toolbar), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(layout.right, layout.panel_height()), ImGuiCond_Always);
     if (ImGui::Begin("Inspector", nullptr, EditorPanelFlags)) {
+        scriptInspector.draw_controls(sceneScripts);
         static int page = 0;
         constexpr const char* pages[] = {
             "Selection", "Lighting", "Shadows", "Global illumination", "Output", "Profiler"
@@ -1185,11 +1200,14 @@ void VulkanEngine::draw_editor_ui()
             switch (page) {
             case 0:
                 sceneOutliner.draw_properties(*this);
+                scriptInspector.draw_attachments(sceneScripts, sceneScripts.host().handle_for(sceneOutliner.get_selected_node()));
                 break;
             case 1:
                 if (ImGui::CollapsingHeader("Scene lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    ImGui::BeginDisabled(sceneScripts.edits_locked());
                     ImGui::PushID("SceneLights");
                     lightSystem.draw_debug_ui();
+                    ImGui::EndDisabled();
                     ImGui::PopID();
                 }
                 if (ImGui::CollapsingHeader("Clustered deferred", ImGuiTreeNodeFlags_DefaultOpen)) {

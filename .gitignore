@@ -42,13 +42,15 @@ _deps
 /build*/
 /bin/
 /cmake-build-*/
-/.runtime/taa/
-/.runtime/clustered/
+/.runtime/
 /out/
-
+/libs/
+/tools/
+/tests/
 # IDEs / Editors
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 *.suo
@@ -67,7 +69,6 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
-/.runtime/ddgi/
 /assets/
 /assets/brickadia
 third_party/*
@@ -75,12 +76,45 @@ third_party/*
 !third_party/rtxgi-ddgi/**
 *.rdc
 *.resolved
-DESCRIPTOR_SYSTEM.md
-TAA.md
-.gitignore
-DDGI_VALIDATION.md
-CLUSTERED_LIGHTING.md
 tests/clustered_validation.cpp
 tests/ddgi_validation.cpp
 tests/taa_validation.cpp
-PROJECT_TECHNICAL_OVERVIEW.md
+
+# Root-level personal notes, interview material and validation reports
+# Keep project READMEs and documentation alongside source files trackable.
+/*.md
+!/README*.md
+
+# Generated artifacts (keep after the third-party allowlist above)
+/third_party/nvlibs/
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.exp
+*.tlog
+*.lastbuildstate
+*.VC.db
+*.VC.VC.opendb
+*.spv
+.ninja_deps
+.ninja_log
+build.ninja
+rules.ninja
+
+# Python tooling caches and local virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime logs, crash captures and temporary files
+*.log
+*.dmp
+*.nv-gpudmp
+*.tmp
+*.bak
+*~

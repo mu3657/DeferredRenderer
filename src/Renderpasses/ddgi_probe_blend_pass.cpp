@@ -279,7 +279,8 @@ void make_probe_data_visible_after_relocation(
         | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
         | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     barrier.dstAccessMask =
-        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+        | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.image = probeData;
@@ -386,6 +387,10 @@ void DDGIProbeBlendPass::init(const RenderPassInitContext& ctx)
         "../cmake-build-debug/shaders/rtxgi_ddgi_probe_relocation.comp.hlsl.spv",
         "DDGIProbeRelocationCS",
         _rtxgiRelocationPipeline);
+    createRtxgiPipeline(
+        "../cmake-build-debug/shaders/rtxgi_ddgi_probe_classification.comp.hlsl.spv",
+        "DDGIProbeClassificationCS",
+        _rtxgiClassificationPipeline);
 
     VkShaderModule diagnosticModule{VK_NULL_HANDLE};
     if (!vkutil::load_shader_module(
@@ -444,6 +449,7 @@ void DDGIProbeBlendPass::cleanup()
     vkDestroyPipeline(_engine->_device, _rtxgiDistancePipeline, nullptr);
     vkDestroyPipeline(_engine->_device, _rtxgiDiagnosticPipeline, nullptr);
     vkDestroyPipeline(_engine->_device, _rtxgiRelocationPipeline, nullptr);
+    vkDestroyPipeline(_engine->_device, _rtxgiClassificationPipeline, nullptr);
     vkDestroyPipeline(_engine->_device, _relocationDiagnosticPipeline, nullptr);
     vkDestroyPipelineLayout(_engine->_device, _rtxgiPipelineLayout, nullptr);
     _pipeline = VK_NULL_HANDLE;
@@ -452,6 +458,7 @@ void DDGIProbeBlendPass::cleanup()
     _rtxgiDistancePipeline = VK_NULL_HANDLE;
     _rtxgiDiagnosticPipeline = VK_NULL_HANDLE;
     _rtxgiRelocationPipeline = VK_NULL_HANDLE;
+    _rtxgiClassificationPipeline = VK_NULL_HANDLE;
     _relocationDiagnosticPipeline = VK_NULL_HANDLE;
     _rtxgiPipelineLayout = VK_NULL_HANDLE;
     _pendingFrameStats.clear();
@@ -487,6 +494,20 @@ void DDGIProbeBlendPass::execute(DDGIProbeBlendPassContext& ctx)
     if (clearHistory) {
         _lastClearedHistorySerial = historySerial;
         _hasHistory = false;
+    }
+
+    if (ctx.volume.probe_classification_enabled()) {
+        const VkDescriptorSet set = ctx.volume.rtxgi_update_descriptor_set(ctx.frameIndex);
+        vkCmdBindDescriptorSets(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            _rtxgiPipelineLayout, 0, 1, &set, 0, nullptr);
+        rtxgi::DDGIRootConstants root{};
+        root.reductionInputSizeX = updateRange.firstProbe;
+        root.reductionInputSizeY = updateRange.probeCount;
+        vkCmdPushConstants(ctx.cmd, _rtxgiPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, rtxgi::DDGIRootConstants::GetSizeInBytes(), &root);
+        vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, _rtxgiClassificationPipeline);
+        vkCmdDispatch(ctx.cmd, (updateRange.probeCount + 31u) / 32u, 1, 1);
+        make_probe_data_visible_after_relocation(ctx.cmd, resources.probeData.image.image);
     }
 
     if (_useOfficialRTXGI) {
@@ -739,6 +760,15 @@ void DDGIProbeBlendPass::draw_debug_ui()
             relocationEnabled
                 ? "RTXGI: 32 stable fixed rays; offsets feed tracing, sampling and debug markers"
                 : "Probe offsets are zero and ignored");
+        bool classification = volume.probe_classification_enabled();
+        if (ImGui::Checkbox("Probe classification", &classification))
+            volume.set_probe_classification_enabled(classification);
+        float normalBias = volume.desc().normalBias;
+        float viewBias = volume.desc().viewBias;
+        bool biasChanged = ImGui::DragFloat("GI normal bias (m)", &normalBias, 0.001f, 0.f, 1.f, "%.3f");
+        biasChanged = ImGui::DragFloat("GI view bias (m)", &viewBias, 0.001f, 0.f, 1.f, "%.3f") || biasChanged;
+        if (biasChanged)
+            volume.set_surface_biases(normalBias, viewBias);
         ImGui::BeginDisabled(!relocationEnabled);
         float fixedBackfaceThreshold = volume.desc().fixedRayBackfaceThreshold;
         if (ImGui::SliderFloat(

@@ -159,6 +159,10 @@ struct Node : public IRenderable {
     inline static uint64_t nextTemporalID{1};
     const uint64_t temporalID{nextTemporalID++};
 
+    // Scene-local persistent identity, independent of display name and TAA.
+    // Imported nodes use the prefab's node ID; runtime nodes receive a random ID.
+    std::string persistentID;
+
     // parent pointer must be a weak pointer to avoid circular dependencies
     std::weak_ptr<Node> parent;
     std::vector<std::shared_ptr<Node>> children;
@@ -166,8 +170,8 @@ struct Node : public IRenderable {
     std::string  name;           // display name (from GLTF node name)
     bool         visible { true };  // controlled by SceneOutliner
 
-    glm::mat4 localTransform;
-    glm::mat4 worldTransform;
+    glm::mat4 localTransform{1.f};
+    glm::mat4 worldTransform{1.f};
 
     void refreshTransform(const glm::mat4& parentMatrix)
     {

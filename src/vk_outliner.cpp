@@ -443,11 +443,11 @@ void SceneOutliner::draw_outliner(VulkanEngine& engine) {
     std::shared_ptr<Node> createdNode;
     std::shared_ptr<Node> selectedNode = get_selected_node();
 
-    ImGui::BeginDisabled(scene == nullptr);
+    ImGui::BeginDisabled(scene == nullptr || engine.sceneScripts.edits_locked());
     if (ImGui::Button("+ Add")) {
         ImGui::OpenPopup("##add_node_popup");
     }
-    if (scene && ImGui::BeginPopup("##add_node_popup")) {
+    if (scene && !engine.sceneScripts.edits_locked() && ImGui::BeginPopup("##add_node_popup")) {
         draw_create_menu_items(engine, *scene, selectedNode, createdNode);
         ImGui::EndPopup();
     }
@@ -493,10 +493,12 @@ void SceneOutliner::draw_outliner(VulkanEngine& engine) {
 
         bool vis = e.visible;
         ImGui::PushID(i * 4);
+        ImGui::BeginDisabled(engine.sceneScripts.edits_locked());
         if (ImGui::Checkbox("##vis", &vis)) {
             e.visible = vis;
             if (auto n = e.node.lock()) n->visible = vis;
         }
+        ImGui::EndDisabled();
         ImGui::SetItemTooltip("Visible");
         ImGui::PopID();
         ImGui::SameLine();
@@ -538,6 +540,7 @@ void SceneOutliner::draw_outliner(VulkanEngine& engine) {
                 }
             }
             ImGui::Separator();
+            ImGui::BeginDisabled(engine.sceneScripts.edits_locked());
             if (scene) {
                 std::shared_ptr<Node> parent = e.node.lock();
                 draw_create_menu_items(engine, *scene, parent, createdNode);
@@ -553,11 +556,12 @@ void SceneOutliner::draw_outliner(VulkanEngine& engine) {
                     if (auto n = entries[j].node.lock()) n->visible = entries[j].visible;
                 }
             }
+            ImGui::EndDisabled();
             ImGui::EndPopup();
         }
     }
 
-    if (scene && ImGui::BeginPopupContextWindow(
+    if (scene && !engine.sceneScripts.edits_locked() && ImGui::BeginPopupContextWindow(
                      "##outliner_background_context",
                      ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
         draw_create_menu_items(engine, *scene, nullptr, createdNode);
@@ -577,7 +581,7 @@ void SceneOutliner::draw_outliner(VulkanEngine& engine) {
 // ─────────────────────────────────────────────────────────────────────────────
 // draw_properties()
 // ─────────────────────────────────────────────────────────────────────────────
-void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
+void SceneOutliner::draw_properties(VulkanEngine& engine) {
     auto node = get_selected_node();
     if (!node) {
         ImGui::TextDisabled("Select an object in the Hierarchy to inspect it.");
@@ -588,6 +592,7 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
     ImGui::TextUnformatted(node->name.empty() ? "(unnamed)" : node->name.c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("%s", node_icon(classify(node)));
+    ImGui::BeginDisabled(engine.sceneScripts.edits_locked());
 
     // Decompose worldTransform for display using ImGuizmo
     float matrixTranslation[3], matrixRotation[3], matrixScale[3];
@@ -671,6 +676,7 @@ void SceneOutliner::draw_properties(VulkanEngine& /*engine*/) {
         }
     }
 
+    ImGui::EndDisabled();
 }
 
 // Draw a Blender-style spotlight overlay in the viewport. This is editor-only:
@@ -813,6 +819,7 @@ void SceneOutliner::draw_light_gizmo(VulkanEngine& engine) {
 // draw_gizmo() – draws the ImGuizmo manipulator over the 3D viewport
 // ─────────────────────────────────────────────────────────────────────────────
 void SceneOutliner::draw_gizmo(VulkanEngine& engine) {
+    if (engine.sceneScripts.edits_locked()) return;
     auto node = get_selected_node();
     if (!node) return;
 

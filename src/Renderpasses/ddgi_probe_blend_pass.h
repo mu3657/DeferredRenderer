@@ -60,6 +60,7 @@ private:
     VkPipeline _rtxgiDistancePipeline{VK_NULL_HANDLE};
     VkPipeline _rtxgiDiagnosticPipeline{VK_NULL_HANDLE};
     VkPipeline _rtxgiRelocationPipeline{VK_NULL_HANDLE};
+    VkPipeline _rtxgiClassificationPipeline{VK_NULL_HANDLE};
     VkPipeline _relocationDiagnosticPipeline{VK_NULL_HANDLE};
     std::vector<DDGIProbeBlendDispatchStats> _pendingFrameStats;
     DDGIProbeBlendDispatchStats _stats{};

@@ -353,8 +353,10 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
     pushConstants.materialCount = ctx.engine.bindlessMaterialCount;
     // A lighting edit refreshes one full sweep from current light sources.
     // Feeding old indirect back during that sweep would preserve the old sun.
+    // prepare_frame counts this batch. Relighting excludes the initial sweep;
+    // equality is necessary when the batch covers the entire volume.
     const bool historyAvailable =
-        ctx.volume.history_probe_count() > updateRange.probeCount;
+        ctx.volume.history_probe_count() >= updateRange.probeCount;
     const bool useMultiBounce = _multiBounceEnabled
         && _traceMode == 3
         && !ctx.volume.relighting_this_frame()
@@ -363,7 +365,8 @@ void DDGIProbeTracePass::execute(DDGIProbeTracePassContext& ctx)
         pushConstants.flags |= DDGIProbeTraceFlagMultiBounce;
         pushConstants.multiBounceStrength = _multiBounceStrength;
     }
-    if (_wholeProbeBackfaceRejection || ctx.volume.probe_relocation_enabled()) {
+    if (_wholeProbeBackfaceRejection || ctx.volume.probe_relocation_enabled()
+        || ctx.volume.probe_classification_enabled()) {
         pushConstants.flags |= DDGIProbeTraceFlagSignedBackfaceDistance;
     }
     vkCmdPushConstants(
@@ -443,7 +446,7 @@ void DDGIProbeTracePass::notify_frame_completed(uint32_t frameIndex)
             &diagnostics.maxProbeOffsetBits,
             sizeof(maxProbeOffset));
         fmt::println(
-            "DDGI GPU diagnostic: ray radiance nonzero {}/{}, max {:.6f}, hits front/back/miss {}/{}/{}, nonfinite {}; irradiance texels nonzero {}/{}, max {:.6f}, nonfinite {}; relocation moved {}/{}, max offset {:.4f}, nonfinite {}",
+            "DDGI GPU diagnostic: ray radiance nonzero {}/{}, max {:.6f}, hits front/back/miss {}/{}/{}, nonfinite {}; irradiance texels nonzero {}/{}, max {:.6f}, nonfinite {}; relocation moved {}/{}, max offset {:.4f} cells, nonfinite {}",
             diagnostics.nonZeroRadianceRays,
             diagnostics.rayCount,
             maxRadiance,
@@ -504,9 +507,8 @@ void DDGIProbeTracePass::draw_debug_ui()
         ImGui::TextDisabled("Multi-bounce is applied only in Full Radiance mode");
     } else if (_engine
         && _engine->ddgiVolume.initialized()
-        && _engine->ddgiVolume.history_probe_count()
-            <= _engine->ddgiVolume.update_range().probeCount) {
-        ImGui::TextDisabled("Waiting for the first direct-light probe batch");
+        && _engine->ddgiVolume.relighting_this_frame()) {
+        ImGui::TextDisabled("Refreshing direct-light probe batches");
     } else {
         ImGui::Text("Last dispatch multi-bounce: %s", _stats.multiBounce != 0u ? "on" : "off");
     }
@@ -517,13 +519,15 @@ void DDGIProbeTracePass::draw_debug_ui()
         && _engine->ddgiVolume.initialized()) {
         _engine->ddgiVolume.request_history_reset();
     }
-    ImGui::TextDisabled(
-        _engine && _engine->ddgiVolume.initialized()
-                && _engine->ddgiVolume.probe_relocation_enabled()
-            ? "Signed backface distances are required by probe relocation"
-            : _wholeProbeBackfaceRejection
-            ? "Signed backface distances can reject an entire probe update"
-            : "Backface radiance is discarded without rejecting the entire probe");
+    if (_engine && _engine->ddgiVolume.initialized()
+        && (_engine->ddgiVolume.probe_relocation_enabled()
+            || _engine->ddgiVolume.probe_classification_enabled())) {
+        ImGui::TextDisabled("Relocation/classification require signed backface distances");
+    } else if (_wholeProbeBackfaceRejection) {
+        ImGui::TextDisabled("Signed backface distances can reject an entire probe update");
+    } else {
+        ImGui::TextDisabled("Backface radiance is discarded without rejecting the entire probe");
+    }
     if (_engine && _engine->ddgiVolume.initialized()) {
         const DDGIVolume& volume = _engine->ddgiVolume;
         const DDGIProbeUpdateRange range = volume.update_range();

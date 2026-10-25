@@ -121,7 +121,8 @@ void main()
     } else if (pushConstants.countsAndMode.w == MODE_RELOCATION) {
         uvec3 coordinates = probeTextureCoordinates(inProbeIndex);
         vec3 offset = texelFetch(probeData, ivec3(coordinates), 0).xyz;
-        vec3 normalizedOffset = offset / max(volume.spacingHysteresis.xyz, vec3(1e-4));
+        // RTXGI stores offsets in probe-cell units, not meters.
+        vec3 normalizedOffset = offset;
         float relocationAmount = clamp(length(normalizedOffset) / 0.45, 0.0, 1.0);
         color = relocationAmount > 1e-4
             ? mix(vec3(0.12, 0.55, 1.0), vec3(1.0, 0.12, 0.02), relocationAmount)

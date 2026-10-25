@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// Test-only hard-visibility reference. Masked occluders are flagged so the
+// analysis excludes them instead of treating solid alpha cards as ground truth.
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0, binding=0) uniform accelerationStructureEXT sceneAS;
+layout(set=0, binding=1) uniform sampler2D depthImage;
+layout(set=0, binding=2) uniform sampler2D normalImage;
+layout(std430, set=0, binding=3) writeonly buffer Result { vec4 pixels[]; } outputData;
+struct Geometry { uvec2 vertexAddress; uvec2 indexAddress; uvec4 rangeMaterial; uvec4 flags; };
+layout(std430, set=0, binding=4) readonly buffer Geometries { Geometry items[]; } geometryData;
+layout(std430, set=0, binding=5) readonly buffer Instances { uvec4 items[]; } instanceData;
+layout(push_constant) uniform Constants {
+    mat4 inverseViewProjection;
+    vec4 toLight;
+    vec4 viewDepthRow;
+    uvec4 extent;
+} constants;
+
+void main()
+{
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(pixel, constants.extent.xy))) return;
+    uint index = pixel.y * constants.extent.x + pixel.x;
+    float depth = texelFetch(depthImage, ivec2(pixel), 0).r;
+    if (depth <= 0.0) { outputData.pixels[index] = vec4(1, 0, 0, 0); return; }
+    vec2 uv = (vec2(pixel)+0.5)/vec2(constants.extent.xy);
+    vec4 point = constants.inverseViewProjection * vec4(uv*2.0-1.0, depth, 1.0);
+    vec3 world = point.xyz / point.w;
+    vec3 N = normalize(texelFetch(normalImage, ivec2(pixel), 0).xyz*2.0-1.0);
+    vec3 L = normalize(constants.toLight.xyz);
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAS,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xff,
+        world + N*0.002 + L*0.001, 0.0001, L, 500.0);
+    while (rayQueryProceedEXT(query)) {}
+    bool hit = rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+    float masked = 0.0;
+    if (hit) {
+        uint instance = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+        uint geometry = instanceData.items[instance].x + rayQueryGetIntersectionGeometryIndexEXT(query, true);
+        masked = (geometryData.items[geometry].flags.x & 1u) != 0u ? 1.0 : 0.0;
+    }
+    outputData.pixels[index] = vec4(hit ? 0.0 : 1.0,
+        dot(constants.viewDepthRow, vec4(world, 1.0)), masked, 1.0);
+}

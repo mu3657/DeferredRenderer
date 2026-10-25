@@ -16,7 +16,7 @@ layout (location = 7) flat in uint inHistoryValid;
 // G-Buffer MRT outputs
 layout (location = 0) out vec4 outAlbedo;       // RT0: rgb = albedo, a = unused
 layout (location = 1) out vec4 outNormal;        // RT1: rgb = world normal ([-1,1] -> [0,1]), a = metallic
-layout (location = 2) out vec4 outMaterial;      // RT2: r = roughness, g = ao, b/a = reserved
+layout (location = 2) out vec4 outMaterial;      // RT2: roughness, ao, reserved, reserved
 layout (location = 3) out vec4 outEmissive;      // RT3: rgb = linear HDR emissive
 layout (location = 4) out vec4 outMotion; // xy = previous-current UV, z = previous view depth, w = valid
 

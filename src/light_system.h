@@ -22,6 +22,7 @@ public:
     const GPULightData& light_data() const { return _lightData; }
     const std::vector<GPULight>& lights() const { return _cpuLights; }
     GPULight GetDirectionalLight();
+    void set_fallback_directional_enabled(bool enabled) { _enableFallbackDirectional = enabled; }
 private:
     struct GIResponseReference {
         GPULight light{};

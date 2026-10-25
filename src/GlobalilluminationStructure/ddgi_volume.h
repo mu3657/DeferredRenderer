@@ -142,7 +142,7 @@ struct DDGIVolumeResources {
     DDGIImageResource irradiance{};
     DDGIImageResource distance{};
     // probeData: width = probeCountX, height = probeCountZ. xyz relocation
-    // offset, w classification state.
+    // offset in probe-cell units (multiply by spacing for meters), w state.
     DDGIImageResource probeData{};
 
     VkSampler bilinearSampler{VK_NULL_HANDLE};
@@ -170,6 +170,11 @@ public:
 
     void init(const DDGIVolumeInitContext& ctx, const DDGIVolumeDesc& desc);
     void cleanup();
+
+    // Submit after init and before any shader access, including frames where
+    // BLAS/TLAS construction prevents the trace and blend passes from running.
+    // Initializes storage only; it does not make probe lighting history valid.
+    void initialize_images(VkCommandBuffer cmd);
 
     // Updates only frame-local constants and descriptors. Probe history remains shared.
     void prepare_frame(
@@ -200,14 +205,19 @@ public:
     void set_scroll_offsets(const glm::ivec3& offsets);
     void set_random_ray_backface_threshold(float threshold);
     void set_probe_relocation_enabled(bool enabled);
+    void set_probe_classification_enabled(bool enabled);
     void set_fixed_ray_backface_threshold(float threshold);
     void set_min_frontface_distance(float distance);
+    void set_surface_biases(float normalBias, float viewBias);
     void set_probes_updated_per_frame(uint32_t probeCount);
 
     bool initialized() const { return _initialized; }
     bool enabled() const { return (_desc.flags & DDGIVolumeFlagEnabled) != 0; }
     bool probe_relocation_enabled() const {
         return (_desc.flags & DDGIVolumeFlagRelocation) != 0;
+    }
+    bool probe_classification_enabled() const {
+        return (_desc.flags & DDGIVolumeFlagClassification) != 0;
     }
 
     uint32_t total_probe_count() const;

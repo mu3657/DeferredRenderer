@@ -450,6 +450,7 @@ std::shared_ptr<LoadedScene> AssetManager::load_prefab(const std::string& path) 
         }
 
         newNode->name = name;
+        newNode->persistentID = "prefab/" + std::to_string(nodeID);
         scene->nodes[name] = newNode;
         nodeMap[nodeID] = newNode;
     }

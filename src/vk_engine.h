@@ -31,6 +31,8 @@
 #include "Renderpasses/tone_map_pass.h"
 #include "Renderpasses/taa_pass.h"
 #include "environment_lighting.h"
+#include "scene_scripts.h"
+#include "script_inspector.h"
 
 #include <array>
 
@@ -241,7 +243,7 @@ public:
 	AllocatedImage _contactShadowImage;
 	AllocatedImage _gAlbedo;   // linear base color
 	AllocatedImage _gNormal;   // encoded world normal + metallic
-	AllocatedImage _gORM;      // roughness + ambient occlusion
+	AllocatedImage _gORM;      // roughness + ambient occlusion + octahedral geometric normal
 	AllocatedImage _gEmissive; // linear HDR emissive
 
 	VkExtent2D _drawExtent;
@@ -318,6 +320,10 @@ public:
 	std::vector<std::string> sceneLibrary;
 	std::string activeSceneName;
 
+    // Destroy scripting before loadedScenes; its adapter keeps weak node references.
+    SceneScripts sceneScripts;
+    ScriptInspector scriptInspector;
+
 #pragma region DebugVariables
 	EngineStats stats;
 	RENDERDOC_API_1_1_2* rdoc_api = nullptr;
@@ -349,7 +355,10 @@ public:
 	//run main loop
 	void run();
     int run_taa_validation();
+    int run_taa_sponza_validation();
+    int run_cornell_validation();
     int run_clustered_validation();
+    int run_scripting_validation();
     int run_ddgi_validation(bool temporal = false, bool rotation = false, int responseMode = 0);
 	void immediate_submit(std::function<void(VkCommandBuffer cmd)>&& function);
 	RenderPassFrameContext make_pass_frame_context(VkCommandBuffer cmd);

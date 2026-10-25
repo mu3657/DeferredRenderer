@@ -20,6 +20,12 @@ set(SDL_LIBC ON CACHE BOOL "" FORCE)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 add_subdirectory(third_party)
 
+# The scripting runtime can also be configured on its own without Vulkan.
+add_subdirectory(src/scripting)
+if(SCRIPTING_BUILD_TESTS)
+    enable_testing()
+endif()
+
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
 set (CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
 
@@ -102,15 +108,15 @@ foreach(HLSL ${HLSL_SOURCE_FILES})
     list(APPEND SPIRV_BINARY_FILES ${SPIRV})
 endforeach()
 
-# Compile the canonical RTXGI probe blending kernels as Vulkan SPIR-V. These
-# binaries are intentionally kept separate from the active custom DDGI path
-# until the runtime resources use RTXGI's Texture2DArray layout and packed
-# constants ABI.
+# Compile the project-local RTXGI kernels, including the renderer's batching
+# and temporal-response adaptations. Keep their SDK-relative include layout.
+set(RTXGI_DDGI_SOURCE_DIR
+    "${PROJECT_SOURCE_DIR}/src/GlobalilluminationStructure/rtxgi")
 set(RTXGI_DDGI_SHADER_DIR
-    "${PROJECT_SOURCE_DIR}/third_party/rtxgi-ddgi/rtxgi-sdk/shaders")
+    "${RTXGI_DDGI_SOURCE_DIR}/shaders")
 file(GLOB_RECURSE RTXGI_DDGI_SHADER_DEPENDENCIES CONFIGURE_DEPENDS
     "${RTXGI_DDGI_SHADER_DIR}/*.hlsl"
-    "${PROJECT_SOURCE_DIR}/third_party/rtxgi-ddgi/rtxgi-sdk/include/rtxgi/*.h")
+    "${RTXGI_DDGI_SOURCE_DIR}/include/rtxgi/*.h")
 
 function(add_rtxgi_ddgi_blend_shader OUTPUT_NAME BLEND_RADIANCE OUTPUT_BINDING PROBE_TEXELS PROBE_INTERIOR_TEXELS)
     if(NOT DXC_EXECUTABLE)
@@ -154,7 +160,7 @@ function(add_rtxgi_ddgi_blend_shader OUTPUT_NAME BLEND_RADIANCE OUTPUT_BINDING P
             -Fo "${SPIRV}"
             "${RTXGI_DDGI_SHADER_DIR}/ddgi/ProbeBlendingCS.hlsl"
         DEPENDS ${RTXGI_DDGI_SHADER_DEPENDENCIES}
-        COMMENT "Compiling official RTXGI-DDGI ${OUTPUT_NAME}"
+        COMMENT "Compiling project-local RTXGI-DDGI ${OUTPUT_NAME}"
         VERBATIM)
     set(SPIRV_BINARY_FILES ${SPIRV_BINARY_FILES} ${SPIRV} PARENT_SCOPE)
 endfunction()
@@ -191,7 +197,7 @@ function(add_rtxgi_ddgi_probe_management_shader OUTPUT_NAME SOURCE_NAME ENTRY_PO
             -Fo "${SPIRV}"
             "${RTXGI_DDGI_SHADER_DIR}/ddgi/${SOURCE_NAME}"
         DEPENDS ${RTXGI_DDGI_SHADER_DEPENDENCIES}
-        COMMENT "Compiling official RTXGI-DDGI ${OUTPUT_NAME}"
+        COMMENT "Compiling project-local RTXGI-DDGI ${OUTPUT_NAME}"
         VERBATIM)
     set(SPIRV_BINARY_FILES ${SPIRV_BINARY_FILES} ${SPIRV} PARENT_SCOPE)
 endfunction()

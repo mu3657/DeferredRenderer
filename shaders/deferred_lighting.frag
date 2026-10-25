@@ -48,6 +48,7 @@ layout(set = 6, binding = 1) uniform sampler2D environmentBrdfLut;
 layout(set = 6, binding = 2) uniform sampler2D environmentPanorama;
 
 const uint DDGI_VOLUME_FLAG_RELOCATION = 1u << 1;
+const uint DDGI_VOLUME_FLAG_CLASSIFICATION = 1u << 2;
 
 #include "shadow_sampling.glsl"
 
@@ -194,7 +195,7 @@ vec3 ddgiProbeWorldPosition(uvec3 coordinates)
         position += texelFetch(
             ddgiProbeData,
             ivec3(coordinates.x, coordinates.z, coordinates.y),
-            0).xyz;
+            0).xyz * ddgiVolume.spacingHysteresis.xyz;
     }
     return position;
 }
@@ -317,6 +318,8 @@ DDGISample sampleDDGI(vec3 worldPosition, vec3 normal, vec3 viewDirection)
         float trilinearWeight = cornerWeight.x * cornerWeight.y * cornerWeight.z;
 
         uvec3 probeCoordinatesU = uvec3(coordinates);
+        if ((ddgiVolume.frameAndFlags.y & DDGI_VOLUME_FLAG_CLASSIFICATION) != 0u
+            && texelFetch(ddgiProbeData, ivec3(coordinates.x, coordinates.z, coordinates.y), 0).w > 0.5) continue;
         uint probeIndex = ddgiProbeIndex(probeCoordinatesU);
         vec3 probePosition = ddgiProbeWorldPosition(probeCoordinatesU);
         vec2 visibilityAndValidity = sampleDDGIVisibility(
@@ -372,7 +375,7 @@ void accumulateDirectLight(
     if (type == LIGHT_TYPE_DIRECTIONAL) {
         // directionType.xyz is the light emission direction. Shading uses the surface-to-light vector.
         L = normalize(-light.directionType.xyz);
-        if (directionalSeen == 0u) {
+        if (directionalSeen == 0u && light.params.w > 0.0) {
             visibility = sampleDirectionalShadow(worldPos, N, L);
             visibility = min(visibility, texture(contactShadowTexture, screenUV).r);
         }
@@ -446,7 +449,6 @@ void main()
     // We need inverse view-projection to reconstruct the world pos
     mat4 invViewProj = inverse(sceneData.viewproj);
     vec3 worldPos = reconstructPosition(inUV, depth, invViewProj);
-    
     // Camera position (can be extracted from inverse view matrix)
     vec3 camPos = inverse(sceneData.view)[3].xyz;
     vec3 V = normalize(camPos - worldPos);

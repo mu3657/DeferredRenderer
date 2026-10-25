@@ -177,7 +177,7 @@ void main()
 
         if (type == LIGHT_TYPE_DIRECTIONAL) {
             L = normalize(-light.directionType.xyz);
-            if (directionalSeen == 0u) {
+            if (directionalSeen == 0u && light.params.w > 0.0) {
                 visibility = sampleDirectionalShadow(inWorldPos, N, L);
             }
             directionalSeen++;

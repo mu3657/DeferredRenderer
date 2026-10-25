@@ -376,8 +376,8 @@ void LightSystem::draw_debug_ui()
     GPULight defaultDirectionalLight = {};
     defaultDirectionalLight.positionRange = glm::vec4(0.f, 0.f, 0.f, 0.f);
     defaultDirectionalLight.directionType = glm::vec4(0.f, -1.f, 0.f, static_cast<float>(light_type_to_uint(LightType::Directional)));
-    defaultDirectionalLight.colorIntensity = glm::vec4(1.f, 1.f, 1.f, 1.f);
-    defaultDirectionalLight.params = glm::vec4(1.f, 1.f, -1.f, 1.f);
+    defaultDirectionalLight.colorIntensity = glm::vec4(0.f);
+    defaultDirectionalLight.params = glm::vec4(1.f, 1.f, -1.f, 0.f);
     defaultDirectionalLight.areaRight = glm::vec4(0.f);
     defaultDirectionalLight.areaUp = glm::vec4(0.f);
 

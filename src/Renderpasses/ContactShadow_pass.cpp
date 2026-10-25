@@ -205,7 +205,8 @@ void ContactShadowPass::execute(ContactShadowPassContext& ctx)
         _surfaceThickness,
         _bilinearThreshold,
         _shadowContrast,
-        _enabled ? _strength : 0.f);
+        _enabled && directionalLight.params.w > 0.f
+            && directionalLight.colorIntensity.w > 0.f ? _strength : 0.f);
     pushConstants.depthParams = glm::vec4(
         1.f / static_cast<float>(ctx.engine._depthImage.imageExtent.width),
         1.f / static_cast<float>(ctx.engine._depthImage.imageExtent.height),

@@ -155,6 +155,7 @@ const uint LIGHT_TYPE_RECT_AREA = 3u;
 const uint TRACE_FLAG_MULTI_BOUNCE = 1u << 0;
 const uint TRACE_FLAG_SIGNED_BACKFACE_DISTANCE = 1u << 1;
 const uint DDGI_VOLUME_FLAG_RELOCATION = 1u << 1;
+const uint DDGI_VOLUME_FLAG_CLASSIFICATION = 1u << 2;
 const float PI = 3.14159265358979323846;
 const float GOLDEN_RATIO_CONJUGATE = 0.6180339887498948482;
 const uint RTXGI_FIXED_RAY_COUNT = 32u;
@@ -221,9 +222,9 @@ bool candidate_passes_alpha_test(
     RayTracingInstance instance = instances[instanceIndex];
     RayTracingGeometry geometry =
         geometries[instance.geometryMetadataOffset + geometryIndex];
-    if (!frontFace && (geometry.flags & GEOMETRY_DOUBLE_SIDED) == 0u) {
-        return false;
-    }
+    // Probe containment and segment visibility need geometric back faces even
+    // for single-sided raster materials. Culling them made embedded probes
+    // see through boxes, report zero backfaces and evade relocation/classification.
     if ((geometry.flags & GEOMETRY_ALPHA_TESTED) == 0u) {
         return true;
     }
@@ -261,7 +262,7 @@ vec3 fibonacci_direction(uint rayIndex, uint rayCount)
 vec3 probe_ray_direction(uint rayIndex, uint rayCount)
 {
     bool relocationEnabled =
-        (volume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u;
+        (volume.frameAndFlags.y & (DDGI_VOLUME_FLAG_RELOCATION | DDGI_VOLUME_FLAG_CLASSIFICATION)) != 0u;
     bool fixedRay = relocationEnabled && rayIndex < RTXGI_FIXED_RAY_COUNT;
     uint sampleIndex = fixedRay ? rayIndex : rayIndex - (relocationEnabled ? RTXGI_FIXED_RAY_COUNT : 0u);
     uint sampleCount = fixedRay
@@ -294,7 +295,7 @@ vec3 probe_world_position(uint probeIndex)
         uvec3 probeCoordinates = probe_coordinates(probeIndex);
         position += imageLoad(
             probeData,
-            ivec3(probeCoordinates.x, probeCoordinates.z, probeCoordinates.y)).xyz;
+            ivec3(probeCoordinates.x, probeCoordinates.z, probeCoordinates.y)).xyz * volume.spacingHysteresis.xyz;
     }
     return position;
 }
@@ -306,7 +307,7 @@ vec3 probe_world_position(uvec3 coordinates)
         + vec3(scrolledCoordinates) * volume.spacingHysteresis.xyz;
     if ((volume.frameAndFlags.y & DDGI_VOLUME_FLAG_RELOCATION) != 0u) {
         position += imageLoad(
-            probeData, ivec3(coordinates.x, coordinates.z, coordinates.y)).xyz;
+            probeData, ivec3(coordinates.x, coordinates.z, coordinates.y)).xyz * volume.spacingHysteresis.xyz;
     }
     return position;
 }
@@ -457,6 +458,10 @@ vec4 sample_previous_ddgi(
             cornerWeight.x * cornerWeight.y * cornerWeight.z;
 
         uvec3 coordinatesU = uvec3(cornerCoordinates);
+        // Inactive probes may retain old atlas values and must not darken or
+        // illuminate the normalized interpolation of the remaining support.
+        if ((volume.frameAndFlags.y & DDGI_VOLUME_FLAG_CLASSIFICATION) != 0u
+            && imageLoad(probeData, ivec3(coordinatesU.x, coordinatesU.z, coordinatesU.y)).w > 0.5) continue;
         uint probeIndex = probe_index(coordinatesU);
         vec3 probePosition = probe_world_position(coordinatesU);
         vec2 visibilityAndValidity = sample_probe_visibility(
@@ -585,9 +590,21 @@ vec3 evaluate_light_incident(
         return vec3(0.0);
     }
     if (traceShadow) {
-        vec3 shadowOrigin = worldPosition
-            + worldNormal * max(volume.biasAndEncoding.x, 0.002);
-        if (!trace_visibility(shadowOrigin, directionToLight, shadowDistance)) {
+        float gridScale = min(volume.spacingHysteresis.x, min(volume.spacingHysteresis.y, volume.spacingHysteresis.z));
+        vec3 shadowOrigin = worldPosition + worldNormal * clamp(gridScale * 0.01, 0.0001, 0.002);
+        // The DDGI lookup bias can be a large fraction of a cell. Reusing it
+        // here moves shadow rays through nearby blockers. Trace to the actual
+        // emitter from this small geometric offset instead.
+        vec3 shadowDirection = directionToLight;
+        if (lightType != LIGHT_TYPE_DIRECTIONAL) {
+            vec3 shadowDelta = light.positionRange.xyz - shadowOrigin;
+            // Area samples already chose a point along directionToLight.
+            if (lightType == LIGHT_TYPE_RECT_AREA)
+                shadowDelta = worldPosition + directionToLight * (shadowDistance + 0.002) - shadowOrigin;
+            shadowDistance = max(length(shadowDelta) - 0.001, 0.001);
+            shadowDirection = normalize(shadowDelta);
+        }
+        if (!trace_visibility(shadowOrigin, shadowDirection, shadowDistance)) {
             return vec3(0.0);
         }
     }
@@ -687,6 +704,11 @@ void main()
     vec3 rayOrigin = probe_world_position(probeIndex);
     vec3 rayDirection = probe_ray_direction(rayIndex, raysPerProbe);
     float maxRayDistance = volume.originMaxRayDistance.w;
+    float gridScale = min(volume.spacingHysteresis.x, min(volume.spacingHysteresis.y, volume.spacingHysteresis.z));
+    // A fixed 1 cm near clip can jump over a nearby front face, then classify
+    // its far face as a backface. Dense Cornell probes expose this as black
+    // vertical stripes even when the probe is just outside the box.
+    float rayMinDistance = clamp(gridScale * 0.001, 0.00001, 0.001);
 
     rayQueryEXT query;
     rayQueryInitializeEXT(
@@ -695,7 +717,7 @@ void main()
         gl_RayFlagsSkipClosestHitShaderEXT,
         0xff,
         rayOrigin,
-        0.01,
+        rayMinDistance,
         rayDirection,
         maxRayDistance);
     while (rayQueryProceedEXT(query)) {
@@ -727,14 +749,9 @@ void main()
     if (hasHit) {
         float hitDistance = rayQueryGetIntersectionTEXT(query, true);
         frontFace = rayQueryGetIntersectionFrontFaceEXT(query, true);
-        // RTXGI's official irradiance blend rejects the entire probe once the
-        // number of negative distances reaches its backface threshold. Until
-        // relocation/classification is active this can leave dense indoor
-        // scenes permanently black, because rejected probes never establish
-        // history. Backface radiance remains zero below; keep distance positive
-        // by default so valid front-face and miss samples can still initialize
-        // the probe. Signed distances remain available as an explicit debug
-        // option and for the future relocation/classification path.
+        // Relocation/classification need the geometric backface sign. Other
+        // debug configurations can keep unsigned distance, but backface hit
+        // radiance stays zero in the production lighting modes.
         bool preserveBackfaceSign =
             (pushConstants.flags & TRACE_FLAG_SIGNED_BACKFACE_DISTANCE) != 0u;
         // RTXGI stores backface distances at one fifth magnitude. The official
@@ -875,6 +892,7 @@ void main()
         radiance = vec3(0.0, 0.2, 1.0);
     }
 
+    if (hasHit && !frontFace && pushConstants.traceMode <= 3u) radiance = vec3(0.0);
     bool nonFiniteRadiance = any(isnan(radiance)) || any(isinf(radiance));
     vec3 storedRadiance = nonFiniteRadiance
         ? vec3(0.0)

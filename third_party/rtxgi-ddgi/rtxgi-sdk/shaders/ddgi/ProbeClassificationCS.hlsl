@@ -97,6 +97,11 @@ void DDGIProbeClassificationCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 
     // Compute the probe index for this thread
     uint probeIndex = DispatchThreadID.x;
+#if RTXGI_DDGI_RELOCATION_USE_ROOT_DISPATCH_BASE
+    uint3 updateRange = GetReductionInputSize();
+    if (DispatchThreadID.x >= updateRange.y) return;
+    probeIndex += updateRange.x;
+#endif
 
 #if RTXGI_DDGI_BINDLESS_RESOURCES
     #if RTXGI_BINDLESS_TYPE == RTXGI_BINDLESS_TYPE_DESCRIPTOR_HEAP
@@ -107,6 +112,13 @@ void DDGIProbeClassificationCS(uint3 DispatchThreadID : SV_DispatchThreadID)
 
     // Get the volume's constants
     DDGIVolumeDescGPU volume = UnpackDDGIVolumeDescGPU(DDGIVolumes[volumeIndex]);
+#if RTXGI_DDGI_RELOCATION_USE_ROOT_DISPATCH_BASE
+    // Match the renderer's batched X,Y,Z scheduler to RTXGI's X,Z,Y storage.
+    int3 gridCoords = int3(probeIndex % volume.probeCounts.x,
+        (probeIndex / volume.probeCounts.x) % volume.probeCounts.y,
+        probeIndex / (volume.probeCounts.x * volume.probeCounts.y));
+    probeIndex = DDGIGetProbeIndex(gridCoords, volume);
+#endif
 
     // Early out: if this thread maps past the number of probes in the volume
     int numProbes = (volume.probeCounts.x * volume.probeCounts.y * volume.probeCounts.z);
@@ -160,6 +172,27 @@ void DDGIProbeClassificationCS(uint3 DispatchThreadID : SV_DispatchThreadID)
         ProbeData[outputCoords].w = RTXGI_DDGI_PROBE_STATE_INACTIVE;
         return;
     }
+
+#if RTXGI_DDGI_RELOCATION_USE_ROOT_DISPATCH_BASE
+    // A fixed-ray containment test can pass while the current random ray set
+    // exceeds the irradiance blend's stricter rejection threshold. Exclude that
+    // same support before blending so a rejected black tile cannot darken the
+    // normalized surface/recursive interpolation. All probes are retraced on
+    // their normal schedule, including inactive ones, so this is recoverable.
+    uint randomBackfaces = 0;
+    uint maxBackfaces = max(1u, uint((volume.probeNumRays - RTXGI_DDGI_NUM_FIXED_RAYS)
+        * volume.probeRandomRayBackfaceThreshold));
+    for (int randomRay = RTXGI_DDGI_NUM_FIXED_RAYS; randomRay < volume.probeNumRays; ++randomRay)
+    {
+        int3 rayCoords = DDGIGetRayDataTexelCoords(randomRay, probeIndex, volume);
+        randomBackfaces += DDGILoadProbeRayDistance(RayData, rayCoords, volume) < 0.f;
+    }
+    if (randomBackfaces >= maxBackfaces)
+    {
+        ProbeData[outputCoords].w = RTXGI_DDGI_PROBE_STATE_INACTIVE;
+        return;
+    }
+#endif
 
     // Get the world space position of the probe
     int3 probeCoords = DDGIGetProbeCoords(probeIndex, volume);

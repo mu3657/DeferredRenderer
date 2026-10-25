@@ -1,0 +1,60 @@
+#version 460
+#extension GL_EXT_ray_query : require
+// Test-only finite-angular directional emitter plus 4x4 pixel coverage.
+// Uses scene triangles rather than the shadow atlas or PCSS blocker estimator.
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0,binding=0) uniform accelerationStructureEXT sceneAS;
+layout(set=0,binding=1) uniform sampler2D depthImage;
+layout(set=0,binding=2) uniform sampler2D normalImage;
+layout(std430,set=0,binding=3) writeonly buffer Result { vec4 pixels[]; } result;
+layout(push_constant) uniform Constants {
+    mat4 inverseVP;
+    vec4 camera;
+    vec4 light; // direction toward light, tan(half angular radius)
+    uvec4 extent; // xy image size, z samples
+} constants;
+void main()
+{
+    uvec2 pixel=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(pixel,constants.extent.xy))) return;
+    uint index=pixel.y*constants.extent.x+pixel.x;
+    float depth=texelFetch(depthImage,ivec2(pixel),0).r;
+    if(depth<=0.0) {result.pixels[index]=vec4(1,0,0,0);return;}
+    vec2 uv=(vec2(pixel)+0.5)/vec2(constants.extent.xy);
+    vec4 point=constants.inverseVP*vec4(uv*2.0-1.0,depth,1.0);
+    vec3 P=point.xyz/point.w;
+    vec3 N=normalize(texelFetch(normalImage,ivec2(pixel),0).xyz*2.0-1.0);
+    bool samePlane=true;
+    const ivec2 offsets[4]=ivec2[](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    // Pixel-area reference applies within a receiver plane. Geometry silhouettes
+    // are excluded from the metrics and retain centre coverage in the preview.
+    for(int k=0;k<4;++k){
+        ivec2 neighbour=clamp(ivec2(pixel)+offsets[k],ivec2(0),ivec2(constants.extent.xy)-1);
+        float z=texelFetch(depthImage,neighbour,0).r;
+        vec4 q=constants.inverseVP*vec4((vec2(neighbour)+0.5)/vec2(constants.extent.xy)*2.0-1.0,z,1);
+        if(z<=0.0 || abs(dot(q.xyz/q.w-P,N))>0.001)samePlane=false;
+    }
+    vec3 L=normalize(constants.light.xyz);
+    vec3 U=normalize(cross(L,abs(L.y)<0.95?vec3(0,1,0):vec3(1,0,0)));
+    vec3 V=cross(L,U);
+    float visible=0.0;
+    for(uint i=0u;i<constants.extent.z;++i) {
+        vec2 pixelOffset=(vec2(i&3u,(i>>2u)&3u)+0.5)/4.0-0.5;
+        if(!samePlane)pixelOffset=vec2(0);
+        vec4 nearPoint=constants.inverseVP*vec4((uv+pixelOffset/vec2(constants.extent.xy))*2.0-1.0,1,1);
+        vec3 cameraRay=normalize(nearPoint.xyz/nearPoint.w-constants.camera.xyz);
+        float planeDenominator=dot(N,cameraRay);
+        vec3 origin=P;
+        if(abs(planeDenominator)>1e-5)
+            origin=constants.camera.xyz+cameraRay*dot(N,P-constants.camera.xyz)/planeDenominator;
+        float radius=sqrt((float(i)+0.5)/float(constants.extent.z));
+        float angle=float(i)*2.399963229728653;
+        vec3 direction=normalize(L+constants.light.w*radius*(U*cos(angle)+V*sin(angle)));
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query,sceneAS,gl_RayFlagsOpaqueEXT|gl_RayFlagsTerminateOnFirstHitEXT,
+            0xff,origin+N*0.0001,0.00001,direction,500.0);
+        while(rayQueryProceedEXT(query)) {}
+        visible+=rayQueryGetIntersectionTypeEXT(query,true)==gl_RayQueryCommittedIntersectionNoneEXT?1.0:0.0;
+    }
+    result.pixels[index]=vec4(visible/float(constants.extent.z),max(dot(N,L),0.0),0,1);
+}

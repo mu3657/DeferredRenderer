@@ -63,8 +63,10 @@ struct GPUShadowData {
     glm::vec4 lightDir;
     glm::vec4 params; // bias in shadow texels, strength, texelSize, enabled
     glm::vec4 pcssParams; // enabled, tan(sun half angle), max search radius, max filter radius (texels)
-    glm::vec4 pcssSamples; // blocker samples, filter samples, minimum filter radius (texels), unused
+    glm::vec4 pcssSamples; // blocker samples, filter samples, minimum filter radius (texels), reserved
 };
+static_assert(offsetof(GPUShadowData, pcssSamples) == 384);
+static_assert(sizeof(GPUShadowData) == 400);
 
 struct GPUPunctualShadow {
     glm::mat4 lightViewProj[MAX_PUNCTUAL_SHADOW_FACES];

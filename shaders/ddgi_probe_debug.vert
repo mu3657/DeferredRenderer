@@ -88,7 +88,7 @@ void main()
             probePosition += texelFetch(
                 probeData,
                 ivec3(coordinates.x, coordinates.z, coordinates.y),
-                0).xyz;
+                0).xyz * volume.spacingHysteresis.xyz;
         }
     }
     vec3 worldPosition = probePosition

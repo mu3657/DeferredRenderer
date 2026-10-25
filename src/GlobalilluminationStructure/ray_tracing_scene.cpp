@@ -497,8 +497,11 @@ void RayTracingScene::record_builds(VkCommandBuffer cmd, uint32_t frameIndex)
                 &pending.sizes);
 
             RayTracingBLAS& blas = _blases[meshIndex];
+
             destroy_acceleration_structure(
                 functions, _device, _allocator, blas.accelerationStructure);
+
+
             blas.accelerationStructure = create_acceleration_structure(
                 functions,
                 _device,
@@ -552,6 +555,10 @@ void RayTracingScene::record_builds(VkCommandBuffer cmd, uint32_t frameIndex)
             frame.instanceCapacity = static_cast<uint32_t>(_instances.size());
         }
 
+
+        // The instance buffer is used as input to the TLAS build, and the metadata buffer is used by shaders to access geometry information.
+        // Both buffers are mapped and written to by the CPU, and then flushed to ensure visibility to the GPU.
+        // vkInstance is the Vulkan representation of an instance, while gpuInstance is the custom GPU representation used by shaders.
         auto* vkInstances = static_cast<VkAccelerationStructureInstanceKHR*>(
             frame.instanceBuffer.info.pMappedData);
         auto* gpuInstances = static_cast<GPURayTracingInstance*>(
